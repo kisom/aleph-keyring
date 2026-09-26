@@ -323,12 +323,13 @@ impl UnlockedVault {
                 .iter()
                 .find(|(id, _)| *id == slot.id)
                 .ok_or(Error::MissingKek(slot.id))?;
-            KeyHandle::unwrap(
+            if !KeyHandle::unwraps(
                 kek,
                 &slot.wrapped(),
                 &Keyslot::aad(self.vault_id, slot.id, &slot.kind),
-            )
-            .map_err(|_| Error::WrongKek(slot.id))?;
+            ) {
+                return Err(Error::WrongKek(slot.id));
+            }
         }
         let new_key = KeyHandle::generate()?;
         let mut rewrapped = self.keyslots.clone();

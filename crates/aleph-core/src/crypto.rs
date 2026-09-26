@@ -14,10 +14,16 @@ pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 24;
 pub const MAC_LEN: usize = 32;
 
-/// Fill an array from the OS CSPRNG.
+/// Fill `buf` from the OS CSPRNG. Fill secrets in place with this rather
+/// than `random_array`, which returns its bytes by value on the stack.
+pub fn fill_random(buf: &mut [u8]) -> Result<()> {
+    getrandom::fill(buf).map_err(|_| Error::Random)
+}
+
+/// A random array for non-secret values (nonces, salts).
 pub fn random_array<const N: usize>() -> Result<[u8; N]> {
     let mut out = [0u8; N];
-    getrandom::fill(&mut out).map_err(|_| Error::Random)?;
+    fill_random(&mut out)?;
     Ok(out)
 }
 

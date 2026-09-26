@@ -7,6 +7,7 @@ use zeroize::Zeroizing;
 
 use crate::crypto;
 use crate::error::{Error, Result};
+use crate::key::try_init_secret;
 
 const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const KEY_BYTES: usize = 32;
@@ -18,7 +19,7 @@ pub struct RecoveryKey(SecretBox<[u8; KEY_BYTES]>);
 
 impl RecoveryKey {
     pub fn generate() -> Result<Self> {
-        Ok(Self(SecretBox::new(Box::new(crypto::random_array()?))))
+        try_init_secret(|buf| crypto::fill_random(buf)).map(Self)
     }
 
     /// The bytes fed to Argon2id.
@@ -67,7 +68,11 @@ impl RecoveryKey {
                 "checksum mismatch (check for a typo)",
             ));
         }
-        Ok(Self(SecretBox::new(Box::new(*bytes))))
+        try_init_secret(|buf| {
+            buf.copy_from_slice(&*bytes);
+            Ok(())
+        })
+        .map(Self)
     }
 }
 

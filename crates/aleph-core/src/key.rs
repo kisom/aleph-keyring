@@ -11,21 +11,25 @@ use crate::error::{Error, Result};
 /// A key-encryption key produced by an unlock method (TPM, FIDO2, Argon2).
 pub struct Kek(SecretBox<[u8; KEY_LEN]>);
 
-impl Kek {
-    pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
-        Self(SecretBox::new(Box::new(bytes)))
-    }
+/// Build a 32-byte secret by filling its (heap, zeroize-on-drop) buffer in
+/// place, so it never exists as a by-value array on the stack. The only
+/// way secrets of this size are constructed.
+pub(crate) fn try_init_secret(
+    fill: impl FnOnce(&mut [u8; KEY_LEN]) -> Result<()>,
+) -> Result<SecretBox<[u8; KEY_LEN]>> {
+    let mut secret = SecretBox::<[u8; KEY_LEN]>::init_with_mut(|_| ());
+    fill(secret.expose_secret_mut())?;
+    Ok(secret)
+}
 
-    /// Build a KEK by filling its (heap, zeroize-on-drop) buffer in place,
-    /// so the key never exists as a by-value array on the stack.
+impl Kek {
+    /// Build a KEK in place; see `try_init_secret`.
     pub fn try_init(fill: impl FnOnce(&mut [u8; KEY_LEN]) -> Result<()>) -> Result<Self> {
-        let mut secret = SecretBox::<[u8; KEY_LEN]>::init_with_mut(|_| ());
-        fill(secret.expose_secret_mut())?;
-        Ok(Self(secret))
+        try_init_secret(fill).map(Self)
     }
 
     pub fn generate() -> Result<Self> {
-        Self::try_init(|buf| getrandom::fill(buf).map_err(|_| Error::Random))
+        Self::try_init(|buf| crypto::fill_random(buf))
     }
 
     pub(crate) fn expose(&self) -> &[u8; KEY_LEN] {
@@ -118,8 +122,8 @@ impl Drop for LockedPage {
     fn drop(&mut self) {
         self.key_mut().zeroize();
         // SAFETY: unmapping the mapping created in `new`, exactly once.
+        // munmap also releases the page's mlock.
         unsafe {
-            libc::munlock(self.page.cast(), self.len);
             libc::munmap(self.page.cast(), self.len);
         }
     }
@@ -133,7 +137,7 @@ pub struct KeyHandle {
 impl KeyHandle {
     pub fn generate() -> Result<Self> {
         let mut mk = LockedPage::new()?;
-        getrandom::fill(mk.key_mut()).map_err(|_| Error::Random)?;
+        crypto::fill_random(mk.key_mut())?;
         Ok(Self { mk })
     }
 
@@ -141,6 +145,13 @@ impl KeyHandle {
     pub fn wrap(&self, kek: &Kek, aad: &[u8]) -> Result<WrappedKey> {
         let (nonce, ciphertext) = crypto::seal(kek.expose(), aad, self.mk.key())?;
         Ok(WrappedKey { nonce, ciphertext })
+    }
+
+    /// Whether `kek` opens `wrapped`, without mapping a page for the
+    /// result: for checks that discard the key.
+    pub fn unwraps(kek: &Kek, wrapped: &WrappedKey, aad: &[u8]) -> bool {
+        crypto::open(kek.expose(), &wrapped.nonce, aad, &wrapped.ciphertext)
+            .is_some_and(|pt| pt.len() == KEY_LEN)
     }
 
     /// Recover the master key from a keyslot.
@@ -219,6 +230,20 @@ mod tests {
         assert!(matches!(
             KeyHandle::unwrap(&kek, &wrapped, b"other-aad"),
             Err(Error::UnwrapFailed)
+        ));
+    }
+
+    #[test]
+    fn unwraps_agrees_with_unwrap() {
+        let mk = KeyHandle::generate().unwrap();
+        let kek = Kek::generate().unwrap();
+        let wrapped = mk.wrap(&kek, b"slot-aad").unwrap();
+        assert!(KeyHandle::unwraps(&kek, &wrapped, b"slot-aad"));
+        assert!(!KeyHandle::unwraps(&kek, &wrapped, b"other-aad"));
+        assert!(!KeyHandle::unwraps(
+            &Kek::generate().unwrap(),
+            &wrapped,
+            b"slot-aad"
         ));
     }
 
