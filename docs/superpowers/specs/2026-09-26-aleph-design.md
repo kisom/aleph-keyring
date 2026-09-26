@@ -116,13 +116,16 @@ without changing `alephd`'s D-Bus layer.
 
 ### Header (plaintext, authenticated after unlock)
 
-| Field | Notes |
-|---|---|
-| `magic` | `"ALEPH\0"` |
-| `format_version` | integer, starts at 1 |
-| `vault_id` | UUIDv4 |
-| `keyslots` | array of keyslots (below) |
-| `header_mac` | HMAC-SHA-256 over all preceding fields, key = `HKDF(MK, info="aleph header v1")` |
+**Layout:** `MAGIC ‖ CBOR([format_version, header_bytes, header_mac, body_nonce, body_ct])`.
+
+- `MAGIC` is `"ALEPH\0"`, and `format_version` is an integer starting at 1.
+- `header_bytes` is `CBOR(Header { vault_id, keyslots })`, stored as a
+  byte string. `vault_id` is a UUIDv4.
+- `header_mac = HMAC-SHA-256(HKDF(MK, "aleph header v1"), MAGIC ‖ be32(format_version) ‖ header_bytes)`.
+  It is computed over the exact stored bytes and never over a re-encoding,
+  so it does not depend on how the CBOR encoder behaves.
+- Decoding is strict: exactly one CBOR item, no trailing bytes, and exactly
+  five outer elements.
 
 After unwrapping the master key (MK), the daemon verifies `header_mac`
 before trusting anything else in the header. This detects keyslot
@@ -144,7 +147,11 @@ deletion, substitution, and format-version rollback.
 | `fido2` | `HKDF(hmac-secret output, info="aleph fido2 v1")` | `credential_id`, `rp_id` (`"aleph"`), `salt` (32 bytes), `uv_required`, `pin_required` |
 | `recovery-key` | `Argon2id(recovery key)` | `salt`, `m=256 MiB`, `t=3`, `p=4` |
 | `passphrase` | `Argon2id(passphrase)` | `salt`, params tuned at enrollment to ≈1 s, floor `m=1 GiB` |
-| `login-password` | `Argon2id(login password)` | `salt`, params tuned at enrollment to ≈0.3 s. Used only when no TPM is available. |
+| `login-password` | `Argon2id(login password)` | `salt`, params tuned at enrollment to ≈0.3 s, floor `m = 64 MiB, t = 2, p = 4`. Used only when no TPM is available. |
+
+Argon2 parameters read from a vault are rejected above `m = 4 GiB`,
+`t = 64`, `p = 16`, so a corrupt or hostile slot errors instead of
+attempting a huge allocation.
 
 Adding or removing an unlock method adds or removes a slot. Only
 `rotate-master` re-encrypts the body.
@@ -158,7 +165,8 @@ Adding or removing an unlock method adds or removes a slot. Only
 - Encrypted as one blob with XChaCha20-Poly1305:
   - key = `HKDF(MK, info="aleph body v1")`
   - fresh random nonce on every write
-  - AAD = `vault_id ‖ format_version`
+  - AAD = `vault_id ‖ be32(format_version)`
+  - stored as the outer array's `body_nonce` and `body_ct` elements
 
 ### Locked search
 
@@ -232,8 +240,9 @@ has no timeout.
 At setup the user chooses one (or both, as separate slots later):
 
 - **Recovery key (recommended default):** 256 random bits, displayed once
-  as 52 Crockford base32 characters in groups of 4, plus a 2-character
-  checksum. Input is case-insensitive and normalizes `O→0`, `I/L→1`.
+  as 52 Crockford base32 characters plus a 4-character checksum (the top
+  20 bits of SHA-256), shown as 14 groups of 4. Input is case-insensitive
+  and normalizes `O→0`, `I/L→1`.
 - **Passphrase:** user-chosen, protected by heavy Argon2id.
 
 A backup is the vault file plus the recovery secret. Losing either loses
