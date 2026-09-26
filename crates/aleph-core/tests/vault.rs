@@ -93,6 +93,31 @@ fn deleting_a_keyslot_from_the_file_is_detected() {
     ));
 }
 
+/// Spec §9 "header rollback rejected": an older, validly MAC'd header
+/// spliced onto a newer body must not open. Otherwise an attacker with
+/// write access to a synced or backed-up vault could bring back a removed
+/// keyslot (e.g. a leaked old passphrase) while keeping current data.
+#[test]
+fn old_header_spliced_onto_new_body_is_rejected() {
+    let (mut v, _, _, pass) = sample();
+    let old = v.to_bytes().unwrap();
+    v.remove_keyslot(pass).unwrap();
+    v.body_mut().collections[0].label = "NEW BODY".into();
+    let new = v.to_bytes().unwrap();
+
+    let old_outer: Value = ciborium::from_reader(&old[6..]).unwrap();
+    let old_outer = old_outer.as_array().unwrap().clone();
+    let spliced = edit_outer(&new, |a| {
+        a[1] = old_outer[1].clone(); // header_bytes (still lists `pass`)
+        a[2] = old_outer[2].clone(); // header_mac
+    });
+    let locked = LockedVault::from_bytes(&spliced).unwrap();
+    assert!(matches!(
+        locked.unlock_argon2(pass, PASSPHRASE),
+        Err(Error::BodyTampered)
+    ));
+}
+
 #[test]
 fn wrapped_key_moved_to_another_slot_does_not_unwrap() {
     let (v, rk, rec, _) = sample();
@@ -187,6 +212,29 @@ fn rotate_master_rewraps_all_slots_and_requires_every_kek() {
         first_secret(&locked.unlock_argon2(pass, PASSPHRASE).unwrap()),
         b"ghp_secret"
     );
+}
+
+/// A wrong KEK (mistyped passphrase, wrong TPM auth) must be refused
+/// before anything changes; otherwise that slot is silently rewrapped
+/// under garbage and the unlock method is lost for good.
+#[test]
+fn rotate_master_rejects_a_wrong_kek_and_changes_nothing() {
+    let (mut v, rk, rec, pass) = sample();
+    let a = v.keyslots()[0].kind.as_argon2().unwrap().clone();
+    let rec_kek = aleph_core::derive_kek(rk.as_bytes(), &a.salt, &a.params).unwrap();
+    let wrong = aleph_core::Kek::generate().unwrap();
+    let before: Vec<Vec<u8>> = v.keyslots().iter().map(|s| s.wrapped_mk.clone()).collect();
+
+    assert!(matches!(
+        v.rotate_master(&[(rec, &rec_kek), (pass, &wrong)]),
+        Err(Error::WrongKek(id)) if id == pass
+    ));
+
+    let after: Vec<Vec<u8>> = v.keyslots().iter().map(|s| s.wrapped_mk.clone()).collect();
+    assert_eq!(before, after);
+    let locked = LockedVault::from_bytes(&v.to_bytes().unwrap()).unwrap();
+    locked.unlock_argon2(pass, PASSPHRASE).unwrap();
+    locked.unlock_argon2(rec, rk.as_bytes()).unwrap();
 }
 
 /// Flipping any single bit of the file must never yield a successfully

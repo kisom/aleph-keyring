@@ -165,7 +165,10 @@ Adding or removing an unlock method adds or removes a slot. Only
 - Encrypted as one blob with XChaCha20-Poly1305:
   - key = `HKDF(MK, info="aleph body v1")`
   - fresh random nonce on every write
-  - AAD = `vault_id ‖ be32(format_version)`
+  - AAD = `vault_id ‖ be32(format_version) ‖ header_mac`. Including
+    `header_mac` binds the body to the exact header it was written with,
+    so an older header (for example one still listing a removed keyslot)
+    cannot be spliced onto a newer body.
   - stored as the outer array's `body_nonce` and `body_ct` elements
 
 ### Locked search
@@ -183,7 +186,11 @@ has no timeout.
 
 - All key material and plaintext secrets are held in `secrecy`/`zeroize`
   types.
-- MK and the decrypted body are held in `mlock`ed memory.
+- MK and the decrypted body are held in `mlock`ed memory. `aleph-core`
+  mlocks MK and never leaves plaintext secrets in freed heap blocks (the
+  body is encoded into an exactly sized, zeroized buffer and decoded
+  without intermediate copies). Page-locking the decrypted body is
+  `alephd`'s job (Plan 3).
 - `alephd` calls `prctl(PR_SET_DUMPABLE, 0)` at startup (no core dumps,
   no same-uid `ptrace`).
 - Locking zeroizes MK, all derived keys, and the decrypted body, and closes

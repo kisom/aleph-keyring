@@ -5,12 +5,15 @@
 //! header     = CBOR(Header { vault_id, keyslots })          (stored as a byte string)
 //! header_mac = HMAC(HKDF(MK, "aleph header v1"), MAGIC ‖ be32(format_version) ‖ header)
 //! body_ct    = XChaCha20-Poly1305(HKDF(MK, "aleph body v1"), CBOR(Body),
-//!                                 aad = vault_id ‖ be32(format_version))
+//!                                 aad = vault_id ‖ be32(format_version) ‖ header_mac)
 //! ```
 //!
 //! The MAC covers the header's exact stored bytes, never a re-encoding,
 //! so it cannot be affected by CBOR encoding choices (ours or a future
 //! ciborium's). The outer container is an array: no field names to alter.
+//! The body's AAD includes `header_mac`, binding each body to the exact
+//! header it was written with: an older header (e.g. one still listing a
+//! since-removed keyslot) cannot be spliced onto a newer body.
 //!
 //! A `LockedVault` is the parsed file with nothing decrypted. Unlocking
 //! one keyslot yields an `UnlockedVault`, which owns the master key and
@@ -62,9 +65,10 @@ fn mac_input(format_version: u32, header: &[u8]) -> Vec<u8> {
     buf
 }
 
-fn body_aad(vault_id: Uuid, format_version: u32) -> Vec<u8> {
+fn body_aad(vault_id: Uuid, format_version: u32, header_mac: &[u8; MAC_LEN]) -> Vec<u8> {
     let mut aad = vault_id.as_bytes().to_vec();
     aad.extend_from_slice(&format_version.to_be_bytes());
+    aad.extend_from_slice(header_mac);
     aad
 }
 
@@ -92,6 +96,45 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 
 fn encode<T: Serialize>(value: &T, out: &mut Vec<u8>) -> Result<()> {
     ciborium::into_writer(value, out).map_err(|e| Error::Malformed(e.to_string()))
+}
+
+/// Decode the plaintext body straight into `Body`: no intermediate
+/// `ciborium::Value`, whose byte and text buffers would be freed without
+/// being zeroized. Still rejects trailing bytes.
+fn decode_body(bytes: &[u8]) -> Result<Body> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    let body: Body =
+        ciborium::from_reader(&mut cursor).map_err(|e| Error::Malformed(e.to_string()))?;
+    if cursor.position() != bytes.len() as u64 {
+        return Err(Error::Malformed("trailing data after CBOR item".into()));
+    }
+    Ok(body)
+}
+
+/// Counts bytes without storing them, to size the body buffer exactly.
+struct CountingWriter(usize);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Encode the plaintext body into a buffer allocated once at its exact
+/// size, so a growing `Vec` never frees a block holding plaintext.
+fn encode_body(body: &Body) -> Result<Zeroizing<Vec<u8>>> {
+    let malformed = |e: ciborium::ser::Error<std::io::Error>| Error::Malformed(e.to_string());
+    let mut counter = CountingWriter(0);
+    ciborium::into_writer(body, &mut counter).map_err(malformed)?;
+    let mut pt = Zeroizing::new(Vec::with_capacity(counter.0));
+    ciborium::into_writer(body, &mut *pt).map_err(malformed)?;
+    debug_assert_eq!(pt.len(), pt.capacity());
+    Ok(pt)
 }
 
 pub struct LockedVault {
@@ -168,11 +211,11 @@ impl LockedVault {
             .open(
                 BODY_KEY_INFO,
                 body_nonce,
-                &body_aad(h.vault_id, *version),
+                &body_aad(h.vault_id, *version, header_mac),
                 body_ct,
             )
             .ok_or(Error::BodyTampered)?;
-        let body: Body = decode(&pt)?;
+        let body = decode_body(&pt)?;
         Ok(UnlockedVault {
             vault_id: h.vault_id,
             keyslots: h.keyslots.clone(),
@@ -271,12 +314,21 @@ impl UnlockedVault {
     }
 
     /// Replace the master key and re-wrap every slot. `keks` must supply
-    /// the KEK for every existing slot; nothing changes if one is missing.
+    /// the correct KEK for every existing slot; each is proven by
+    /// unwrapping the slot before anything changes, so a missing or wrong
+    /// KEK leaves the vault untouched.
     pub fn rotate_master(&mut self, keks: &[(Uuid, &Kek)]) -> Result<()> {
         for slot in &self.keyslots {
-            if !keks.iter().any(|(id, _)| *id == slot.id) {
-                return Err(Error::MissingKek(slot.id));
-            }
+            let (_, kek) = keks
+                .iter()
+                .find(|(id, _)| *id == slot.id)
+                .ok_or(Error::MissingKek(slot.id))?;
+            KeyHandle::unwrap(
+                kek,
+                &slot.wrapped(),
+                &Keyslot::aad(self.vault_id, slot.id, &slot.kind),
+            )
+            .map_err(|_| Error::WrongKek(slot.id))?;
         }
         let new_key = KeyHandle::generate()?;
         let mut rewrapped = self.keyslots.clone();
@@ -311,11 +363,12 @@ impl UnlockedVault {
         let header_mac = self
             .key
             .mac(HEADER_MAC_INFO, &mac_input(FORMAT_VERSION, &header));
-        let mut pt = Zeroizing::new(Vec::new());
-        encode(&self.body, &mut pt)?;
-        let (nonce, ct) =
-            self.key
-                .seal(BODY_KEY_INFO, &body_aad(self.vault_id, FORMAT_VERSION), &pt)?;
+        let pt = encode_body(&self.body)?;
+        let (nonce, ct) = self.key.seal(
+            BODY_KEY_INFO,
+            &body_aad(self.vault_id, FORMAT_VERSION, &header_mac),
+            &pt,
+        )?;
         let mut out = MAGIC.to_vec();
         encode(
             &VaultFile(FORMAT_VERSION, header, header_mac, nonce, ct),

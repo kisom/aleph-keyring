@@ -39,6 +39,9 @@ pub enum Error {
     #[error("master key rotation needs a KEK for keyslot {0}")]
     MissingKek(Uuid),
 
+    #[error("the KEK supplied for keyslot {0} does not unlock it")]
+    WrongKek(Uuid),
+
     #[error("invalid recovery key: {0}")]
     InvalidRecoveryKey(&'static str),
 
