@@ -112,7 +112,9 @@ without changing `alephd`'s D-Bus layer.
 - Encoding: CBOR.
 - Writes are atomic: write `vault.aleph.tmp`, `fsync`, rename over
   `vault.aleph`, `fsync` the directory. The previous version is kept as
-  `vault.aleph.bak`.
+  `vault.aleph.bak`. Writers hold an exclusive `flock` on
+  `vault.aleph.lock` for the whole sequence, so concurrent writers
+  serialize instead of renaming each other's half-written temp files.
 
 ### Header (plaintext, authenticated after unlock)
 

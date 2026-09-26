@@ -379,6 +379,8 @@ impl UnlockedVault {
 
     /// Atomically replace the vault at `path`, keeping the previous
     /// version as `<path>.bak`. Creates the parent directory (0700).
+    /// Concurrent writers are serialized on `<path>.lock`; the last one to
+    /// write wins, but the vault and backup are always intact.
     pub fn write(&self, path: &Path) -> Result<()> {
         write_atomic(path, &self.to_bytes()?)
     }
@@ -425,6 +427,17 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         fs::create_dir_all(dir)?;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
+    // Serialize writers. Without this, one writer's `write_file_synced`
+    // could unlink another's temp file mid-write, and the other's rename
+    // would then put this half-written file in place. The lock is on a
+    // sibling that is never renamed, so it guards every path below.
+    let lock = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(sibling(path, ".lock")?)?;
+    lock.lock()?;
     if path.exists() {
         let bak_tmp = sibling(path, ".bak.tmp")?;
         write_file_synced(&bak_tmp, &fs::read(path)?)?;

@@ -94,3 +94,37 @@ fn stale_temp_file_from_a_crashed_write_is_replaced() {
         .unlock_argon2(pass, PASSPHRASE)
         .unwrap();
 }
+
+/// Two writers (say, the daemon and a CLI run against the same file) must
+/// not interleave: one could unlink the other's temp file and rename a
+/// half-written one over the vault. Every write must succeed and leave an
+/// intact vault and backup.
+#[test]
+fn concurrent_writers_never_corrupt_the_vault() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.aleph");
+    let (mut v, _, _, pass) = sample();
+    // A larger file widens the window between create and rename.
+    v.body_mut().collections[0].label = "x".repeat(256 << 10);
+    v.write(&path).unwrap();
+    let v = std::sync::Arc::new(v);
+    let writers: Vec<_> = (0..8)
+        .map(|_| {
+            let (v, path) = (v.clone(), path.clone());
+            std::thread::spawn(move || {
+                for _ in 0..5 {
+                    v.write(&path).unwrap();
+                }
+            })
+        })
+        .collect();
+    for w in writers {
+        w.join().unwrap();
+    }
+    for p in [path.clone(), dir.path().join("vault.aleph.bak")] {
+        LockedVault::read(&p)
+            .unwrap()
+            .unlock_argon2(pass, PASSPHRASE)
+            .unwrap();
+    }
+}
