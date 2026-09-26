@@ -15,7 +15,7 @@
 - **Slot storage:** each keyslot is stored in the header as its own CBOR byte string. Known types parse strictly (`deny_unknown_fields`). Unknown types are kept as their exact bytes and re-emitted unchanged.
 - **Generations:** every serialization is a new generation. A `HighWater` store outside the vault detects rollback and replacement.
 
-**Tech Stack:** Rust 1.98; adds `x-wing` 0.1 (RustCrypto, Apache-2.0 OR MIT: ML-KEM-768 + X25519); dev: `hex`, `serde_json`.
+**Tech Stack:** Rust 1.98; adds `x-wing` `=0.1.0` (RustCrypto, Apache-2.0 OR MIT: ML-KEM-768 + X25519) and `hybrid-array` 0.4 (to pass secrets to it without copies); dev: `hex`, `serde_json`.
 
 **Spec:** `docs/superpowers/specs/2026-09-26-aleph-design.md` revision 2 (§4 Layout, Generation and high-water mark, Master key and keyslots, Rotation and revocation; §5 Recovery key; §9 aleph-core tests).
 
@@ -31,6 +31,30 @@ Every task was prototyped, then replayed from this document on a fresh clone of 
 - **`add_keyslot` accepts only TPM and FIDO2 kinds.** Recovery and login-password slots have dedicated constructors that derive their own KEKs.
 - **Only the login-password slot uses Argon2.** `RECOVERY_KEY` and `PASSPHRASE_FLOOR` are removed. The KAT moves to `LOGIN_PASSWORD_FLOOR`, verified with the reference C implementation (`printf "aleph known answer" | argon2 BBBBBBBBBBBBBBBB -id -t 2 -m 16 -p 4 -l 32 -r` → `70f16ec9…0cbb`). `INSECURE_TEST` exists only under `cfg(test)` or the `insecure-test-params` feature. The crate's integration tests enable that feature through a self dev-dependency, and it also gates a hidden `vault::testing` hook.
 - **Test speed:** X-Wing and CBOR parsing are slow unoptimized, so the workspace builds `ml-kem`, `x25519-dalek`, `sha3`, `ciborium`, and a few others at `opt-level = 3` in dev and test profiles (alongside the existing Argon2/AEAD overrides). The round-trip proptest runs 64 cases. The exhaustive bit-flip test (about 25k flips over a 3 KB file) unlocks through a raw-KEK slot, so it needs no Argon2.
+- **Changes from the plan review** (`docs/reviews`-style review of this plan and its prototype, 2026-09-26). Each is pinned by a test that was checked to fail when the fix is reverted:
+  - **Replaying an old MK under a forged higher generation is now caught (Critical).** Before, a higher generation was accepted as `Newer` even with a different `mk_id`. Anyone holding an old MK (an old file plus a removed credential) could re-serialize the old vault with any generation and slip past the high-water check. This left review finding 7 open.
+    - The new `Standing::Rekeyed` covers "higher generation, different MK" and is not ok.
+    - `HighWater::raise` (for files the daemon *reads*) stores only acceptable marks and returns the `Standing`.
+    - `HighWater::record` (for the daemon's *own* writes and user-accepted rollbacks) stores unconditionally.
+    - Generation arithmetic is checked (`GenerationOverflow`).
+    - Task 4 amends spec §4 to match.
+  - **`write()` returns the `Mark` it wrote.** It chooses and serializes the generation while holding `vault.aleph.lock`, and commits it only after the rename. Concurrent writers get distinct generations, the file on disk equals the vault's mark, and a failed write does not advance it.
+  - **A test pins the `mk_id` check.** A header carrying another MK's `mk_id`, MAC'd under the real key, fails with `HeaderTampered`.
+  - **End-to-end rollback tests.** Real files go through `HighWater`: a restored older file shows as `RolledBack`, and a forged higher generation under the old MK shows as `Rekeyed`.
+  - **Minor fixes:**
+    - the first write after a rotation also replaces `.bak`, so the pre-rotation file (old MK, removed slot) does not linger
+    - trailing bytes after a slot are rejected
+    - `Rotation.dropped` lists each known slot once, and unknown slots appear only in `dropped_unknown`
+    - backups never carry generation 0
+    - `WrongSlotType`'s message is fixed
+    - `x-wing` is pinned to `=0.1.0`
+    - secrets are passed to `x-wing` by reference (`as_array_ref`) and its outputs are zeroized
+    - rotation checks each KEK against the *current* MK's fingerprint (`KeyHandle::unwraps_to`)
+    - a structured proptest runs slot maps through `SlotEntry::decode`
+    - the high-water file is decoded strictly
+    - the test vectors come from a commit-pinned URL
+  - **Deferred:** splitting Task 4 into smaller red/green steps. It replays cleanly, and splitting it would mean building intermediate file states.
+  - **For Plan 6:** CI must also run a plain `cargo build --workspace`. `cargo test --workspace` enables `insecure-test-params` for every crate in the build, so it could go green while a release build fails.
 - **Out of this plan:**
   - the daemon-lifetime lock (`vault.aleph.daemon`) and logging the directory-tightening warning (Plan 3)
   - recovery-key confirmation at setup (Plan 4)
@@ -49,6 +73,8 @@ Every task was prototyped, then replayed from this document on a fresh clone of 
   - magic `b"ALEPH\0"`, `FORMAT_VERSION = 1` (v1 unreleased; Task 4 regenerates the golden file)
 - **Invariants:**
   - a vault cannot be serialized without a recovery slot (`RecoveryRequired`)
+  - the `Mark` returned by `write` is exactly the file on disk
+  - only marks from the daemon's own writes (or explicit user acceptance) may move the high-water mark to a new MK
   - `rotate_master` changes nothing unless every non-recovery slot kept has a correct KEK
   - removing a slot always rotates MK
 - Secrets never print: `Debug` is redacted on `Recipient`, `Kek`, `KeyHandle`, `RecoveryKey`, `SecretBytes`.
@@ -59,7 +85,7 @@ Every task was prototyped, then replayed from this document on a fresh clone of 
 
 1. **A removed credential plus an old copy of the file** must never open a file written after the removal. The removed slot is gone, and splicing its old entry back in fails. → Task 4 `removing_a_slot_rotates_so_it_cannot_open_later_files`.
 2. **A rotation where some slot cannot be presented** must fail cleanly and leave the vault unchanged. The recovery slot must be re-wrapped without the paper key. → Task 4 `rotation_needs_correct_keks_for_every_non_recovery_slot_and_changes_nothing_on_error`, `reissuing_the_recovery_key_retires_the_old_one`.
-3. **A file rolled back or replaced** (by a sync peer or an old backup) must be distinguishable from the current one. The recorded mark must never move backwards unless the user accepts it. → Task 3 `raise_never_lowers_and_accept_overrides`, Task 4 `highwater_detects_a_rolled_back_or_replaced_file`, `lowering_the_generation_in_the_file_is_detected`.
+3. **A file rolled back, replaced, or re-keyed elsewhere** (a sync peer, an old backup, or someone replaying an old MK under a forged higher generation) must be distinguishable from the current one. The recorded mark must never move backwards, or to another MK, except through the daemon's own writes or explicit acceptance. → Task 3 `a_higher_generation_under_a_different_mk_is_rekeyed_not_newer`, `raise_stores_only_acceptable_marks_and_reports_the_standing`; Task 4 `restoring_an_older_file_is_detected_as_rolled_back`, `a_replayed_old_mk_with_a_forged_higher_generation_is_rekeyed`, `a_header_claiming_another_mk_id_is_rejected`, and (write side) `concurrent_writers_never_corrupt_the_vault`, `a_failed_write_does_not_advance_the_generation`.
 4. **A slot written by a newer aleph** must survive an older aleph's rewrite byte-for-byte. A known slot with an unexpected field must be rejected, not silently truncated. → Task 4 `unknown_slot_types_survive_writes_and_are_dropped_by_rotation`, keyslot unit tests.
 5. **A leaked `aleph backup` file** must hold only the recovery slot. A login-password slot with weak parameters must be refused at enrollment. → Task 4 `backup_copy_contains_only_the_recovery_slot`, `only_hardware_slots_take_a_raw_kek_and_weak_params_are_refused`; Task 2 `enrollment_requires_the_floor`.
 
@@ -122,6 +148,7 @@ ciborium = "0.2"
 getrandom = "0.4"
 hkdf = "0.13"
 hex = "0.4"
+hybrid-array = { version = "0.4", features = ["zeroize"] }
 hmac = "0.13"
 libc = "0.2"
 proptest = "1"
@@ -133,7 +160,9 @@ sha2 = "0.11"
 tempfile = "3"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-x-wing = { version = "0.1", features = ["zeroize"] }
+# Pinned exactly: recovery keys must open vaults forever, and the crate
+# tracks a draft (the local KATs against the draft vectors are the tripwire).
+x-wing = { version = "=0.1.0", features = ["zeroize"] }
 zeroize = { version = "1.9", features = ["derive"] }
 
 # Argon2, the AEAD, X-Wing (ML-KEM, X25519, SHA-3), and CBOR parsing are
@@ -186,6 +215,7 @@ ciborium.workspace = true
 getrandom.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
+hybrid-array.workspace = true
 libc.workspace = true
 secrecy.workspace = true
 serde.workspace = true
@@ -230,11 +260,11 @@ pub use recovery::RecoveryKey;
 pub use vault::{LockedVault, UnlockedVault};
 ```
 
-Create `crates/aleph-core/tests/data/xwing-draft-vectors.json` from the draft authors' published vectors. Download them and check the digest:
+Create `crates/aleph-core/tests/data/xwing-draft-vectors.json` from the draft authors' published vectors, pinned to commit `984c2f7`. Download them and check the digest:
 
 ```bash
 curl -sSL -o crates/aleph-core/tests/data/xwing-draft-vectors.json \
-  https://raw.githubusercontent.com/dconnolly/draft-connolly-cfrg-xwing-kem/main/spec/test-vectors.json
+  https://raw.githubusercontent.com/dconnolly/draft-connolly-cfrg-xwing-kem/984c2f7a93b8f8d8f8073ebb53f9f4ce50b5babd/spec/test-vectors.json
 sha256sum crates/aleph-core/tests/data/xwing-draft-vectors.json
 ```
 
@@ -356,8 +386,9 @@ Insert above the `#[cfg(test)]` line in `crates/aleph-core/src/xwing.rs`:
 //! the recovery key), so the daemon can wrap MK to the public key without
 //! ever holding the recovery key.
 
-use x_wing::{Decapsulate, DecapsulationKey, Decapsulator, EncapsulationKey, KeyExport};
-use zeroize::Zeroizing;
+use hybrid_array::AsArrayRef;
+use x_wing::{Decapsulate, DecapsulationKey, Decapsulator, EncapsulationKey, KeyExport, KeyInit};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{self, KEY_LEN};
 use crate::error::{Error, Result};
@@ -371,7 +402,9 @@ pub struct Recipient(DecapsulationKey);
 impl Recipient {
     /// The key pair determined by `seed`, per the X-Wing spec's KeyGen.
     pub fn from_seed(seed: &Zeroizing<[u8; KEY_LEN]>) -> Self {
-        Self(DecapsulationKey::from(**seed))
+        // Borrowed as an `Array` without copying; the key copies it into its
+        // own zeroize-on-drop storage.
+        Self(DecapsulationKey::new(seed.as_array_ref()))
     }
 
     pub fn public_key(&self) -> Vec<u8> {
@@ -384,7 +417,11 @@ impl Recipient {
     pub fn decapsulate(&self, ciphertext: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>> {
         let ct = x_wing::Ciphertext::try_from(ciphertext)
             .map_err(|_| Error::Malformed("X-Wing ciphertext has the wrong length".into()))?;
-        Ok(Zeroizing::new(self.0.decapsulate(&ct).into()))
+        let mut ss = self.0.decapsulate(&ct);
+        let mut out = Zeroizing::new([0u8; KEY_LEN]);
+        out.copy_from_slice(&ss);
+        ss.zeroize();
+        Ok(out)
     }
 }
 
@@ -401,8 +438,11 @@ pub fn encapsulate(public_key: &[u8]) -> Result<(Vec<u8>, Zeroizing<[u8; KEY_LEN
         .map_err(|_| Error::Malformed("invalid X-Wing public key".into()))?;
     let mut randomness = Zeroizing::new([0u8; x_wing::ENCAPSULATION_RANDOMNESS_SIZE]);
     crypto::fill_random(randomness.as_mut())?;
-    let (ct, ss) = ek.encapsulate_deterministic(&(*randomness).into());
-    Ok((ct.to_vec(), Zeroizing::new(ss.into())))
+    let (ct, mut ss) = ek.encapsulate_deterministic(randomness.as_array_ref());
+    let mut out = Zeroizing::new([0u8; KEY_LEN]);
+    out.copy_from_slice(&ss);
+    ss.zeroize();
+    Ok((ct.to_vec(), out))
 }
 ```
 
@@ -475,6 +515,7 @@ ciborium.workspace = true
 getrandom.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
+hybrid-array.workspace = true
 libc.workspace = true
 secrecy.workspace = true
 serde.workspace = true
@@ -918,9 +959,13 @@ git commit -m "feat(core): Argon2 for login passwords only, with an enrollment f
 - Consumes: `vault::{sibling, write_file_synced}` (private helpers in the same crate).
 - Produces:
   - `Mark { vault_id: Uuid, generation: u64, mk_id: [u8; 16] }` (serde)
-  - `Standing { Unrecorded, Current, Newer, RolledBack { recorded }, Replaced }` and `.is_ok()`
+  - `Standing { Unrecorded, Current, Newer, RolledBack { recorded }, Replaced, Rekeyed }` and `.is_ok()`, which is true only for `Unrecorded`, `Current`, and `Newer`. `Newer` requires the same `mk_id`, and a higher generation under a different MK is `Rekeyed`.
   - `highwater::compare(recorded: Option<&Mark>, found: &Mark) -> Standing`
-  - `HighWater::new(dir)` with `.load(vault_id)`, `.check(&Mark)`, `.raise(&Mark)` (never lowers), and `.accept(&Mark)` (unconditional)
+  - `HighWater::new(dir)` with:
+    - `.load(vault_id)`: strict decode
+    - `.check(&Mark) -> Result<Standing>`
+    - `.raise(&Mark) -> Result<Standing>`: for files the daemon reads; stores only acceptable marks
+    - `.record(&Mark)`: unconditional; for the daemon's own writes and user-accepted rollbacks
   - `pub(crate) vault::write_small_file(path, bytes)`: 0600 file in a 0700 directory, temp file then rename
 
 - [ ] **Step 1: Write the failing tests**
@@ -973,44 +1018,82 @@ mod tests {
     fn compare_classifies_every_case() {
         assert_eq!(compare(None, &mark(5, 1)), Standing::Unrecorded);
         assert_eq!(compare(Some(&mark(5, 1)), &mark(5, 1)), Standing::Current);
-        assert_eq!(compare(Some(&mark(5, 1)), &mark(6, 2)), Standing::Newer);
+        assert_eq!(compare(Some(&mark(5, 1)), &mark(6, 1)), Standing::Newer);
         assert_eq!(
             compare(Some(&mark(5, 1)), &mark(4, 1)),
             Standing::RolledBack { recorded: 5 }
         );
         assert_eq!(compare(Some(&mark(5, 1)), &mark(5, 2)), Standing::Replaced);
-        assert!(Standing::Newer.is_ok() && !Standing::Replaced.is_ok());
+        assert_eq!(compare(Some(&mark(5, 1)), &mark(6, 2)), Standing::Rekeyed);
+        assert!(Standing::Newer.is_ok());
+        for s in [
+            Standing::Replaced,
+            Standing::Rekeyed,
+            Standing::RolledBack { recorded: 1 },
+        ] {
+            assert!(!s.is_ok(), "{s:?}");
+        }
+    }
+
+    /// Someone holding the old MK can re-serialize an old file with any
+    /// generation. A higher generation under a different MK than recorded
+    /// is therefore not "newer": it must not be accepted or recorded.
+    #[test]
+    fn a_higher_generation_under_a_different_mk_is_rekeyed_not_newer() {
+        let dir = tempfile::tempdir().unwrap();
+        let hw = HighWater::new(dir.path());
+        hw.record(&mark(5, 1)).unwrap();
+        assert_eq!(hw.raise(&mark(u64::MAX, 2)).unwrap(), Standing::Rekeyed);
+        assert_eq!(hw.load(mark(1, 1).vault_id).unwrap(), Some(mark(5, 1)));
     }
 
     #[test]
-    fn raise_never_lowers_and_accept_overrides() {
+    fn raise_stores_only_acceptable_marks_and_reports_the_standing() {
         let dir = tempfile::tempdir().unwrap();
         let hw = HighWater::new(dir.path().join("state"));
         assert_eq!(hw.load(mark(1, 1).vault_id).unwrap(), None);
-        hw.raise(&mark(5, 1)).unwrap();
-        hw.raise(&mark(3, 1)).unwrap(); // ignored
-        hw.raise(&mark(5, 2)).unwrap(); // replaced: ignored
-        assert_eq!(hw.load(mark(1, 1).vault_id).unwrap(), Some(mark(5, 1)));
+        assert_eq!(hw.raise(&mark(5, 1)).unwrap(), Standing::Unrecorded);
         assert_eq!(
-            hw.check(&mark(3, 1)).unwrap(),
+            hw.raise(&mark(3, 1)).unwrap(),
             Standing::RolledBack { recorded: 5 }
         );
-        hw.accept(&mark(3, 1)).unwrap();
-        assert_eq!(hw.check(&mark(3, 1)).unwrap(), Standing::Current);
+        assert_eq!(hw.raise(&mark(5, 2)).unwrap(), Standing::Replaced);
+        assert_eq!(hw.raise(&mark(6, 1)).unwrap(), Standing::Newer);
+        assert_eq!(hw.load(mark(1, 1).vault_id).unwrap(), Some(mark(6, 1)));
+    }
+
+    /// `record` is for marks the daemon itself wrote (including its own
+    /// rotations) and for rollbacks the user accepted: stored unconditionally.
+    #[test]
+    fn record_stores_unconditionally() {
+        let dir = tempfile::tempdir().unwrap();
+        let hw = HighWater::new(dir.path());
+        hw.record(&mark(5, 1)).unwrap();
+        hw.record(&mark(6, 2)).unwrap(); // own rotation
+        assert_eq!(hw.check(&mark(6, 2)).unwrap(), Standing::Current);
+        hw.record(&mark(3, 2)).unwrap(); // accepted rollback
+        assert_eq!(hw.check(&mark(3, 2)).unwrap(), Standing::Current);
     }
 
     #[test]
-    fn corrupt_or_foreign_record_is_an_error() {
+    fn corrupt_foreign_or_padded_record_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let hw = HighWater::new(dir.path());
         let m = mark(1, 1);
         std::fs::write(hw.path(m.vault_id), b"garbage").unwrap();
         assert!(matches!(hw.load(m.vault_id), Err(Error::Malformed(_))));
+
+        hw.record(&m).unwrap();
+        let mut padded = std::fs::read(hw.path(m.vault_id)).unwrap();
+        padded.push(0);
+        std::fs::write(hw.path(m.vault_id), padded).unwrap();
+        assert!(matches!(hw.load(m.vault_id), Err(Error::Malformed(_))));
+
         let other = Mark {
             vault_id: Uuid::from_bytes([1; 16]),
             ..m
         };
-        hw.accept(&other).unwrap();
+        hw.record(&other).unwrap();
         std::fs::rename(hw.path(other.vault_id), hw.path(m.vault_id)).unwrap();
         assert!(matches!(hw.load(m.vault_id), Err(Error::Malformed(_))));
     }
@@ -1032,9 +1115,13 @@ Insert above the `#[cfg(test)]` line in `crates/aleph-core/src/highwater.rs`:
 //! backups and sync do not carry it (spec §4).
 //!
 //! Comparing a file's mark against the recorded one reveals a vault that
-//! was rolled back (lower generation) or replaced (same generation,
-//! different MK), for example by a sync peer undoing a rotation. It is not
-//! tamper-proof against an attacker who can also write the state directory.
+//! was rolled back (lower generation), replaced (same generation, different
+//! MK), or re-keyed elsewhere (higher generation, different MK). The last
+//! case matters because anyone holding an old MK (an old file plus a since-
+//! removed credential) can re-serialize the old vault with any generation.
+//! Only the daemon's own writes may move the mark to a new MK, via
+//! `record`. It is not tamper-proof against an attacker who can also write
+//! the state directory.
 
 use std::fs;
 use std::path::PathBuf;
@@ -1046,6 +1133,7 @@ use crate::error::{Error, Result};
 
 /// One generation of one vault.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Mark {
     pub vault_id: Uuid,
     pub generation: u64,
@@ -1060,13 +1148,17 @@ pub enum Standing {
     Unrecorded,
     /// Exactly the recorded generation.
     Current,
-    /// Newer than recorded (written elsewhere, e.g. restored and advanced).
+    /// Newer than recorded, under the same master key.
     Newer,
     /// Older than recorded: the file was rolled back.
     RolledBack { recorded: u64 },
     /// Same generation as recorded but a different master key: the file
     /// was replaced.
     Replaced,
+    /// Higher generation than recorded but a different master key: MK was
+    /// changed somewhere other than this daemon, or an old MK is being
+    /// replayed under a forged generation.
+    Rekeyed,
 }
 
 impl Standing {
@@ -1083,12 +1175,15 @@ impl Standing {
 pub fn compare(recorded: Option<&Mark>, found: &Mark) -> Standing {
     match recorded {
         None => Standing::Unrecorded,
-        Some(r) if found.generation > r.generation => Standing::Newer,
         Some(r) if found.generation < r.generation => Standing::RolledBack {
             recorded: r.generation,
         },
-        Some(r) if found.mk_id == r.mk_id => Standing::Current,
-        Some(_) => Standing::Replaced,
+        Some(r) => match (found.generation == r.generation, found.mk_id == r.mk_id) {
+            (true, true) => Standing::Current,
+            (true, false) => Standing::Replaced,
+            (false, true) => Standing::Newer,
+            (false, false) => Standing::Rekeyed,
+        },
     }
 }
 
@@ -1109,8 +1204,13 @@ impl HighWater {
     pub fn load(&self, vault_id: Uuid) -> Result<Option<Mark>> {
         match fs::read(self.path(vault_id)) {
             Ok(bytes) => {
-                let mark: Mark = ciborium::from_reader(bytes.as_slice())
-                    .map_err(|e| Error::Malformed(format!("high-water mark: {e}")))?;
+                let malformed = |m: String| Error::Malformed(format!("high-water mark: {m}"));
+                let mut cursor = std::io::Cursor::new(bytes.as_slice());
+                let mark: Mark =
+                    ciborium::from_reader(&mut cursor).map_err(|e| malformed(e.to_string()))?;
+                if cursor.position() != bytes.len() as u64 {
+                    return Err(malformed("trailing data".into()));
+                }
                 if mark.vault_id != vault_id {
                     return Err(Error::Malformed("high-water mark for another vault".into()));
                 }
@@ -1126,19 +1226,22 @@ impl HighWater {
         Ok(compare(self.load(found.vault_id)?.as_ref(), found))
     }
 
-    /// Record `mark` if it is not older than what is recorded. Never
-    /// lowers the mark; use `accept` for a user-confirmed rollback.
-    pub fn raise(&self, mark: &Mark) -> Result<()> {
-        match self.check(mark)? {
-            Standing::Unrecorded | Standing::Newer => self.store(mark),
-            Standing::Current => Ok(()),
-            Standing::RolledBack { .. } | Standing::Replaced => Ok(()),
+    /// Record `mark` if it stands acceptably (`Standing::is_ok`) against
+    /// the current record, and report how it stood. Use for marks of files
+    /// the daemon *read*. Never lowers the mark or moves it to another MK.
+    pub fn raise(&self, mark: &Mark) -> Result<Standing> {
+        let standing = self.check(mark)?;
+        if standing.is_ok() && standing != Standing::Current {
+            self.store(mark)?;
         }
+        Ok(standing)
     }
 
-    /// Record `mark` unconditionally, after the user confirmed a rollback,
-    /// replacement, or restore.
-    pub fn accept(&self, mark: &Mark) -> Result<()> {
+    /// Record `mark` unconditionally. Use only for marks the daemon itself
+    /// wrote (the `Mark` returned by `UnlockedVault::write`, including after
+    /// its own rotations) and for a rollback or replacement the user
+    /// explicitly accepted.
+    pub fn record(&self, mark: &Mark) -> Result<()> {
         self.store(mark)
     }
 
@@ -1175,7 +1278,7 @@ pub(crate) fn write_small_file(path: &Path, bytes: &[u8]) -> Result<()> {
 - [ ] **Step 4: Run the tests, clippy, and fmt**
 
 Run: `cargo test -p aleph-core && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
-Expected: unit tests `47 passed`.
+Expected: unit tests `49 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -1196,7 +1299,7 @@ git commit -m "feat(core): high-water mark for rollback and replacement detectio
 **Interfaces:**
 - Consumes: Tasks 1–3 (`xwing::{encapsulate, Recipient}`, `RecoveryKey::recipient`, `Argon2Params::enrollable`, `Mark`).
 - Produces:
-  - `KeyHandle::id() -> [u8; 16]`
+  - `KeyHandle::id() -> [u8; 16]`, and `KeyHandle::unwraps_to(kek, wrapped, aad, expected_id) -> bool` (opens *and* is the MK with that fingerprint)
   - `SlotKind`:
     - `Tpm(TpmSlot { public, private, auth_salt: [u8; 16], srk_name })`
     - `Fido2(Fido2Slot { credential_id, salt, uv_required, pin_required })` (no stored RP ID)
@@ -1214,10 +1317,12 @@ git commit -m "feat(core): high-water mark for rollback and replacement detectio
     - `login_password_kek(id, password)`
     - `remove_keyslot(id, keks) -> Result<Rotation>`
     - `rotate_master(keks: &[(Uuid, &Kek)], drop: &[Uuid]) -> Result<Rotation { dropped, dropped_unknown }>`
-    - `to_bytes()` (next generation; `Err(RecoveryRequired)` without a recovery slot), `to_backup_bytes()`, `write(path)`
-  - `Error`: adds `RecoveryRequired`, `WeakParams`, `NotAHardwareSlot`; removes `LastKeyslot`
+    - `to_bytes()`: the next generation; `Err(RecoveryRequired)` without a recovery slot, `Err(GenerationOverflow)` at `u64::MAX`
+    - `to_backup_bytes()`: generation at least 1
+    - `write(path) -> Result<Mark>`: the generation is chosen under the file lock and committed after the rename; the first write after a rotation also replaces `.bak`
+  - `Error`: adds `RecoveryRequired`, `WeakParams`, `NotAHardwareSlot`, `GenerationOverflow`; removes `LastKeyslot`
   - `RecoveryKey::as_bytes` becomes private
-  - hidden `vault::testing::push_unknown` (feature `insecure-test-params`)
+  - hidden `vault::testing::{push_unknown, set_generation, to_bytes_with_mk_id}` (feature `insecure-test-params`)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1333,8 +1438,8 @@ mod common;
 
 use aleph_core::model::DEFAULT_ALIAS;
 use aleph_core::{
-    Error, Fido2Slot, Item, Kek, LockedVault, RecoveryKey, SecretBytes, SlotKind, Standing,
-    TpmSlot, UnlockedVault, highwater,
+    Error, Fido2Slot, HighWater, Item, Kek, LockedVault, RecoveryKey, SecretBytes, SlotKind,
+    Standing, TpmSlot, UnlockedVault, highwater, vault,
 };
 use ciborium::Value;
 use common::*;
@@ -1559,6 +1664,75 @@ fn every_write_is_a_new_generation_and_marks_track_it() {
     assert_eq!(third.mark().generation, second.mark().generation + 1);
 }
 
+/// The public `mk_id` in the header must match the key that unwrapped it.
+/// Otherwise someone holding an old MK could stamp the current `mk_id` on a
+/// forged file and pass the high-water check as `Current` or `Newer`.
+#[test]
+fn a_header_claiming_another_mk_id_is_rejected() {
+    let (v, _, _, pw) = sample();
+    let (other, ..) = sample();
+    let forged = vault::testing::to_bytes_with_mk_id(&v, other.mark().mk_id).unwrap();
+    let locked = LockedVault::from_bytes(&forged).unwrap();
+    assert_eq!(locked.mark().mk_id, other.mark().mk_id);
+    assert!(matches!(
+        locked.unlock_login_password(pw, PASSWORD),
+        Err(Error::HeaderTampered)
+    ));
+}
+
+/// End to end through real files: a restored older copy is `RolledBack`.
+#[test]
+fn restoring_an_older_file_is_detected_as_rolled_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.aleph");
+    let hw = HighWater::new(dir.path().join("state"));
+    let (v, ..) = sample();
+    hw.record(&v.write(&path).unwrap()).unwrap();
+    let old = std::fs::read(&path).unwrap();
+    hw.record(&v.write(&path).unwrap()).unwrap();
+    std::fs::write(&path, old).unwrap();
+    let found = LockedVault::read(&path).unwrap().mark();
+    assert!(matches!(
+        hw.check(&found).unwrap(),
+        Standing::RolledBack { .. }
+    ));
+}
+
+/// Review finding: someone holding the old MK (an old file plus a removed
+/// credential) re-serializes the old vault with a higher generation. It
+/// must be flagged `Rekeyed`, not accepted as `Newer`.
+#[test]
+fn a_replayed_old_mk_with_a_forged_higher_generation_is_rekeyed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.aleph");
+    let hw = HighWater::new(dir.path().join("state"));
+    let (mut v, _, _, pw) = sample();
+    let rogue_kek = Kek::generate().unwrap();
+    let rogue = v.add_keyslot("rogue", fido2_kind(), &rogue_kek).unwrap();
+    hw.record(&v.write(&path).unwrap()).unwrap();
+    let old = std::fs::read(&path).unwrap();
+
+    let pw_kek = v.login_password_kek(pw, PASSWORD).unwrap();
+    v.remove_keyslot(rogue, &[(pw, &pw_kek)]).unwrap();
+    hw.record(&v.write(&path).unwrap()).unwrap();
+
+    // The attacker opens the old file with the revoked credential and
+    // writes it back several generations ahead.
+    let replay = LockedVault::from_bytes(&old)
+        .unwrap()
+        .unlock(rogue, &rogue_kek)
+        .unwrap();
+    for _ in 0..3 {
+        replay.to_bytes().unwrap();
+    }
+    let forged = replay.to_bytes().unwrap();
+    let found = LockedVault::from_bytes(&forged).unwrap();
+    assert!(found.mark().generation > v.mark().generation);
+    assert_eq!(hw.check(&found.mark()).unwrap(), Standing::Rekeyed);
+    assert_eq!(hw.raise(&found.mark()).unwrap(), Standing::Rekeyed);
+    assert_eq!(hw.check(&v.mark()).unwrap(), Standing::Current);
+}
+
 #[test]
 fn highwater_detects_a_rolled_back_or_replaced_file() {
     let (v, ..) = sample();
@@ -1748,9 +1922,47 @@ fn unknown_slot_types_survive_writes_and_are_dropped_by_rotation() {
 }
 
 #[test]
+fn rotation_reports_each_drop_once_and_unknown_slots_separately() {
+    let (mut v, _, _, pw) = sample();
+    let kek = Kek::generate().unwrap();
+    let fido = v.add_keyslot("yubikey", fido2_kind(), &kek).unwrap();
+    let future_id = Uuid::new_v4();
+    let future = encode(&Value::Map(vec![
+        (
+            Value::Text("id".into()),
+            Value::Bytes(future_id.as_bytes().to_vec()),
+        ),
+        (
+            Value::Text("kind".into()),
+            Value::Map(vec![(
+                Value::Text("slot_type".into()),
+                Value::Text("quantum-dot".into()),
+            )]),
+        ),
+    ]));
+    vault::testing::push_unknown(&mut v, future);
+    let pw_kek = v.login_password_kek(pw, PASSWORD).unwrap();
+    let rotation = v
+        .rotate_master(&[(pw, &pw_kek)], &[fido, fido, future_id])
+        .unwrap();
+    assert_eq!(rotation.dropped, vec![fido]);
+    assert_eq!(rotation.dropped_unknown.len(), 1);
+    assert_eq!(rotation.dropped_unknown[0].id, Some(future_id));
+}
+
+#[test]
+fn generation_overflow_is_an_error_not_a_panic() {
+    let (v, ..) = sample();
+    vault::testing::set_generation(&v, u64::MAX);
+    assert!(matches!(v.to_bytes(), Err(Error::GenerationOverflow)));
+}
+
+#[test]
 fn backup_copy_contains_only_the_recovery_slot() {
     let (v, rk, rec, pw) = sample();
     let backup = LockedVault::from_bytes(&v.to_backup_bytes().unwrap()).unwrap();
+    // Generations start at 1, even for a backup of a never-written vault.
+    assert_eq!(backup.mark().generation, 1);
     let kinds: Vec<&str> = backup.keyslots().map(|s| s.kind.type_name()).collect();
     assert_eq!(kinds, vec!["recovery"]);
     assert!(matches!(
@@ -1935,16 +2147,21 @@ fn concurrent_writers_never_corrupt_the_vault() {
     let writers: Vec<_> = (0..8)
         .map(|_| {
             let (v, path) = (v.clone(), path.clone());
-            std::thread::spawn(move || {
-                for _ in 0..5 {
-                    v.write(&path).unwrap();
-                }
-            })
+            std::thread::spawn(move || (0..5).map(|_| v.write(&path).unwrap()).collect::<Vec<_>>())
         })
         .collect();
-    for w in writers {
-        w.join().unwrap();
-    }
+    let mut marks: Vec<_> = writers
+        .into_iter()
+        .flat_map(|w| w.join().unwrap())
+        .collect();
+    // Every write got its own generation, and the file on disk (and the
+    // vault's own mark) is exactly the last one written.
+    marks.sort_by_key(|m| m.generation);
+    marks.dedup_by_key(|m| m.generation);
+    assert_eq!(marks.len(), 40);
+    let on_disk = LockedVault::read(&path).unwrap().mark();
+    assert_eq!(on_disk, *marks.last().unwrap());
+    assert_eq!(v.mark(), on_disk);
     for p in [path.clone(), dir.path().join("vault.aleph.bak")] {
         LockedVault::read(&p)
             .unwrap()
@@ -1981,6 +2198,56 @@ fn a_group_or_world_accessible_vault_directory_is_tightened() {
     let (v, ..) = sample();
     v.write(&vault_dir.join("vault.aleph")).unwrap();
     assert_eq!(mode(&vault_dir), 0o700);
+}
+
+/// A failed write must not advance the vault's generation: otherwise the
+/// daemon would record a generation that never reached the disk.
+#[test]
+fn a_failed_write_does_not_advance_the_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    // A directory where the vault should be: serialization succeeds, then
+    // the write itself fails.
+    let path = dir.path().join("vault.aleph");
+    std::fs::create_dir(&path).unwrap();
+    let (v, ..) = sample();
+    let before = v.mark();
+    assert!(v.write(&path).is_err());
+    assert_eq!(v.mark(), before);
+}
+
+/// After a rotation, the first write must not leave the pre-rotation file
+/// (which still holds the removed slot and the old MK) in `.bak`.
+#[test]
+fn the_backup_after_a_rotation_does_not_keep_the_removed_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.aleph");
+    let (mut v, _, _, pw) = sample();
+    let kek = aleph_core::Kek::generate().unwrap();
+    let fido = v
+        .add_keyslot(
+            "yubikey",
+            aleph_core::SlotKind::Fido2(aleph_core::Fido2Slot {
+                credential_id: vec![1; 16],
+                salt: [2; 32],
+                uv_required: true,
+                pin_required: true,
+            }),
+            &kek,
+        )
+        .unwrap();
+    v.write(&path).unwrap();
+    let pw_kek = v.login_password_kek(pw, PASSWORD).unwrap();
+    v.remove_keyslot(fido, &[(pw, &pw_kek)]).unwrap();
+    v.write(&path).unwrap();
+    let bak = LockedVault::read(&path.with_file_name("vault.aleph.bak")).unwrap();
+    assert!(bak.keyslots().all(|s| s.id != fido));
+    // Ordinary writes still keep the previous version as the backup.
+    let before = std::fs::read(&path).unwrap();
+    v.write(&path).unwrap();
+    assert_eq!(
+        std::fs::read(path.with_file_name("vault.aleph.bak")).unwrap(),
+        before
+    );
 }
 ```
 
@@ -2197,7 +2464,7 @@ pub enum Error {
     #[error("no keyslot with id {0}")]
     NoSuchKeyslot(Uuid),
 
-    #[error("keyslot {0} is not a password-type (Argon2id) slot")]
+    #[error("keyslot {0} is not the right type for this unlock method")]
     WrongSlotType(Uuid),
 
     #[error("keyslot could not be unlocked (wrong secret or tampered slot)")]
@@ -2208,6 +2475,9 @@ pub enum Error {
 
     #[error("vault body failed authentication")]
     BodyTampered,
+
+    #[error("vault generation counter would overflow")]
+    GenerationOverflow,
 
     #[error("the vault must keep at least one recovery slot")]
     RecoveryRequired,
@@ -2395,6 +2665,13 @@ impl KeyHandle {
         Ok(WrappedKey { nonce, ciphertext })
     }
 
+    /// Whether `kek` opens `wrapped` *and* the key inside is the one with
+    /// fingerprint `expected_id`, without mapping a page for it.
+    pub fn unwraps_to(kek: &Kek, wrapped: &WrappedKey, aad: &[u8], expected_id: &[u8; 16]) -> bool {
+        crypto::open(kek.expose(), &wrapped.nonce, aad, &wrapped.ciphertext)
+            .is_some_and(|pt| pt.len() == KEY_LEN && id_of(&pt) == *expected_id)
+    }
+
     /// Whether `kek` opens `wrapped`, without mapping a page for the
     /// result: for checks that discard the key.
     pub fn unwraps(kek: &Kek, wrapped: &WrappedKey, aad: &[u8]) -> bool {
@@ -2444,15 +2721,19 @@ impl KeyHandle {
     /// A public fingerprint of this master key: `HKDF(MK, "aleph mk id v1")`
     /// truncated to 16 bytes. Changes whenever MK rotates.
     pub fn id(&self) -> [u8; 16] {
-        let okm = self.derive(b"aleph mk id v1");
-        let mut id = [0u8; 16];
-        id.copy_from_slice(&okm[..16]);
-        id
+        id_of(self.mk.key())
     }
 
     fn derive(&self, info: &[u8]) -> zeroize::Zeroizing<[u8; KEY_LEN]> {
         crypto::hkdf(self.mk.key(), info)
     }
+}
+
+fn id_of(mk: &[u8]) -> [u8; 16] {
+    let okm = crypto::hkdf(mk, b"aleph mk id v1");
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&okm[..16]);
+    id
 }
 
 impl std::fmt::Debug for KeyHandle {
@@ -2498,6 +2779,27 @@ mod tests {
         assert_ne!(a.id(), b.id());
         // The fingerprint is not the key: it cannot unwrap anything.
         assert_ne!(a.id(), [0u8; 16]);
+    }
+
+    #[test]
+    fn unwraps_to_also_checks_which_master_key_it_is() {
+        let mk = KeyHandle::generate().unwrap();
+        let kek = Kek::generate().unwrap();
+        let wrapped = mk.wrap(&kek, b"slot-aad").unwrap();
+        assert!(KeyHandle::unwraps_to(&kek, &wrapped, b"slot-aad", &mk.id()));
+        let other = KeyHandle::generate().unwrap();
+        assert!(!KeyHandle::unwraps_to(
+            &kek,
+            &wrapped,
+            b"slot-aad",
+            &other.id()
+        ));
+        assert!(!KeyHandle::unwraps_to(
+            &kek,
+            &wrapped,
+            b"other-aad",
+            &mk.id()
+        ));
     }
 
     #[test]
@@ -2771,7 +3073,12 @@ impl SlotEntry {
     /// (unknown fields are an error); an unknown one is preserved.
     pub fn decode(raw: &[u8]) -> Result<Self> {
         let malformed = |m: &str| Error::Malformed(format!("keyslot: {m}"));
-        let value: Value = ciborium::from_reader(raw).map_err(|e| malformed(&e.to_string()))?;
+        let mut cursor = std::io::Cursor::new(raw);
+        let value: Value =
+            ciborium::from_reader(&mut cursor).map_err(|e| malformed(&e.to_string()))?;
+        if cursor.position() != raw.len() as u64 {
+            return Err(malformed("trailing data"));
+        }
         let map = value.as_map().ok_or_else(|| malformed("not a map"))?;
         let field = |name: &str| {
             map.iter()
@@ -2939,6 +3246,75 @@ mod tests {
     }
 
     #[test]
+    fn trailing_bytes_after_a_slot_are_malformed() {
+        let mut raw = SlotEntry::Known(recovery_slot()).encode().unwrap();
+        raw.push(0);
+        assert!(matches!(SlotEntry::decode(&raw), Err(Error::Malformed(_))));
+    }
+
+    fn arb_value() -> impl proptest::strategy::Strategy<Value = Value> {
+        use proptest::prelude::*;
+        let leaf = prop_oneof![
+            any::<i64>().prop_map(|i| Value::Integer(i.into())),
+            any::<bool>().prop_map(Value::Bool),
+            ".{0,8}".prop_map(Value::Text),
+            proptest::collection::vec(any::<u8>(), 0..40).prop_map(Value::Bytes),
+            Just(Value::Null),
+        ];
+        leaf.prop_recursive(3, 16, 4, |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
+                proptest::collection::vec((".{0,8}".prop_map(Value::Text), inner), 0..4)
+                    .prop_map(Value::Map),
+            ]
+        })
+    }
+
+    proptest::proptest! {
+        /// Slot maps with plausible structure (known and unknown types,
+        /// arbitrary field values) never panic, and whatever decodes as a
+        /// known slot re-encodes to something that decodes identically.
+        #[test]
+        fn structured_slot_maps_never_panic(
+            slot_type in proptest::prop_oneof![
+                proptest::strategy::Just("tpm".to_string()),
+                proptest::strategy::Just("fido2".to_string()),
+                proptest::strategy::Just("recovery".to_string()),
+                proptest::strategy::Just("login-password".to_string()),
+                "[a-z-]{0,12}",
+            ],
+            kind_fields in proptest::collection::vec((
+                proptest::prop_oneof![
+                    proptest::strategy::Just("public".to_string()),
+                    proptest::strategy::Just("salt".to_string()),
+                    proptest::strategy::Just("xwing_pk".to_string()),
+                    ".{0,10}",
+                ],
+                arb_value(),
+            ), 0..6),
+            top in proptest::collection::vec((
+                proptest::prop_oneof![
+                    proptest::strategy::Just("id".to_string()),
+                    proptest::strategy::Just("nonce".to_string()),
+                    proptest::strategy::Just("wrapped_mk".to_string()),
+                    ".{0,10}",
+                ],
+                arb_value(),
+            ), 0..7),
+        ) {
+            let mut kind = vec![(Value::Text("slot_type".into()), Value::Text(slot_type))];
+            kind.extend(kind_fields.into_iter().map(|(k, v)| (Value::Text(k), v)));
+            let mut map: Vec<(Value, Value)> =
+                top.into_iter().map(|(k, v)| (Value::Text(k), v)).collect();
+            map.push((Value::Text("kind".into()), Value::Map(kind)));
+            if let Ok(entry) = SlotEntry::decode(&encode_value(&Value::Map(map))) {
+                let again = SlotEntry::decode(&entry.encode().unwrap()).unwrap();
+                proptest::prop_assert_eq!(again, entry);
+            }
+        }
+    }
+
+    #[test]
     fn slot_without_a_type_is_malformed() {
         let v = Value::Map(vec![(Value::Text("id".into()), Value::Bytes(vec![0; 16]))]);
         assert!(matches!(
@@ -2987,7 +3363,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ciborium::Value;
 use serde::{Deserialize, Serialize};
@@ -3254,6 +3630,7 @@ impl LockedVault {
         Ok(UnlockedVault {
             vault_id: self.vault_id,
             generation: AtomicU64::new(self.generation),
+            rotated: AtomicBool::new(false),
             entries: self.entries.clone(),
             key,
             body,
@@ -3282,6 +3659,9 @@ pub struct UnlockedVault {
     vault_id: Uuid,
     /// The generation last read or written; the next write uses one more.
     generation: AtomicU64,
+    /// MK rotated since the last write: that write must not leave the
+    /// pre-rotation file (old MK, removed slots) behind as `.bak`.
+    rotated: AtomicBool,
     entries: Vec<SlotEntry>,
     key: KeyHandle,
     body: Body,
@@ -3294,6 +3674,7 @@ impl UnlockedVault {
         Ok(Self {
             vault_id: Uuid::new_v4(),
             generation: AtomicU64::new(0),
+            rotated: AtomicBool::new(false),
             entries: Vec::new(),
             key: KeyHandle::generate()?,
             body: Body::default(),
@@ -3422,6 +3803,12 @@ impl UnlockedVault {
                 return Err(Error::NoSuchKeyslot(*id));
             }
         }
+        let mut dropped: Vec<Uuid> = known(&self.entries)
+            .filter(|s| drop.contains(&s.id))
+            .map(|s| s.id)
+            .collect();
+        dropped.sort();
+        dropped.dedup();
         let keep: Vec<&Keyslot> = known(&self.entries)
             .filter(|s| !drop.contains(&s.id))
             .collect();
@@ -3436,10 +3823,11 @@ impl UnlockedVault {
                 .iter()
                 .find(|(id, _)| *id == slot.id)
                 .ok_or(Error::MissingKek(slot.id))?;
-            if !KeyHandle::unwraps(
+            if !KeyHandle::unwraps_to(
                 kek,
                 &slot.wrapped(),
                 &Keyslot::aad(self.vault_id, slot.id, &slot.kind),
+                &self.key.id(),
             ) {
                 return Err(Error::WrongKek(slot.id));
             }
@@ -3469,24 +3857,35 @@ impl UnlockedVault {
             rewrapped.push(SlotEntry::Known(slot));
         }
 
-        let mut rotation = Rotation {
-            dropped: drop.to_vec(),
+        let rotation = Rotation {
+            dropped,
             dropped_unknown: unknown(&self.entries).cloned().collect(),
         };
-        rotation.dropped.sort();
         self.entries = rewrapped;
         self.key = new_key;
+        self.rotated.store(true, Ordering::SeqCst);
         Ok(rotation)
     }
 
     /// Serialize the next generation, with a fresh body nonce and a
-    /// recomputed header MAC. Fails without a recovery slot.
+    /// recomputed header MAC, and advance the generation. Fails without a
+    /// recovery slot. Use `write` to put a vault on disk: it returns the
+    /// `Mark` of what it wrote.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let generation = self.next_generation()?;
+        let bytes = self.serialize(&self.entries, generation)?;
+        self.generation.fetch_max(generation, Ordering::SeqCst);
+        Ok(bytes)
+    }
+
+    fn next_generation(&self) -> Result<u64> {
         if !known(&self.entries).any(|s| matches!(s.kind, SlotKind::Recovery(_))) {
             return Err(Error::RecoveryRequired);
         }
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        self.serialize(&self.entries, generation)
+        self.generation
+            .load(Ordering::SeqCst)
+            .checked_add(1)
+            .ok_or(Error::GenerationOverflow)
     }
 
     /// A copy for `aleph backup`: the current generation with only the
@@ -3502,10 +3901,20 @@ impl UnlockedVault {
         if recovery.is_empty() {
             return Err(Error::RecoveryRequired);
         }
-        self.serialize(&recovery, self.generation.load(Ordering::SeqCst))
+        // Generations start at 1, even for a never-written vault.
+        self.serialize(&recovery, self.generation.load(Ordering::SeqCst).max(1))
     }
 
     fn serialize(&self, entries: &[SlotEntry], generation: u64) -> Result<Vec<u8>> {
+        self.serialize_with_mk_id(entries, generation, self.key.id())
+    }
+
+    fn serialize_with_mk_id(
+        &self,
+        entries: &[SlotEntry],
+        generation: u64,
+        mk_id: [u8; 16],
+    ) -> Result<Vec<u8>> {
         let keyslots = entries
             .iter()
             .map(|e| e.encode().map(serde_bytes::ByteBuf::from))
@@ -3515,7 +3924,7 @@ impl UnlockedVault {
             &Header {
                 vault_id: self.vault_id,
                 generation,
-                mk_id: self.key.id(),
+                mk_id,
                 keyslots,
             },
             &mut header,
@@ -3537,14 +3946,39 @@ impl UnlockedVault {
         Ok(out)
     }
 
-    /// Atomically replace the vault at `path` with the next generation,
-    /// keeping the previous version as `<path>.bak`. Creates the parent
-    /// directory (0700) and tightens an existing one that is group- or
-    /// world-accessible. Refuses to replace a symlink. Concurrent writers
-    /// are serialized on `<path>.lock`; the vault and backup are always
-    /// intact.
-    pub fn write(&self, path: &Path) -> Result<()> {
-        write_atomic(path, &self.to_bytes()?)
+    /// Atomically replace the vault at `path` with the next generation and
+    /// return that generation's `Mark` (what the daemon records in the
+    /// high-water store).
+    ///
+    /// - The previous version is kept as `<path>.bak`, except on the first
+    ///   write after a rotation, when `.bak` is also the new file (the old
+    ///   one still holds the old MK and any removed slot).
+    /// - The generation is chosen and serialized while holding
+    ///   `<path>.lock`, and committed only after the rename. Concurrent
+    ///   writers therefore get distinct generations, the file on disk is the
+    ///   highest, and a failed write does not advance the generation.
+    /// - Creates the parent directory (0700), tightens an existing one that
+    ///   is group- or world-accessible, and refuses to replace a symlink.
+    pub fn write(&self, path: &Path) -> Result<Mark> {
+        let rotated = self.rotated.load(Ordering::SeqCst);
+        let mut written = 0;
+        write_atomic(
+            path,
+            || {
+                written = self.next_generation()?;
+                self.serialize(&self.entries, written)
+            },
+            rotated,
+        )?;
+        self.generation.fetch_max(written, Ordering::SeqCst);
+        if rotated {
+            self.rotated.store(false, Ordering::SeqCst);
+        }
+        Ok(Mark {
+            vault_id: self.vault_id,
+            generation: written,
+            mk_id: self.key.id(),
+        })
     }
 }
 
@@ -3580,7 +4014,15 @@ fn write_file_synced(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+/// Replace `path` atomically with the bytes `make` produces. `make` runs
+/// while `<path>.lock` is held, so what it reads (e.g. the next generation)
+/// cannot interleave with another writer. With `replace_backup`, `.bak`
+/// becomes a copy of the new file instead of the previous one.
+fn write_atomic(
+    path: &Path,
+    make: impl FnOnce() -> Result<Vec<u8>>,
+    replace_backup: bool,
+) -> Result<()> {
     let dir = path
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
@@ -3610,14 +4052,20 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         .mode(0o600)
         .open(sibling(path, ".lock")?)?;
     lock.lock()?;
-    if path.exists() {
-        let bak_tmp = sibling(path, ".bak.tmp")?;
+    let bytes = make()?;
+    let bak_tmp = sibling(path, ".bak.tmp")?;
+    let bak = sibling(path, ".bak")?;
+    if path.exists() && !replace_backup {
         write_file_synced(&bak_tmp, &fs::read(path)?)?;
-        fs::rename(&bak_tmp, sibling(path, ".bak")?)?;
+        fs::rename(&bak_tmp, &bak)?;
     }
     let tmp = sibling(path, ".tmp")?;
-    write_file_synced(&tmp, bytes)?;
+    write_file_synced(&tmp, &bytes)?;
     fs::rename(&tmp, path)?;
+    if replace_backup {
+        write_file_synced(&bak_tmp, &bytes)?;
+        fs::rename(&bak_tmp, &bak)?;
+    }
     File::open(dir)?.sync_all()?;
     Ok(())
 }
@@ -3644,12 +4092,26 @@ pub(crate) fn write_small_file(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(feature = "insecure-test-params")]
 #[doc(hidden)]
 pub mod testing {
+    use std::sync::atomic::Ordering;
+
     use super::{SlotEntry, UnlockedVault};
+    use crate::error::Result;
 
     /// Add an encoded slot as if a newer aleph had written it.
     pub fn push_unknown(v: &mut UnlockedVault, raw: Vec<u8>) {
         v.entries
             .push(SlotEntry::decode(&raw).expect("decodable slot"));
+    }
+
+    /// Force the generation counter (to test overflow).
+    pub fn set_generation(v: &UnlockedVault, generation: u64) {
+        v.generation.store(generation, Ordering::SeqCst);
+    }
+
+    /// Serialize with a chosen `mk_id` but a valid MAC under the real key:
+    /// what someone holding this (old) MK could forge.
+    pub fn to_bytes_with_mk_id(v: &UnlockedVault, mk_id: [u8; 16]) -> Result<Vec<u8>> {
+        v.serialize_with_mk_id(&v.entries, 1, mk_id)
     }
 }
 ~~~
@@ -3958,7 +4420,7 @@ Expected: `1 passed`. The new file is about 3.1 KB (the X-Wing public key and ci
 
 Run: `cargo test -p aleph-core && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
 Expected:
-- unit `51 passed`, `golden` `1 passed, 1 ignored`, `vault` `20 passed`, `write` `7 passed`, `zeroize` `1 passed`
+- unit `56 passed`, `golden` `1 passed, 1 ignored`, `vault` `25 passed`, `write` `9 passed`, `zeroize` `1 passed`
 - about 20 s in total, of which the exhaustive bit-flip test takes about 10 s
 
 - [ ] **Step 6: Confirm the revocation test has teeth**
@@ -3977,9 +4439,22 @@ Temporarily change the last line of `remove_keyslot` from `self.rotate_master(ke
 (the slot is removed and reported as dropped, but MK is not rotated), then run `cargo test -p aleph-core --test vault removing_a_slot`.
 Expected: FAIL at `assert_ne!(v.mark().mk_id, mk_before)`. Revert, then re-run to confirm it passes.
 
-- [ ] **Step 7: Update the spec's keyslot encoding**
+Also check the high-water fixes, one at a time, restoring after each:
+- Remove ` || key.id() != self.mk_id` from `LockedVault::unlock`. `--test vault a_header_claiming_another_mk_id` must FAIL.
+- In `highwater::compare`, change `(false, false) => Standing::Rekeyed,` to `(false, false) => Standing::Newer,`. `--test vault a_replayed_old_mk` must FAIL.
+- In `UnlockedVault::write`, add `self.generation.fetch_max(written, Ordering::SeqCst);` right after `written = self.next_generation()?;`, which commits the generation before writing. `--test write a_failed_write_does_not_advance` must FAIL.
 
-In `docs/superpowers/specs/2026-09-26-aleph-design.md` §4 Layout, in the header table row for `keyslots`, replace "Each element is one keyslot, below." with "Each element is a byte string holding one keyslot's CBOR, so that unknown slot types can be re-emitted byte-for-byte."
+After restoring each file, re-run the test to confirm it passes. If cargo reports the old failure, `touch` the restored file first, since a restored older mtime can make cargo reuse the mutant build.
+
+- [ ] **Step 7: Update the spec**
+
+In `docs/superpowers/specs/2026-09-26-aleph-design.md` §4:
+
+1. In the Layout header table row for `keyslots`, replace "Each element is one keyslot, below." with "Each element is a byte string holding one keyslot's CBOR, so that unknown slot types can be re-emitted byte-for-byte."
+2. In "Generation and high-water mark":
+   - replace the path `` `$XDG_STATE_HOME/aleph/highwater` `` with `` `$XDG_STATE_HOME/aleph/highwater-<vault_id>` `` (one file per vault)
+   - after the "Same `generation` but a different `mk_id`" bullet, add: "- **Higher `generation` with a different `mk_id`:** MK changed somewhere other than this daemon, or someone holding an old MK is replaying it under a forged generation (`Rekeyed`). Same handling."
+   - add the paragraph: "Only the daemon's own writes move the mark to a new MK: `write` returns the `Mark` it put on disk, and the daemon records exactly that. Marks of files it reads are only ever raised within the same MK."
 
 - [ ] **Step 8: Commit**
 
