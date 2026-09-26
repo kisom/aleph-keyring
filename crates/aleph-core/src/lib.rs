@@ -7,7 +7,9 @@ pub mod crypto;
 pub mod error;
 pub mod kdf;
 pub mod key;
+pub mod recovery;
 
 pub use error::{Error, Result};
 pub use kdf::{Argon2Params, derive_kek};
 pub use key::{Kek, KeyHandle, WrappedKey};
+pub use recovery::RecoveryKey;
