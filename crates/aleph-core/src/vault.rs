@@ -16,7 +16,9 @@
 //! one keyslot yields an `UnlockedVault`, which owns the master key and
 //! the plaintext body and can re-serialize itself.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use ciborium::Value;
@@ -321,4 +323,52 @@ impl UnlockedVault {
         )?;
         Ok(out)
     }
+
+    /// Atomically replace the vault at `path`, keeping the previous
+    /// version as `<path>.bak`. Creates the parent directory (0700).
+    pub fn write(&self, path: &Path) -> Result<()> {
+        write_atomic(path, &self.to_bytes()?)
+    }
+}
+
+fn sibling(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path
+        .file_name()
+        .expect("vault path has a file name")
+        .to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+fn write_file_synced(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if !dir.exists() {
+        fs::create_dir_all(dir)?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    if path.exists() {
+        let bak_tmp = sibling(path, ".bak.tmp");
+        write_file_synced(&bak_tmp, &fs::read(path)?)?;
+        fs::rename(&bak_tmp, sibling(path, ".bak"))?;
+    }
+    let tmp = sibling(path, ".tmp");
+    write_file_synced(&tmp, bytes)?;
+    fs::rename(&tmp, path)?;
+    File::open(dir)?.sync_all()?;
+    Ok(())
 }
