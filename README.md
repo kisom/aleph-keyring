@@ -1,5 +1,7 @@
 # aleph
 
+![](docs/images/aleph.jpg)
+
 A Secret Service (`org.freedesktop.secrets`) keyring for
 [Omarchy](https://omarchy.org), with TPM and FIDO2 unlock. It replaces
 gnome-keyring's secrets store; libsecret applications work unmodified.
