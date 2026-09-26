@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = ["crates/aleph-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.98"
+
+[workspace.dependencies]
+argon2 = "0.6"
+chacha20poly1305 = "0.11"
+ciborium = "0.2"
+getrandom = "0.4"
+hkdf = "0.13"
+hmac = "0.13"
+libc = "0.2"
+proptest = "1"
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+sha2 = "0.11"
+tempfile = "3"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = { version = "1.9", features = ["derive"] }
+
+# Argon2 and the AEAD are unusably slow unoptimized; keep tests fast.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.chacha20poly1305]
+opt-level = 3
+[profile.dev.package.chacha20]
+opt-level = 3
+[profile.dev.package.poly1305]
+opt-level = 3
