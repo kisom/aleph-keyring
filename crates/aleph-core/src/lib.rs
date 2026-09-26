@@ -10,6 +10,7 @@ pub mod key;
 pub mod keyslot;
 pub mod model;
 pub mod recovery;
+pub mod vault;
 
 pub use error::{Error, Result};
 pub use kdf::{Argon2Params, derive_kek};
@@ -17,3 +18,4 @@ pub use key::{Kek, KeyHandle, WrappedKey};
 pub use keyslot::{Argon2Kind, Argon2Slot, Fido2Slot, Keyslot, SlotKind, TpmAuth, TpmSlot};
 pub use model::{Body, Collection, Item, SecretBytes};
 pub use recovery::RecoveryKey;
+pub use vault::{LockedVault, UnlockedVault};
