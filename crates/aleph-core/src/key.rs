@@ -245,12 +245,38 @@ mod tests {
         panic!("no mapping contains {addr:#x}");
     }
 
+    /// Whether this process may mlock another page, probed on a scratch
+    /// mapping so a key that is merely *not* locked still fails the test.
+    fn mlock_is_permitted() -> bool {
+        let len = 4096;
+        // SAFETY: a fresh anonymous mapping, unmapped before returning.
+        unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert_ne!(p, libc::MAP_FAILED);
+            let ok = libc::mlock(p, len) == 0;
+            libc::munmap(p, len);
+            ok
+        }
+    }
+
     /// mlock does not nest: unlocking one key's page must never unlock a
     /// page that another live key still relies on.
     #[test]
     fn dropping_one_key_keeps_another_key_locked() {
         let a = KeyHandle::generate().unwrap();
         let b = KeyHandle::generate().unwrap();
+        if locked_kib(key_addr(&b)) == 0 && !mlock_is_permitted() {
+            // mlock is best effort by design; e.g. RLIMIT_MEMLOCK = 0 in CI.
+            eprintln!("skipping: this environment does not permit mlock");
+            return;
+        }
         assert!(locked_kib(key_addr(&b)) > 0, "key not locked at all");
         drop(a);
         assert!(
