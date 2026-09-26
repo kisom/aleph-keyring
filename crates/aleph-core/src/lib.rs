@@ -5,5 +5,7 @@
 
 pub mod crypto;
 pub mod error;
+pub mod key;
 
 pub use error::{Error, Result};
+pub use key::{Kek, KeyHandle, WrappedKey};
