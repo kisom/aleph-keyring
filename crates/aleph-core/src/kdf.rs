@@ -1,5 +1,7 @@
 //! Argon2id key derivation for the password-like keyslots.
 
+use std::path::Path;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -61,7 +63,7 @@ impl Argon2Params {
         if self.m_kib > Self::MAX.m_kib || self.t > Self::MAX.t || self.p > Self::MAX.p {
             return Err(Error::Kdf(format!("parameters exceed limits: {self:?}")));
         }
-        check_memory(self.m_kib, mem_available_kib())?;
+        check_memory(self.m_kib, memory_limit_kib())?;
         let params = argon2::Params::new(self.m_kib, self.t, self.p, Some(KEY_LEN))
             .map_err(|e| Error::Kdf(e.to_string()))?;
         Ok(argon2::Argon2::new(
@@ -72,33 +74,98 @@ impl Argon2Params {
     }
 }
 
-/// Refuse a derivation that needs more memory than the machine has
-/// available: Rust aborts on allocation failure, so this is the only way a
-/// corrupt slot's `m_kib` becomes an error instead of a crash. `None`
-/// (availability unknown) falls back to the fixed `Argon2Params::MAX` cap.
-fn check_memory(m_kib: u32, available_kib: Option<u64>) -> Result<()> {
-    match available_kib {
-        Some(avail) if u64::from(m_kib) > avail => Err(Error::Kdf(format!(
-            "needs {m_kib} KiB but only {avail} KiB of memory is available"
-        ))),
+/// Refuse a derivation that needs more memory than this process can ever
+/// get. Under Linux overcommit the allocation itself succeeds and the OOM
+/// killer ends the process mid-derivation, so this check is the only way a
+/// corrupt slot's `m_kib` becomes an error instead of a dead daemon.
+/// `None` (limit unknown) falls back to the fixed `Argon2Params::MAX` cap.
+fn check_memory(m_kib: u32, limit_kib: Option<u64>) -> Result<()> {
+    match limit_kib {
+        Some(limit_kib) if u64::from(m_kib) > limit_kib => Err(Error::InsufficientMemory {
+            needed_kib: m_kib.into(),
+            limit_kib,
+        }),
         _ => Ok(()),
     }
 }
 
-fn parse_mem_available(meminfo: &str) -> Option<u64> {
+/// The most memory a derivation in this process can use: RAM plus swap,
+/// lowered by any cgroup v2 limit on the way to the root.
+///
+/// Deliberately capacity, not `MemAvailable`: that is a momentary figure
+/// (it excludes swap and drops when a browser is open) and would turn a
+/// busy desktop into a failed unlock indistinguishable from a bad slot.
+fn memory_limit_kib() -> Option<u64> {
+    let system = parse_system_limit(&std::fs::read_to_string("/proc/meminfo").ok()?);
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|s| {
+            let path = parse_cgroup_path(&s)?.to_owned();
+            cgroup_limit_kib(Path::new("/sys/fs/cgroup"), &path)
+        });
+    match (system, cgroup) {
+        (Some(s), Some(c)) => Some(s.min(c)),
+        (s, c) => s.or(c),
+    }
+}
+
+fn meminfo_kib(meminfo: &str, field: &str) -> Option<u64> {
     meminfo
         .lines()
-        .find_map(|l| l.strip_prefix("MemAvailable:"))
+        .find_map(|l| l.strip_prefix(field)?.strip_prefix(':'))
         .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
 }
 
-fn mem_available_kib() -> Option<u64> {
-    parse_mem_available(&std::fs::read_to_string("/proc/meminfo").ok()?)
+fn parse_system_limit(meminfo: &str) -> Option<u64> {
+    let ram = meminfo_kib(meminfo, "MemTotal")?;
+    Some(ram + meminfo_kib(meminfo, "SwapTotal").unwrap_or(0))
 }
+
+/// The unified (v2) hierarchy's path from `/proc/self/cgroup`.
+fn parse_cgroup_path(proc_cgroup: &str) -> Option<&str> {
+    proc_cgroup
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .map(str::trim)
+}
+
+/// One cgroup's limit from its `memory.max` and `memory.swap.max`. `None`
+/// when either is `max` (or swap is unaccounted): the cgroup then imposes
+/// nothing beyond the system-wide limit.
+fn parse_cgroup_limit(memory_max: &str, swap_max: Option<&str>) -> Option<u64> {
+    let bytes = |s: &str| s.trim().parse::<u64>().ok();
+    Some((bytes(memory_max)? + bytes(swap_max?)?) / 1024)
+}
+
+/// The tightest limit among the cgroup at `path` and its ancestors.
+fn cgroup_limit_kib(root: &Path, path: &str) -> Option<u64> {
+    let mut dir = root.join(path.trim_start_matches('/'));
+    let mut tightest: Option<u64> = None;
+    while dir.starts_with(root) && dir != root {
+        if let Ok(max) = std::fs::read_to_string(dir.join("memory.max")) {
+            let swap = std::fs::read_to_string(dir.join("memory.swap.max")).ok();
+            if let Some(limit) = parse_cgroup_limit(&max, swap.as_deref()) {
+                tightest = Some(tightest.map_or(limit, |t| t.min(limit)));
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    tightest
+}
+
+/// Held for every derivation. `check_memory` vets one derivation against
+/// the limit; running them one at a time keeps two concurrent unlocks from
+/// jointly exceeding it. Derivations take ~1 s, so async callers must
+/// already be on a blocking thread.
+static DERIVE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Derive a KEK from a password-like secret.
 pub fn derive_kek(secret: &[u8], salt: &[u8; SALT_LEN], params: &Argon2Params) -> Result<Kek> {
     let argon2 = params.argon2()?;
+    // A panic mid-derivation leaves no state behind to protect.
+    let _serialized = DERIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     Kek::try_init(|out| {
         argon2
             .hash_password_into(secret, salt, out)
@@ -182,23 +249,84 @@ mod tests {
     }
 
     #[test]
-    fn params_needing_more_memory_than_available_are_rejected() {
-        // A corrupt slot asking for 1 GiB on a machine with 512 MiB free
-        // must be an error, not an out-of-memory abort.
+    fn params_needing_more_memory_than_the_limit_are_rejected() {
+        // A corrupt slot asking for 1 GiB on a 512 MiB machine must be a
+        // distinct error, not an OOM kill and not a generic KDF failure.
         assert!(matches!(
             check_memory(1024 * 1024, Some(512 * 1024)),
-            Err(Error::Kdf(_))
+            Err(Error::InsufficientMemory {
+                needed_kib: 1_048_576,
+                limit_kib: 524_288
+            })
         ));
         assert!(check_memory(1024 * 1024, Some(2 * 1024 * 1024)).is_ok());
-        // Unknown availability (no /proc) falls back to the fixed caps.
+        // Unknown limit (no /proc) falls back to the fixed caps.
         assert!(check_memory(1024 * 1024, None).is_ok());
     }
 
+    /// The limit is capacity (RAM + swap), not the momentary MemAvailable:
+    /// a busy desktop with little free RAM must still unlock.
     #[test]
-    fn mem_available_is_parsed_from_meminfo() {
-        let meminfo = "MemTotal:       32000000 kB\nMemFree:  100 kB\nMemAvailable:   123456 kB\n";
-        assert_eq!(parse_mem_available(meminfo), Some(123456));
-        assert_eq!(parse_mem_available("MemTotal: 1 kB\n"), None);
+    fn system_limit_is_total_ram_plus_swap_not_available() {
+        let meminfo = "MemTotal:        8000000 kB\nMemFree:  100 kB\n\
+                       MemAvailable:     900000 kB\nSwapTotal:       4000000 kB\n";
+        assert_eq!(parse_system_limit(meminfo), Some(12_000_000));
+        let no_swap = "MemTotal:        8000000 kB\nMemAvailable: 1 kB\n";
+        assert_eq!(parse_system_limit(no_swap), Some(8_000_000));
+        assert_eq!(parse_system_limit("SwapTotal: 1 kB\n"), None);
+        assert!(check_memory(1024 * 1024, parse_system_limit(meminfo)).is_ok());
+    }
+
+    #[test]
+    fn cgroup_v2_path_is_parsed() {
+        assert_eq!(
+            parse_cgroup_path("0::/user.slice/user@1000.service/app.slice/alephd.service\n"),
+            Some("/user.slice/user@1000.service/app.slice/alephd.service")
+        );
+        // cgroup v1 hierarchies only: no unified path.
+        assert_eq!(parse_cgroup_path("4:memory:/user.slice\n"), None);
+    }
+
+    #[test]
+    fn cgroup_limit_is_memory_plus_swap_and_max_is_unlimited() {
+        // MemoryMax=512M, MemorySwapMax=256M.
+        assert_eq!(
+            parse_cgroup_limit("536870912\n", Some("268435456\n")),
+            Some(768 * 1024)
+        );
+        assert_eq!(
+            parse_cgroup_limit("536870912\n", Some("0\n")),
+            Some(512 * 1024)
+        );
+        assert_eq!(parse_cgroup_limit("max\n", Some("0\n")), None);
+        // Unlimited or unaccounted swap: the system-wide limit covers it.
+        assert_eq!(parse_cgroup_limit("536870912\n", Some("max\n")), None);
+        assert_eq!(parse_cgroup_limit("536870912\n", None), None);
+        assert_eq!(parse_cgroup_limit("garbage", Some("0")), None);
+    }
+
+    /// The tightest cgroup on the path to the root wins: a slice-level
+    /// MemoryMax binds a service inside it.
+    #[test]
+    fn cgroup_limit_is_the_tightest_ancestor() {
+        let root = tempfile::tempdir().unwrap();
+        let slice = root.path().join("user.slice");
+        let service = slice.join("alephd.service");
+        std::fs::create_dir_all(&service).unwrap();
+        std::fs::write(slice.join("memory.max"), "536870912\n").unwrap();
+        std::fs::write(slice.join("memory.swap.max"), "0\n").unwrap();
+        std::fs::write(service.join("memory.max"), "max\n").unwrap();
+        std::fs::write(service.join("memory.swap.max"), "0\n").unwrap();
+        assert_eq!(
+            cgroup_limit_kib(root.path(), "/user.slice/alephd.service"),
+            Some(512 * 1024)
+        );
+        assert_eq!(cgroup_limit_kib(root.path(), "/"), None);
+    }
+
+    #[test]
+    fn this_machine_has_a_memory_limit() {
+        assert!(memory_limit_kib().is_some_and(|l| l > 0));
     }
 
     #[test]

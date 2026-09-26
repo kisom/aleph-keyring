@@ -48,6 +48,12 @@ pub enum Error {
     #[error("key derivation failed: {0}")]
     Kdf(String),
 
+    /// The slot's Argon2 memory cost exceeds what this machine (RAM plus
+    /// swap, within this process's cgroup) can ever provide. Distinct from
+    /// `Kdf` so callers can say so rather than report a corrupt slot.
+    #[error("key derivation needs {needed_kib} KiB but this system allows at most {limit_kib} KiB")]
+    InsufficientMemory { needed_kib: u64, limit_kib: u64 },
+
     #[error("system randomness unavailable")]
     Random,
 }
