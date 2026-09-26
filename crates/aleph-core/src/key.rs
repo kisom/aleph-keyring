@@ -82,11 +82,14 @@ impl LockedPage {
         if page == libc::MAP_FAILED {
             return Err(Error::Io(std::io::Error::last_os_error()));
         }
-        // SAFETY: `page` is a valid mapping of `len` bytes. Both calls are
+        // SAFETY: `page` is a valid mapping of `len` bytes. All calls are
         // best effort: failure (e.g. RLIMIT_MEMLOCK exhausted) is not fatal.
+        // mlock is not inherited across fork, so WIPEONFORK gives a forked
+        // child zeroes rather than an unlocked copy of the key.
         unsafe {
             libc::mlock(page, len);
             libc::madvise(page, len, libc::MADV_DONTDUMP);
+            libc::madvise(page, len, libc::MADV_WIPEONFORK);
         }
         Ok(Self {
             page: page.cast(),
@@ -254,6 +257,27 @@ mod tests {
             locked_kib(key_addr(&b)) > 0,
             "live key unlocked by dropping another"
         );
+    }
+
+    /// A forked child (the daemon spawning a prompter or swtpm) must not
+    /// inherit a copy of the master key: its copy would not be mlocked.
+    #[test]
+    fn forked_child_sees_a_zeroed_key() {
+        let k = KeyHandle::generate().unwrap();
+        assert_ne!(k.mk.key(), &[0u8; KEY_LEN]);
+        // SAFETY: the child only reads memory and calls `_exit`, both
+        // async-signal-safe, so forking a multithreaded test is sound.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            let wiped = k.mk.key() == &[0u8; KEY_LEN];
+            unsafe { libc::_exit(if wiped { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        // SAFETY: waiting on the child forked above.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status), "child did not exit normally");
+        assert_eq!(libc::WEXITSTATUS(status), 0, "child saw the master key");
     }
 
     /// The daemon shares the unlocked vault across async tasks; the raw

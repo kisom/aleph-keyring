@@ -193,6 +193,11 @@ has no timeout.
   body is encoded into an exactly sized, zeroized buffer and decoded
   without intermediate copies). Page-locking the decrypted body is
   `alephd`'s job (Plan 3).
+- Key pages are also `MADV_DONTDUMP` and `MADV_WIPEONFORK`: `mlock` is not
+  inherited across `fork`, so a forked child sees zeroes instead of an
+  unlocked copy of MK. The decrypted body gets no such protection, so
+  `alephd` starts children (prompter, swtpm) only via `posix_spawn`/`exec`
+  (`std::process::Command`), never a bare `fork`.
 - `alephd` calls `prctl(PR_SET_DUMPABLE, 0)` at startup (no core dumps,
   no same-uid `ptrace`).
 - Locking zeroizes MK, all derived keys, and the decrypted body, and closes
