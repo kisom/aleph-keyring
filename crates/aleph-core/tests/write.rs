@@ -5,6 +5,42 @@ use std::os::unix::fs::PermissionsExt;
 use aleph_core::LockedVault;
 use common::*;
 
+fn mode(path: &std::path::Path) -> u32 {
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// A pre-existing temp file created by some other tool with loose
+/// permissions must not hand those permissions to the vault or backup.
+#[test]
+fn world_readable_leftover_temp_files_do_not_loosen_permissions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.aleph");
+    let (v, ..) = sample();
+    v.write(&path).unwrap();
+    for name in ["vault.aleph.tmp", "vault.aleph.bak.tmp"] {
+        let p = dir.path().join(name);
+        std::fs::write(&p, b"stale").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    v.write(&path).unwrap();
+    assert_eq!(mode(&path), 0o600);
+    assert_eq!(mode(&dir.path().join("vault.aleph.bak")), 0o600);
+}
+
+#[test]
+fn path_without_a_file_name_is_an_error_not_a_panic() {
+    let (v, ..) = sample();
+    for p in ["..", "/"] {
+        assert!(
+            matches!(
+                v.write(std::path::Path::new(p)),
+                Err(aleph_core::Error::Io(_))
+            ),
+            "{p}"
+        );
+    }
+}
+
 #[test]
 fn write_is_atomic_private_and_keeps_a_backup() {
     let dir = tempfile::tempdir().unwrap();

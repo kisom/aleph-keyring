@@ -61,6 +61,7 @@ impl Argon2Params {
         if self.m_kib > Self::MAX.m_kib || self.t > Self::MAX.t || self.p > Self::MAX.p {
             return Err(Error::Kdf(format!("parameters exceed limits: {self:?}")));
         }
+        check_memory(self.m_kib, mem_available_kib())?;
         let params = argon2::Params::new(self.m_kib, self.t, self.p, Some(KEY_LEN))
             .map_err(|e| Error::Kdf(e.to_string()))?;
         Ok(argon2::Argon2::new(
@@ -71,14 +72,38 @@ impl Argon2Params {
     }
 }
 
+/// Refuse a derivation that needs more memory than the machine has
+/// available: Rust aborts on allocation failure, so this is the only way a
+/// corrupt slot's `m_kib` becomes an error instead of a crash. `None`
+/// (availability unknown) falls back to the fixed `Argon2Params::MAX` cap.
+fn check_memory(m_kib: u32, available_kib: Option<u64>) -> Result<()> {
+    match available_kib {
+        Some(avail) if u64::from(m_kib) > avail => Err(Error::Kdf(format!(
+            "needs {m_kib} KiB but only {avail} KiB of memory is available"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn parse_mem_available(meminfo: &str) -> Option<u64> {
+    meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))
+        .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
+}
+
+fn mem_available_kib() -> Option<u64> {
+    parse_mem_available(&std::fs::read_to_string("/proc/meminfo").ok()?)
+}
+
 /// Derive a KEK from a password-like secret.
 pub fn derive_kek(secret: &[u8], salt: &[u8; SALT_LEN], params: &Argon2Params) -> Result<Kek> {
-    let mut out = zeroize::Zeroizing::new([0u8; KEY_LEN]);
-    params
-        .argon2()?
-        .hash_password_into(secret, salt, out.as_mut())
-        .map_err(|e| Error::Kdf(e.to_string()))?;
-    Ok(Kek::from_bytes(*out))
+    let argon2 = params.argon2()?;
+    Kek::try_init(|out| {
+        argon2
+            .hash_password_into(secret, salt, out)
+            .map_err(|e| Error::Kdf(e.to_string()))
+    })
 }
 
 /// Raise the pass count from `floor` until one derivation takes at least
@@ -154,6 +179,26 @@ mod tests {
             derive_kek(b"pw", &[0; SALT_LEN], &bad),
             Err(Error::Kdf(_))
         ));
+    }
+
+    #[test]
+    fn params_needing_more_memory_than_available_are_rejected() {
+        // A corrupt slot asking for 1 GiB on a machine with 512 MiB free
+        // must be an error, not an out-of-memory abort.
+        assert!(matches!(
+            check_memory(1024 * 1024, Some(512 * 1024)),
+            Err(Error::Kdf(_))
+        ));
+        assert!(check_memory(1024 * 1024, Some(2 * 1024 * 1024)).is_ok());
+        // Unknown availability (no /proc) falls back to the fixed caps.
+        assert!(check_memory(1024 * 1024, None).is_ok());
+    }
+
+    #[test]
+    fn mem_available_is_parsed_from_meminfo() {
+        let meminfo = "MemTotal:       32000000 kB\nMemFree:  100 kB\nMemAvailable:   123456 kB\n";
+        assert_eq!(parse_mem_available(meminfo), Some(123456));
+        assert_eq!(parse_mem_available("MemTotal: 1 kB\n"), None);
     }
 
     #[test]

@@ -1,7 +1,5 @@
 mod common;
 
-use std::collections::BTreeMap;
-
 use aleph_core::model::DEFAULT_ALIAS;
 use aleph_core::{Error, Item, LockedVault, SecretBytes, UnlockedVault};
 use ciborium::Value;
@@ -90,6 +88,29 @@ fn deleting_a_keyslot_from_the_file_is_detected() {
     assert!(matches!(
         locked.unlock_argon2(pass, PASSPHRASE),
         Err(Error::HeaderTampered)
+    ));
+}
+
+#[test]
+fn unlock_argon2_on_a_hardware_slot_is_wrong_slot_type() {
+    let (mut v, ..) = sample();
+    let tpm = v
+        .add_keyslot(
+            "tpm",
+            aleph_core::SlotKind::Tpm(aleph_core::TpmSlot {
+                public: vec![1],
+                private: vec![2],
+                auth: aleph_core::TpmAuth::LoginPassword,
+                pcrs: vec![],
+                pcr_bank: None,
+            }),
+            &aleph_core::Kek::generate().unwrap(),
+        )
+        .unwrap();
+    let locked = LockedVault::from_bytes(&v.to_bytes().unwrap()).unwrap();
+    assert!(matches!(
+        locked.unlock_argon2(tpm, b"anything"),
+        Err(Error::WrongSlotType(id)) if id == tpm
     ));
 }
 
@@ -268,11 +289,18 @@ proptest! {
     }
 
     #[test]
-    fn body_round_trips(secret in prop::collection::vec(any::<u8>(), 0..256), label in ".{0,40}") {
+    fn body_round_trips(
+        secret in prop::collection::vec(any::<u8>(), 0..256),
+        label in ".{0,40}",
+        collection_label in ".{0,40}",
+        attributes in prop::collection::btree_map(".{0,20}", ".{0,40}", 0..6),
+    ) {
         let (mut v, rk, rec, _) = sample();
         let login = v.body().resolve_alias(DEFAULT_ALIAS).unwrap().id;
-        v.body_mut().collection_mut(login).unwrap().upsert(
-            Item::new(label.clone(), BTreeMap::new(), SecretBytes::new(secret.clone()), "application/octet-stream"),
+        let c = v.body_mut().collection_mut(login).unwrap();
+        c.label = collection_label;
+        c.upsert(
+            Item::new(label.clone(), attributes, SecretBytes::new(secret.clone()), "application/octet-stream"),
             false,
         );
         let back = LockedVault::from_bytes(&v.to_bytes().unwrap()).unwrap().unlock_argon2(rec, rk.as_bytes()).unwrap();

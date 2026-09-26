@@ -384,20 +384,31 @@ impl UnlockedVault {
     }
 }
 
-fn sibling(path: &Path, suffix: &str) -> std::path::PathBuf {
+fn sibling(path: &Path, suffix: &str) -> Result<std::path::PathBuf> {
     let mut name = path
         .file_name()
-        .expect("vault path has a file name")
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("vault path {} has no file name", path.display()),
+            )
+        })?
         .to_os_string();
     name.push(suffix);
-    path.with_file_name(name)
+    Ok(path.with_file_name(name))
 }
 
+/// Write a fresh 0600 file. Any existing file at `path` (a temp file left
+/// by a crash or another tool) is removed first, because `mode` only
+/// applies when a file is created and would not tighten an existing one.
 fn write_file_synced(path: &Path, bytes: &[u8]) -> Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
     let mut f = OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)?;
     f.write_all(bytes)?;
@@ -415,11 +426,11 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
     if path.exists() {
-        let bak_tmp = sibling(path, ".bak.tmp");
+        let bak_tmp = sibling(path, ".bak.tmp")?;
         write_file_synced(&bak_tmp, &fs::read(path)?)?;
-        fs::rename(&bak_tmp, sibling(path, ".bak"))?;
+        fs::rename(&bak_tmp, sibling(path, ".bak")?)?;
     }
-    let tmp = sibling(path, ".tmp");
+    let tmp = sibling(path, ".tmp")?;
     write_file_synced(&tmp, bytes)?;
     fs::rename(&tmp, path)?;
     File::open(dir)?.sync_all()?;
