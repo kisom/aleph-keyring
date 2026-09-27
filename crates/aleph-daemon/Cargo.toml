@@ -1,0 +1,28 @@
+[package]
+name = "aleph-daemon"
+description = "alephd: the aleph keyring daemon (Secret Service and admin interface)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "alephd"
+path = "src/main.rs"
+
+[dependencies]
+aleph-core = { path = "../aleph-core" }
+aleph-unlock = { path = "../aleph-unlock" }
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml = "1"
+tracing = "0.1"
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+aleph-core = { path = "../aleph-core", features = ["insecure-test-params"] }
+tempfile.workspace = true
+serde.workspace = true

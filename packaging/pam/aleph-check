@@ -1,0 +1,6 @@
+#%PAM-1.0
+# alephd checks a typed login password with this service before offering
+# it to the TPM, so typos never spend the TPM's dictionary-attack budget
+# (spec §5). pam_unix only: no faillock, so a typo in an aleph prompt does
+# not count against the account; alephd limits typed attempts itself.
+auth      required  pam_unix.so
