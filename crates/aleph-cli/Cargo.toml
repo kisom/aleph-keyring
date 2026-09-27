@@ -14,6 +14,7 @@ path = "src/main.rs"
 aleph-prompt-proto = { path = "../aleph-prompt-proto" }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
+libc.workspace = true
 rpassword = "7"
 serde.workspace = true
 serde_json.workspace = true
@@ -24,4 +25,5 @@ zeroize.workspace = true
 [dev-dependencies]
 aleph-core = { path = "../aleph-core", features = ["insecure-test-params"] }
 aleph-daemon = { path = "../aleph-daemon", features = ["testing"] }
+tempfile.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

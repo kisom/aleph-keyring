@@ -38,6 +38,23 @@ enum Cmd {
     Keyslot(KeyslotCmd),
     #[command(subcommand)]
     Recovery(RecoveryCmd),
+    /// Write a backup (only the recovery slot: it opens with the recovery key).
+    Backup {
+        path: std::path::PathBuf,
+        /// Replace an existing file.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Recover with the recovery key: this vault, or a backup file.
+    Restore {
+        path: Option<std::path::PathBuf>,
+        /// Replace an unreadable vault file with its backup copy.
+        #[arg(long, conflicts_with_all = ["path", "accept_rollback"])]
+        from_bak: bool,
+        /// Accept a rolled-back, replaced, or different vault file as current.
+        #[arg(long, conflicts_with = "path")]
+        accept_rollback: bool,
+    },
     /// Print the secret of the item matching attr=value pairs.
     Get {
         attributes: Vec<String>,
@@ -230,6 +247,24 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Recovery(RecoveryCmd::Reissue) => {
             outcome(c.converse("ReissueRecoveryKey", Args::None).await?)?
         }
+        Cmd::Backup { path, force } => backup(&c, &path, force).await?,
+        Cmd::Restore {
+            path,
+            from_bak,
+            accept_rollback,
+        } => {
+            let result = match (path, from_bak, accept_rollback) {
+                (Some(p), _, _) => {
+                    let file =
+                        std::fs::File::open(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+                    c.converse("RestoreBackup", Args::File(file)).await?
+                }
+                (None, true, _) => c.converse("RestoreFromBak", Args::None).await?,
+                (None, _, true) => c.converse("AcceptRollback", Args::None).await?,
+                (None, false, false) => c.converse("Recover", Args::None).await?,
+            };
+            outcome(result)?
+        }
         Cmd::Get { attributes: pairs } => {
             let attrs = attributes(&pairs)?;
             if attrs.is_empty() {
@@ -326,6 +361,51 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `aleph backup`: the CLI creates the file (never following a symlink,
+/// never replacing one without `--force`, which writes a temporary file and
+/// renames it over the target once the daemon is done) and passes it.
+async fn backup(c: &Client, path: &std::path::Path, force: bool) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let target = if force {
+        let name = path
+            .file_name()
+            .ok_or("the backup path has no file name")?
+            .to_string_lossy();
+        path.with_file_name(format!(".{name}.aleph-tmp"))
+    } else {
+        path.to_path_buf()
+    };
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&target)
+        .map_err(|e| {
+            if force && e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "{}: left by an interrupted `aleph backup --force`; remove it and try again",
+                    target.display()
+                )
+            } else {
+                format!("{}: {e}", target.display())
+            }
+        })?;
+    let result = c.converse("Backup", Args::File(file)).await;
+    let ok = matches!(&result, Ok(o) if o.ok);
+    if force && ok {
+        std::fs::rename(&target, path).map_err(|e| format!("{}: {e}", path.display()))?;
+    } else if !ok {
+        let _ = std::fs::remove_file(&target);
+    }
+    outcome(result?)?;
+    eprintln!(
+        "aleph: note: copies of ~/.local/share/aleph made any other way hold every keyslot \
+         (including a login-password slot on machines without a TPM); `aleph backup` holds only the recovery slot"
+    );
+    Ok(())
 }
 
 fn term_line(term: &mut prompter::Terminal, prompt: &str) -> Result<String> {

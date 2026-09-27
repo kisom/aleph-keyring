@@ -56,6 +56,8 @@ pub enum Args<'a> {
     Str(&'a str),
     Bool(bool),
     Str2(&'a str, &'a str),
+    /// A file the daemon reads or writes (passed as a descriptor).
+    File(std::fs::File),
 }
 
 pub struct Client {
@@ -149,6 +151,10 @@ impl Client {
             Args::Str(a) => admin.call_method(method, &(fd, a)).await,
             Args::Bool(b) => admin.call_method(method, &(fd, b)).await,
             Args::Str2(a, b) => admin.call_method(method, &(fd, a, b)).await,
+            Args::File(f) => {
+                let f = zbus::zvariant::OwnedFd::from(OwnedFd::from(f));
+                admin.call_method(method, &(fd, f)).await
+            }
         }
         .map_err(|e| format!("cannot reach alephd: {e}"))?;
         tokio::task::spawn_blocking(move || prompter::converse(ours, &mut Terminal::new()))

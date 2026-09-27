@@ -42,6 +42,59 @@ fn slot_id(id: &str) -> zbus::fdo::Result<Uuid> {
         .map_err(|_| zbus::fdo::Error::InvalidArgs(format!("not a keyslot id: {id:?}")))
 }
 
+/// The largest backup file read (a vault this size holds a great deal).
+const MAX_BACKUP: u64 = 64 * 1024 * 1024;
+
+/// A restore file's bytes: a regular file only (a pipe, terminal, or socket
+/// could hold the reading thread indefinitely), at most `MAX_BACKUP`.
+fn read_backup(file: std::fs::File) -> zbus::fdo::Result<Vec<u8>> {
+    use std::io::Read;
+    if !file.metadata().map_err(failed)?.is_file() {
+        return Err(zbus::fdo::Error::InvalidArgs(
+            "a backup is read only from a regular file".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_BACKUP + 1)
+        .read_to_end(&mut bytes)
+        .map_err(failed)?;
+    if bytes.len() as u64 > MAX_BACKUP {
+        return Err(zbus::fdo::Error::InvalidArgs(
+            "that file is too large to be a backup".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Refuse a backup target that is not a new (empty) regular file, or lies
+/// inside aleph's data or state directory. (A hard link to the vault
+/// elsewhere is not empty.)
+fn check_backup_target(paths: &Paths, file: &std::fs::File) -> zbus::fdo::Result<()> {
+    use std::os::fd::AsRawFd;
+    let meta = file.metadata().map_err(failed)?;
+    if !meta.is_file() {
+        return Err(zbus::fdo::Error::InvalidArgs(
+            "the backup target is not a regular file".into(),
+        ));
+    }
+    if meta.len() != 0 {
+        return Err(zbus::fdo::Error::InvalidArgs(
+            "the backup target is not empty (a backup goes only into a new file)".into(),
+        ));
+    }
+    let path = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).map_err(failed)?;
+    for dir in [&paths.data_dir, &paths.state_dir] {
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+        if path.starts_with(&dir) {
+            return Err(zbus::fdo::Error::InvalidArgs(format!(
+                "a backup cannot go inside {}",
+                dir.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl Admin {
     fn timeout(&self) -> Duration {
         Duration::from_secs(self.config.lock().unwrap().prompt.timeout)
@@ -143,6 +196,57 @@ impl Admin {
         self.converse(prompter, |k, chan| k.reissue_recovery(chan))
     }
 
+    /// Recover the current vault with the recovery key (`aleph restore`).
+    async fn recover(&self, prompter: zbus::zvariant::OwnedFd) -> zbus::fdo::Result<()> {
+        self.converse(prompter, |k, chan| k.recover(chan, None))
+    }
+
+    /// Restore the backup file `file` (opened by the caller) with its
+    /// recovery key (`aleph restore <file>`).
+    async fn restore_backup(
+        &self,
+        prompter: zbus::zvariant::OwnedFd,
+        file: zbus::zvariant::OwnedFd,
+    ) -> zbus::fdo::Result<()> {
+        let file = std::fs::File::from(OwnedFd::from(file));
+        let bytes = tokio::task::spawn_blocking(move || read_backup(file))
+            .await
+            .map_err(failed)??;
+        self.converse(prompter, move |k, chan| k.recover(chan, Some(&bytes)))
+    }
+
+    /// Replace an unreadable vault file with its backup copy
+    /// (`aleph restore --from-bak`).
+    async fn restore_from_bak(&self, prompter: zbus::zvariant::OwnedFd) -> zbus::fdo::Result<()> {
+        self.converse(prompter, |k, chan| k.restore_from_bak(chan))
+    }
+
+    /// Accept a rolled-back, replaced, or different vault file
+    /// (`aleph restore --accept-rollback`).
+    async fn accept_rollback(&self, prompter: zbus::zvariant::OwnedFd) -> zbus::fdo::Result<()> {
+        self.converse(prompter, |k, chan| k.accept_rollback(chan))
+    }
+
+    /// Write a backup into `file`, which the caller opened: a regular file
+    /// outside aleph's own directories (a backup over the live vault would
+    /// leave only the recovery slot).
+    async fn backup(
+        &self,
+        prompter: zbus::zvariant::OwnedFd,
+        file: zbus::zvariant::OwnedFd,
+    ) -> zbus::fdo::Result<()> {
+        let file = std::fs::File::from(OwnedFd::from(file));
+        check_backup_target(&self.paths, &file)?;
+        self.converse(prompter, move |k, chan| {
+            k.backup(chan, |bytes| {
+                use std::io::Write;
+                (&file).write_all(bytes)?;
+                file.sync_all()?;
+                Ok(())
+            })
+        })
+    }
+
     /// Clear a keyslot's stale mark so it is tried again.
     async fn retry_keyslot(&self, id: String) -> zbus::fdo::Result<()> {
         self.keyring.retry_slot(slot_id(&id)?).map_err(failed)
@@ -173,5 +277,45 @@ impl Admin {
                 Ok(Some(format!("{key} = {value}")))
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pipe (or a terminal, a socket) is never read as a backup: it
+    /// could hold a daemon thread until the other end closes.
+    #[test]
+    fn only_a_regular_file_is_read_as_a_backup() {
+        let (r, w) = std::io::pipe().unwrap();
+        drop(w);
+        let f = std::fs::File::from(OwnedFd::from(r));
+        assert!(read_backup(f).is_err());
+    }
+
+    /// A backup goes only into a new, empty regular file outside aleph's
+    /// directories (a hard link to the vault elsewhere is not empty).
+    #[test]
+    fn a_backup_target_must_be_empty_and_outside_aleph() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(&dir.path().join("aleph"));
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        let outside = dir.path().join("backup");
+        std::fs::write(&outside, b"").unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&outside)
+            .unwrap();
+        assert!(check_backup_target(&paths, &f).is_ok());
+        std::fs::write(&outside, b"a vault").unwrap();
+        assert!(check_backup_target(&paths, &f).is_err());
+        let inside = paths.data_dir.join("copy");
+        std::fs::write(&inside, b"").unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&inside)
+            .unwrap();
+        assert!(check_backup_target(&paths, &f).is_err());
     }
 }

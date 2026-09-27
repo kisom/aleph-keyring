@@ -253,3 +253,87 @@ async fn get_needs_attributes() {
         "{err}"
     );
 }
+
+/// The recovery key `aleph setup` showed (in its output).
+fn recovery_key_in(log: &str) -> String {
+    log.lines()
+        .map(str::trim)
+        .find(|l| l.matches('-').count() == 13)
+        .expect("the recovery key was shown")
+        .to_string()
+}
+
+/// `aleph backup` writes a file holding only the recovery slot, never over
+/// an existing file without `--force`, never inside aleph's own directory;
+/// `aleph restore <file>` restores it with the recovery key.
+#[tokio::test(flavor = "multi_thread")]
+async fn backup_and_restore_through_the_cli() {
+    let d = daemon(false, vec![]).await;
+    let key = recovery_key_in(&setup(&d).await);
+    run(&d, &["store", "--label", "Kept", "k=kept"], "in the backup").await;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("keyring.backup");
+    let f = file.to_str().unwrap();
+    let (ok, _, err) = run(&d, &["backup", f], &format!("{PW}\n")).await;
+    assert!(ok, "{err}");
+    let first = std::fs::read(&file).unwrap();
+    let backup = aleph_core::LockedVault::read(&file).unwrap();
+    assert!(
+        backup
+            .keyslots()
+            .all(|s| matches!(s.kind, aleph_core::SlotKind::Recovery(_)))
+    );
+    let (ok, _, _) = run(&d, &["backup", f], &format!("{PW}\n")).await;
+    assert!(!ok, "an existing file is not replaced without --force");
+    assert_eq!(std::fs::read(&file).unwrap(), first);
+    // A symlink is never followed.
+    let target = dir.path().join("elsewhere");
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let (ok, _, _) = run(&d, &["backup", link.to_str().unwrap()], &format!("{PW}\n")).await;
+    assert!(!ok);
+    assert!(!target.exists());
+    let (ok, _, err) = run(&d, &["backup", "--force", f], &format!("{PW}\n")).await;
+    assert!(ok, "{err}");
+    let inside = d.env.paths.data_dir.join("copy");
+    let (ok, _, err) = run(
+        &d,
+        &["backup", inside.to_str().unwrap()],
+        &format!("{PW}\n"),
+    )
+    .await;
+    assert!(!ok && err.contains("cannot go inside"), "{err}");
+    assert!(!inside.exists());
+    run(
+        &d,
+        &["store", "--label", "Later", "k=later"],
+        "written after the backup",
+    )
+    .await;
+    d.secrets.lock().await.unwrap();
+    // The current vault's password, yes to losing what came after the
+    // backup, the recovery key, a new method (the password), and no new
+    // recovery key.
+    let (ok, _, err) = run(
+        &d,
+        &["restore", f],
+        &format!("{PW}\ny\n{key}\np\n{PW}\nn\n"),
+    )
+    .await;
+    assert!(ok && err.contains("The keyring is restored"), "{err}");
+    // Secret Service clients see the restored items, and not the later one.
+    let (ok, out, _) = run(&d, &["get", "k=kept"], "").await;
+    assert!(ok && out.contains("in the backup"), "{out}");
+    let (ok, _, _) = run(&d, &["get", "k=later"], "").await;
+    assert!(!ok);
+}
+
+/// Restore says when there is nothing to do.
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_says_when_there_is_nothing_to_do() {
+    let d = daemon(true, vec![]).await;
+    let (ok, _, err) = run(&d, &["restore"], "").await;
+    assert!(!ok && err.contains("nothing to recover"), "{err}");
+    let (ok, _, err) = run(&d, &["restore", "--accept-rollback"], "").await;
+    assert!(!ok && err.contains("nothing to accept"), "{err}");
+}
