@@ -77,6 +77,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aleph-unlock"
+version = "0.1.0"
+dependencies = [
+ "aleph-core",
+ "aleph-tpm-proto",
+ "aleph-tpmd",
+ "libc",
+ "tempfile",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "argon2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

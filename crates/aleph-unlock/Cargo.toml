@@ -1,0 +1,20 @@
+[package]
+name = "aleph-unlock"
+description = "TPM (via aleph-tpmd) and FIDO2 key-encryption-key providers for the aleph keyring"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aleph-core = { path = "../aleph-core" }
+aleph-tpm-proto = { path = "../aleph-tpm-proto" }
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+aleph-core = { path = "../aleph-core", features = ["insecure-test-params"] }
+aleph-tpm-proto = { path = "../aleph-tpm-proto" }
+aleph-tpmd = { path = "../aleph-tpmd", features = ["testing"] }
+libc.workspace = true
+tempfile.workspace = true
