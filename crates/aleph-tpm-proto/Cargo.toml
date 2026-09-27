@@ -1,0 +1,17 @@
+[package]
+name = "aleph-tpm-proto"
+description = "Wire protocol between alephd and the aleph-tpmd TPM helper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ciborium.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

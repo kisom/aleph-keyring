@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/aleph-core"]
+members = ["crates/aleph-core", "crates/aleph-tpm-proto"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,7 @@ rust-version = "1.98"
 argon2 = "0.6"
 chacha20poly1305 = "0.11"
 ciborium = "0.2"
+fido2-rs = "0.6"
 getrandom = "0.4"
 hkdf = "0.13"
 hex = "0.4"
@@ -26,6 +27,7 @@ serde_json = "1"
 sha2 = "0.11"
 tempfile = "3"
 thiserror = "2"
+tss-esapi = "7.7"
 uuid = { version = "1", features = ["v4", "serde"] }
 # Pinned exactly: recovery keys must open vaults forever, and the crate
 # tracks a draft (the local KATs against the draft vectors are the tripwire).

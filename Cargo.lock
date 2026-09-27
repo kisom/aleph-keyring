@@ -40,6 +40,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "aleph-tpm-proto"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "proptest",
+ "serde",
+ "serde_bytes",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "argon2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
