@@ -295,3 +295,35 @@ impl Launcher for InteractiveLauncher {
         Ok(Interactive::new(scripts.remove(0)).channel())
     }
 }
+
+/// A private session bus, killed on drop.
+pub struct Bus {
+    child: std::process::Child,
+    pub address: String,
+}
+
+impl Drop for Bus {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+pub fn bus() -> Bus {
+    let mut child = std::process::Command::new("dbus-daemon")
+        .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("dbus-daemon (Arch: pacman -S dbus)");
+    let mut line = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+        &mut line,
+    )
+    .unwrap();
+    Bus {
+        child,
+        address: line.trim().to_string(),
+    }
+}

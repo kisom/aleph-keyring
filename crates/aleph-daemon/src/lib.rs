@@ -6,6 +6,7 @@ pub mod keyring;
 pub mod password;
 pub mod paths;
 pub mod prompt;
+pub mod secret;
 pub mod state;
 pub mod store;
 

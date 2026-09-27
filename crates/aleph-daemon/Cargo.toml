@@ -14,6 +14,12 @@ path = "src/main.rs"
 testing = ["dep:aleph-tpmd", "dep:tempfile", "aleph-core/insecure-test-params"]
 
 [dependencies]
+aes = "0.9"
+cbc = { version = "0.2", features = ["alloc"] }
+futures-util = { version = "0.3", default-features = false }
+hkdf.workspace = true
+num-bigint = "0.4"
+sha2.workspace = true
 aleph-core = { path = "../aleph-core" }
 aleph-prompt-proto = { path = "../aleph-prompt-proto" }
 aleph-tpm-proto = { path = "../aleph-tpm-proto" }
@@ -22,9 +28,11 @@ libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 toml = "1"
 tracing = "0.1"
 uuid.workspace = true
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 zeroize.workspace = true
 aleph-tpmd = { path = "../aleph-tpmd", features = ["testing"], optional = true }
 tempfile = { workspace = true, optional = true }
