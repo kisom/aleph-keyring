@@ -1,0 +1,15 @@
+[Unit]
+Description=aleph keyring daemon: the login password socket
+Documentation=https://github.com/kisom/aleph-keyring
+
+[Socket]
+# pam_aleph connects here (as the user) to hand over the login password;
+# a connection starts alephd.service if it is not running yet. alephd
+# checks the peer's uid itself (SO_PEERCRED).
+ListenStream=%t/aleph/pam.sock
+FileDescriptorName=pam
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

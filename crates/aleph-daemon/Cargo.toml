@@ -21,6 +21,7 @@ hkdf.workspace = true
 num-bigint = "0.4"
 sha2.workspace = true
 aleph-core = { path = "../aleph-core" }
+aleph-pam-proto = { path = "../aleph-pam-proto" }
 aleph-prompt-proto = { path = "../aleph-prompt-proto" }
 aleph-tpm-proto = { path = "../aleph-tpm-proto" }
 aleph-unlock = { path = "../aleph-unlock" }
@@ -28,7 +29,7 @@ libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
 toml = "1"
 tracing = "0.1"
 tracing-journald = "0.3"

@@ -266,6 +266,12 @@ pub struct TypedLimiter {
 impl TypedLimiter {
     /// `Some(wait)` if typing is blocked now.
     pub fn blocked(&mut self, now: Instant) -> Option<Duration> {
+        (self.recent(now) >= TYPED_FAILURES)
+            .then(|| TYPED_WINDOW.saturating_sub(now.duration_since(self.failures[0])))
+    }
+
+    /// Failures within the window.
+    pub fn recent(&mut self, now: Instant) -> usize {
         while self
             .failures
             .front()
@@ -273,8 +279,7 @@ impl TypedLimiter {
         {
             self.failures.pop_front();
         }
-        (self.failures.len() >= TYPED_FAILURES)
-            .then(|| TYPED_WINDOW.saturating_sub(now.duration_since(self.failures[0])))
+        self.failures.len()
     }
 
     pub fn record_failure(&mut self, now: Instant) {

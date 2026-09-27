@@ -70,4 +70,9 @@ impl Paths {
     pub fn slot_state(&self) -> PathBuf {
         self.state_dir.join("slots.json")
     }
+
+    /// Where `pam_aleph` hands over the login password (§6).
+    pub fn pam_socket(&self) -> PathBuf {
+        self.runtime_dir.join("pam.sock")
+    }
 }

@@ -348,8 +348,22 @@ pub struct Daemon {
 }
 
 pub async fn daemon(create: bool, prompts: Vec<Vec<FromPrompter>>) -> Daemon {
+    daemon_with(create, prompts, Box::new(Fixed(|p| p == PW))).await
+}
+
+/// `daemon`, with the given password check (PAM).
+pub async fn daemon_with(
+    create: bool,
+    prompts: Vec<Vec<FromPrompter>>,
+    check: Box<dyn crate::password::PasswordCheck>,
+) -> Daemon {
     let env = env();
-    let keyring = Arc::new(keyring(&env, MockKeys::default()));
+    let keyring = Arc::new(keyring_with(
+        &env,
+        Box::new(TpmClient::new(env.socket.clone())),
+        MockKeys::default(),
+        check,
+    ));
     if create {
         create_with_password(&keyring);
     }

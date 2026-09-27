@@ -83,6 +83,7 @@ dependencies = [
  "aes",
  "aleph-core",
  "aleph-daemon",
+ "aleph-pam-proto",
  "aleph-prompt-proto",
  "aleph-tpm-proto",
  "aleph-tpmd",

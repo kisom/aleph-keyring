@@ -55,10 +55,25 @@ async fn run() -> Result<(), String> {
         .map_err(|e| {
             format!("cannot own {SECRETS_NAME} on the session bus (is gnome-keyring still running?): {e}")
         })?;
-    aleph_daemon::daemon::serve(&conn, keyring, launcher, config, paths)
+    let pam_socket = paths.pam_socket();
+    let secrets = aleph_daemon::daemon::serve(&conn, keyring.clone(), launcher, config, paths)
         .await
         .map_err(|e| e.to_string())?;
     tracing::info!("serving {SECRETS_NAME} and {BUS_NAME}");
+    // Login unlock needs pam.sock; without it the rest still works.
+    match aleph_daemon::pamsock::listener(&pam_socket) {
+        Ok(listener) => {
+            tokio::spawn(async move {
+                if let Err(e) = aleph_daemon::pamsock::serve(listener, keyring, secrets).await {
+                    tracing::error!("pam.sock stopped: {e}");
+                }
+            });
+        }
+        Err(e) => tracing::warn!(
+            "no pam.sock ({}): login unlock is unavailable: {e}",
+            pam_socket.display()
+        ),
+    }
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| e.to_string())?;
     tokio::select! {
