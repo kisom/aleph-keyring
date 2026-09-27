@@ -1,6 +1,8 @@
 //! `alephd`, the aleph keyring daemon (spec §6).
 
+pub mod admin;
 pub mod config;
+pub mod daemon;
 pub mod error;
 pub mod keyring;
 pub mod password;

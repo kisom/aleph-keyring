@@ -1,0 +1,19 @@
+[Unit]
+Description=aleph keyring daemon
+Documentation=https://github.com/kisom/aleph-keyring
+
+[Service]
+# Started by D-Bus activation (org.freedesktop.secrets, io.aleph.Keyring).
+Type=dbus
+BusName=org.freedesktop.secrets
+ExecStart=/usr/lib/aleph/alephd
+Restart=on-failure
+# alephd holds the master key while unlocked: no core dumps (it also sets
+# PR_SET_DUMPABLE=0 itself).
+LimitCORE=0
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+# Not NoNewPrivileges: checking the login password with pam_unix runs the
+# setuid unix_chkpwd helper.

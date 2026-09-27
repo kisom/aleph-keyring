@@ -327,3 +327,49 @@ pub fn bus() -> Bus {
         address: line.trim().to_string(),
     }
 }
+
+/// A daemon (Secret Service and admin interface) on a private bus, with a
+/// keyring on a swtpm TPM helper. `create` makes the vault (unlocked);
+/// `prompts` answer Secret Service prompts, one list per prompt.
+pub struct Daemon {
+    pub secrets: Arc<crate::secret::service::SecretService>,
+    pub keyring: Arc<Keyring>,
+    pub bus: Bus,
+    pub conn: zbus::Connection,
+    pub env: Env,
+}
+
+pub async fn daemon(create: bool, prompts: Vec<Vec<FromPrompter>>) -> Daemon {
+    let env = env();
+    let keyring = Arc::new(keyring(&env, MockKeys::default()));
+    if create {
+        create_with_password(&keyring);
+    }
+    let bus = bus();
+    let conn = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name("org.freedesktop.secrets")
+        .unwrap()
+        .name(crate::admin::BUS_NAME)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let launcher = Arc::new(InteractiveLauncher::new(prompts));
+    let secrets = crate::daemon::serve(
+        &conn,
+        keyring.clone(),
+        launcher,
+        Arc::new(std::sync::Mutex::new(crate::config::Config::default())),
+        env.paths.clone(),
+    )
+    .await
+    .unwrap();
+    Daemon {
+        secrets,
+        keyring,
+        bus,
+        conn,
+        env,
+    }
+}
