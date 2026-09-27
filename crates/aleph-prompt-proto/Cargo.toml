@@ -1,0 +1,14 @@
+[package]
+name = "aleph-prompt-proto"
+description = "The prompter protocol between alephd and its prompters (GUI or terminal)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -49,6 +49,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aleph-prompt-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "zeroize",
+]
+
+[[package]]
 name = "aleph-tpm-proto"
 version = "0.1.0"
 dependencies = [
