@@ -3,6 +3,7 @@
 //! See `docs/superpowers/specs/2026-09-26-aleph-design.md` §5.
 
 pub mod error;
+pub mod fido2;
 pub mod tpm;
 
 pub use error::{Error, Result};
