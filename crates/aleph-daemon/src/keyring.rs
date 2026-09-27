@@ -150,6 +150,8 @@ pub struct Keyring {
     pub argon2: Argon2Params,
     /// How long to wait for a FIDO2 key to be plugged in.
     pub key_wait: Duration,
+    /// When the body was last read or written (for the idle lock).
+    last_access: Mutex<Instant>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -179,11 +181,18 @@ impl Keyring {
             ops: Mutex::new(()),
             argon2: Argon2Params::LOGIN_PASSWORD_FLOOR,
             key_wait: Duration::from_secs(120),
+            last_access: Mutex::new(Instant::now()),
         }
     }
 
     pub fn is_locked(&self) -> bool {
         lock(&self.inner).vault.is_none()
+    }
+
+    /// How long since the body was last read or written, or the vault
+    /// unlocked (`lock.idle_timeout`).
+    pub fn idle_for(&self) -> Duration {
+        lock(&self.last_access).elapsed()
     }
 
     pub fn status(&self) -> Result<Status> {
@@ -243,6 +252,7 @@ impl Keyring {
     /// Read the unlocked body.
     pub fn read<T>(&self, f: impl FnOnce(&Body) -> T) -> Result<T> {
         let inner = lock(&self.inner);
+        *lock(&self.last_access) = Instant::now();
         inner
             .vault
             .as_ref()
@@ -254,6 +264,7 @@ impl Keyring {
     /// in-memory body is restored, so memory never runs ahead of the file.
     pub fn modify<T>(&self, f: impl FnOnce(&mut Body) -> Result<T>) -> Result<T> {
         let mut inner = lock(&self.inner);
+        *lock(&self.last_access) = Instant::now();
         let Inner {
             store,
             vault,
@@ -825,6 +836,7 @@ impl Keyring {
         inner.state.retain(|id| ids.contains(&id))?;
         inner.vault = Some(vault);
         inner.untrusted = untrusted;
+        *lock(&self.last_access) = Instant::now();
         Ok(untrusted.map(|why| Error::Untrusted(why).to_string()))
     }
 

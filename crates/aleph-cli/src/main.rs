@@ -316,6 +316,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         }
         Cmd::Config(ConfigCmd::Get { key }) => println!("{}", c.get_config(&key).await?),
         Cmd::Config(ConfigCmd::Set { key, value }) => {
+            if key == "lock.on_suspend" && value == "false" {
+                eprintln!(
+                    "aleph: warning: the keyring will stay unlocked through suspend and hibernation; \
+                     the master key can then be written to a hibernation image (keep swap encrypted)"
+                );
+            }
             outcome(c.converse("SetConfig", Args::Str2(&key, &value)).await?)?;
         }
     }

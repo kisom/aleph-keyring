@@ -395,3 +395,127 @@ pub async fn daemon_with(
         env,
     }
 }
+
+/// A stand-in for logind on a test bus: it hands out sleep inhibitors
+/// (keeping the far end of each, to see when it is released) and sends
+/// `PrepareForSleep` and `Session.Lock` when told. It serves two sessions:
+/// `mine` (this user's) and `other` (another uid's).
+pub struct Logind {
+    pub conn: zbus::Connection,
+    inhibitors: Arc<std::sync::Mutex<Vec<std::os::unix::net::UnixStream>>>,
+}
+
+struct LogindManager {
+    inhibitors: Arc<std::sync::Mutex<Vec<std::os::unix::net::UnixStream>>>,
+}
+
+#[zbus::interface(name = "org.freedesktop.login1.Manager")]
+impl LogindManager {
+    fn inhibit(
+        &self,
+        what: String,
+        _who: String,
+        _why: String,
+        mode: String,
+    ) -> zbus::fdo::Result<zbus::zvariant::OwnedFd> {
+        if (what.as_str(), mode.as_str()) != ("sleep", "delay") {
+            return Err(zbus::fdo::Error::InvalidArgs(format!("{what}/{mode}")));
+        }
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair()
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        self.inhibitors.lock().unwrap().push(ours);
+        Ok(std::os::fd::OwnedFd::from(theirs).into())
+    }
+
+    #[zbus(signal)]
+    async fn prepare_for_sleep(
+        emitter: &zbus::object_server::SignalEmitter<'_>,
+        start: bool,
+    ) -> zbus::Result<()>;
+}
+
+struct LogindSession {
+    uid: u32,
+}
+
+#[zbus::interface(name = "org.freedesktop.login1.Session")]
+impl LogindSession {
+    #[zbus(property)]
+    fn user(&self) -> (u32, zbus::zvariant::OwnedObjectPath) {
+        (
+            self.uid,
+            zbus::zvariant::OwnedObjectPath::try_from(format!(
+                "/org/freedesktop/login1/user/_{}",
+                self.uid
+            ))
+            .unwrap(),
+        )
+    }
+
+    #[zbus(signal)]
+    async fn lock(emitter: &zbus::object_server::SignalEmitter<'_>) -> zbus::Result<()>;
+}
+
+const LOGIND_PATH: &str = "/org/freedesktop/login1";
+
+impl Logind {
+    pub async fn start(address: &str) -> Self {
+        let inhibitors = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // SAFETY: getuid cannot fail.
+        let me = unsafe { libc::getuid() };
+        let conn = zbus::connection::Builder::address(address)
+            .unwrap()
+            .name("org.freedesktop.login1")
+            .unwrap()
+            .serve_at(
+                LOGIND_PATH,
+                LogindManager {
+                    inhibitors: inhibitors.clone(),
+                },
+            )
+            .unwrap()
+            .serve_at(
+                "/org/freedesktop/login1/session/mine",
+                LogindSession { uid: me },
+            )
+            .unwrap()
+            .serve_at(
+                "/org/freedesktop/login1/session/other",
+                LogindSession { uid: me + 1 },
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        Self { conn, inhibitors }
+    }
+
+    /// Send `PrepareForSleep(start)`.
+    pub async fn sleep(&self, start: bool) {
+        let emitter = zbus::object_server::SignalEmitter::new(&self.conn, LOGIND_PATH).unwrap();
+        LogindManager::prepare_for_sleep(&emitter, start)
+            .await
+            .unwrap();
+    }
+
+    /// Send `Session.Lock` from the session `mine` or `other`.
+    pub async fn lock_session(&self, session: &str) {
+        let path = format!("/org/freedesktop/login1/session/{session}");
+        let emitter = zbus::object_server::SignalEmitter::new(&self.conn, path).unwrap();
+        LogindSession::lock(&emitter).await.unwrap();
+    }
+
+    /// Inhibitors handed out so far.
+    pub fn inhibitors(&self) -> usize {
+        self.inhibitors.lock().unwrap().len()
+    }
+
+    /// Whether the `n`th inhibitor has been released (its holder closed it).
+    pub fn released(&self, n: usize) -> bool {
+        use std::io::Read;
+        let mut list = self.inhibitors.lock().unwrap();
+        let s = &mut list[n];
+        s.set_nonblocking(true).unwrap();
+        matches!(s.read(&mut [0u8; 1]), Ok(0))
+    }
+}

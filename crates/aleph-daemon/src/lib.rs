@@ -5,6 +5,7 @@ pub mod config;
 pub mod daemon;
 pub mod error;
 pub mod keyring;
+pub mod lockpolicy;
 pub mod pamsock;
 pub mod password;
 pub mod paths;

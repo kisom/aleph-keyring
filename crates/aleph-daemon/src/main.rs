@@ -56,10 +56,31 @@ async fn run() -> Result<(), String> {
             format!("cannot own {SECRETS_NAME} on the session bus (is gnome-keyring still running?): {e}")
         })?;
     let pam_socket = paths.pam_socket();
-    let secrets = aleph_daemon::daemon::serve(&conn, keyring.clone(), launcher, config, paths)
-        .await
-        .map_err(|e| e.to_string())?;
+    let secrets =
+        aleph_daemon::daemon::serve(&conn, keyring.clone(), launcher, config.clone(), paths)
+            .await
+            .map_err(|e| e.to_string())?;
     tracing::info!("serving {SECRETS_NAME} and {BUS_NAME}");
+    // The lock policy: logind (sleep, screen lock) on the system bus, and
+    // the idle timer. Without logind the rest still works.
+    match zbus::Connection::system().await {
+        Ok(system) => {
+            let (secrets, config) = (secrets.clone(), config.clone());
+            tokio::spawn(async move {
+                if let Err(e) =
+                    aleph_daemon::lockpolicy::watch_logind(system, secrets, config).await
+                {
+                    tracing::warn!("not following logind (no lock on sleep or screen lock): {e}");
+                }
+            });
+        }
+        Err(e) => tracing::warn!("no system bus (no lock on sleep or screen lock): {e}"),
+    }
+    tokio::spawn(aleph_daemon::lockpolicy::lock_when_idle(
+        keyring.clone(),
+        secrets.clone(),
+        config,
+    ));
     // Login unlock needs pam.sock; without it the rest still works.
     match aleph_daemon::pamsock::listener(&pam_socket) {
         Ok(listener) => {

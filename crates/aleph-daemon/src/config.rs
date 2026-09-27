@@ -19,7 +19,8 @@ pub struct Config {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct LockConfig {
-    /// Lock on suspend (hibernate always locks).
+    /// Lock before sleep: suspend and hibernate alike (logind does not say
+    /// which is coming). Off, the master key can reach a hibernation image.
     pub on_suspend: bool,
     /// Lock when the session is locked (logind `Session.Lock`).
     pub on_screen_lock: bool,
