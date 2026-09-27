@@ -11,6 +11,7 @@ pub mod keyslot;
 pub mod model;
 pub mod recovery;
 pub mod vault;
+pub mod xwing;
 
 pub use error::{Error, Result};
 pub use kdf::{Argon2Params, derive_kek};

@@ -8,6 +8,9 @@ use zeroize::Zeroizing;
 use crate::crypto;
 use crate::error::{Error, Result};
 use crate::key::try_init_secret;
+use crate::xwing::Recipient;
+
+const XWING_SEED_INFO: &[u8] = b"aleph recovery xwing seed v1";
 
 const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const KEY_BYTES: usize = 32;
@@ -22,9 +25,17 @@ impl RecoveryKey {
         try_init_secret(|buf| crypto::fill_random(buf)).map(Self)
     }
 
-    /// The bytes fed to Argon2id.
+    /// The bytes fed to Argon2id by today's recovery slot (private again
+    /// once the X-Wing recovery slot replaces it).
     pub fn as_bytes(&self) -> &[u8; KEY_BYTES] {
         self.0.expose_secret()
+    }
+
+    /// This key's X-Wing recipient: the key pair whose seed is
+    /// `HKDF(recovery key, "aleph recovery xwing seed v1")`. No Argon2:
+    /// the recovery key already has full entropy.
+    pub fn recipient(&self) -> Recipient {
+        Recipient::from_seed(&crypto::hkdf(self.as_bytes(), XWING_SEED_INFO))
     }
 
     /// Display form, e.g. `7K3M-…`. Show once; never log.
@@ -166,6 +177,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recipient_is_determined_by_the_key() {
+        let k = RecoveryKey::generate().unwrap();
+        let same = RecoveryKey::parse(&k.format()).unwrap();
+        let other = RecoveryKey::generate().unwrap();
+        assert_eq!(k.recipient().public_key(), same.recipient().public_key());
+        assert_ne!(k.recipient().public_key(), other.recipient().public_key());
+        assert_eq!(
+            k.recipient().public_key().len(),
+            crate::xwing::PUBLIC_KEY_LEN
+        );
+    }
     #[test]
     fn parse_round_trips_format() {
         let k = RecoveryKey::generate().unwrap();
