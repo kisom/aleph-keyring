@@ -23,8 +23,13 @@ Requirements:
   binary. They never touch your session bus or keyring.
 - PAM is exercised for real through a private service directory
   (`pam_start_confdir`, Linux-PAM 1.4+): `pam_unix` rejecting a wrong
-  password, and the shipped `packaging/pam/aleph-check`. Nothing is
-  installed and no root is needed.
+  password, the shipped `packaging/pam/aleph-check`, and the built
+  `pam_aleph` module loaded by libpam (`pam_exec expose_authtok` supplies
+  the password it hands over). Nothing is installed and no root is
+  needed; the module's privilege drop is left to Plan 6's root container.
+- The lock policy runs against a stand-in logind on the private bus
+  (`aleph_daemon::testing::Logind`): sleep inhibitors, `PrepareForSleep`,
+  and `Session.Lock`.
 - Arch: `pacman -S swtpm tpm2-tools tpm2-tss libfido2 pam dbus libsecret`.
   Nix: `swtpm tpm2-tools tpm2-tss libfido2 pam dbus libsecret`.
 
@@ -33,9 +38,9 @@ test in the default run needs a security key. Prompts are answered by
 scripted prompters (`aleph_daemon::testing`), and the CLI reads its answers
 from standard input under `ALEPH_NO_TTY=1`.
 
-`alephd`'s user unit is checked with
-`systemd-analyze verify --user packaging/systemd/alephd.service` (same
-`ExecStart` caveat as below).
+`alephd`'s user units are checked with
+`systemd-analyze verify --user packaging/systemd/alephd.service packaging/systemd/alephd.socket`
+(same `ExecStart` caveat as below).
 
 The systemd units in `packaging/systemd/` are checked with:
 
@@ -122,7 +127,27 @@ gnome-keyring-daemon.service gnome-keyring-daemon.socket`):
    stored for the user ("Store the password only for this user"), lock,
    reconnect, and unlock when asked: the connection must come up without
    asking for the Wi-Fi password again.
-6. `aleph status` shows the keyslots; `journalctl --user` (or the
+6. **Login and screen unlock** (Plan 4a; setup's PAM edits come in 4b, so
+   by hand for now, keeping backups):
+   - `install -Dm755 target/debug/libpam_aleph.so /usr/lib/security/pam_aleph.so`
+   - `/etc/pam.d/sddm`: `-auth optional pam_aleph.so` after `auth include
+     system-login`, and `-session optional pam_aleph.so` after `session
+     include system-login` (remove the `pam_gnome_keyring` lines)
+   - `/etc/pam.d/omarchy-lock-password`: `-auth optional pam_aleph.so` at
+     the end
+   - `/etc/pam.d/passwd`: `-password optional pam_aleph.so` after `password
+     include system-auth`
+   - Never edit `system-login`, `system-auth`, or `login`: a TTY login is
+     the way back in if something goes wrong (keep a root shell open while
+     editing, and try the lock screen before walking away)
+   - `systemctl --user enable --now alephd.socket` (with the units under
+     `~/.config/systemd/user/`)
+
+   Then: log out and in (the vault is unlocked at login, no prompt); lock
+   the screen (`aleph status`: locked) and unlock it (unlocked); `passwd`
+   (the TPM slot's id changes; with a FIDO2 slot, `aleph status` asks for
+   `aleph keyslot rotate-master`); suspend and resume (locked).
+7. `aleph status` shows the keyslots; `journalctl --user` (or the
    terminal) shows no secrets.
 
 Record the results, and the libsecret, Chromium, and NetworkManager

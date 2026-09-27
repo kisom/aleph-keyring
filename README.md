@@ -12,11 +12,13 @@ gnome-keyring's secrets store; libsecret applications work unmodified.
 **Status:** early development. The design is in
 [`docs/superpowers/specs/2026-09-26-aleph-design.md`](docs/superpowers/specs/2026-09-26-aleph-design.md).
 
-Not yet handled: changing your login password outside aleph (`passwd`).
-TPM keyslots are sealed under the login password; after an outside change
-they go stale, and until session integration lands (re-sealing with the
-previous password, recovery-key unlock) the way back in is to set the
-previous password again. A FIDO2 keyslot is unaffected.
+Login and screen unlock (`pam_aleph`), `passwd` changes, and locking on
+sleep, screen lock, or idle are in place (Plan 4a). `aleph setup` does not
+yet edit PAM, take over from gnome-keyring, or import its items (Plan 4b):
+see [docs/testing.md](docs/testing.md) for the lines to add by hand. If
+the login password is changed outside aleph, the next unlock asks for the
+previous one to update the TPM keyslot. Design decisions made along the
+way are in [DECISIONS.md](DECISIONS.md).
 
 ## Crates
 
@@ -27,7 +29,9 @@ previous password again. A FIDO2 keyslot is unaffected.
 | `aleph-tpmd` | The TPM helper service (the only process that talks to the TPM) |
 | `aleph-unlock` | TPM client and FIDO2 unlock methods that produce keyslot KEKs |
 | `aleph-prompt-proto` | Protocol between `alephd` and its prompters (GUI or terminal) |
+| `aleph-pam-proto` | Protocol between `pam_aleph` and `alephd`'s `pam.sock` |
 | `aleph-daemon` | `alephd`: the Secret Service and the `io.aleph.Admin1` interface |
+| `pam_aleph` | PAM module that hands the login password to `alephd` |
 | `aleph-cli` | `aleph`: the command-line client |
 
 ## Development

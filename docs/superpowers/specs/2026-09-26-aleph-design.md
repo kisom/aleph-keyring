@@ -136,8 +136,9 @@ the TPM. The design keeps key custody separable for v2 (§10).
 | `aleph-tpmd` | bin | TPM helper: seal and unseal per uid, SRK verification, rate limiting, `Status`. | `aleph-tpm-proto`, `tss-esapi` |
 | `aleph-unlock` | lib | Produces a KEK per hardware keyslot: the TPM client (talks to `aleph-tpmd`) and FIDO2 (`Authenticator` trait, `libfido2` backend, mock). | `aleph-core`, `aleph-tpm-proto`, `fido2-rs` |
 | `aleph-prompt-proto` | lib | The prompter protocol (newline-delimited JSON) shared by `alephd`, the CLI's terminal prompter, and `aleph-gui`. | `serde`, `zeroize` |
-| `aleph-daemon` (bin `alephd`) | bin | Secret Service and admin D-Bus interfaces, PAM socket, lock policy, prompter orchestration. | `aleph-core`, `aleph-unlock`, `aleph-prompt-proto`, `zbus`, `tokio`, `tracing`, `tracing-journald`, libpam |
-| `pam_aleph` | cdylib | PAM module: forwards passwords to `alephd` after dropping to the user's uid. Minimal, no async runtime. | PAM FFI, std |
+| `aleph-pam-proto` | lib | The `pam.sock` protocol between `pam_aleph` and `alephd`: length-prefixed binary frames, strict decoding, a reply check that does not allocate. | `zeroize` |
+| `aleph-daemon` (bin `alephd`) | bin | Secret Service and admin D-Bus interfaces, PAM socket, lock policy, prompter orchestration. | `aleph-core`, `aleph-unlock`, `aleph-prompt-proto`, `aleph-pam-proto`, `zbus`, `tokio`, `tracing`, `tracing-journald`, libpam |
+| `pam_aleph` | cdylib | PAM module: forwards passwords to `alephd` after dropping to the user's uid. Minimal, no async runtime. | `aleph-pam-proto`, PAM FFI, `libc` |
 | `aleph-cli` (bin `aleph`) | bin | CLI. | `aleph-prompt-proto`, `zbus`, `clap` |
 | `aleph-gui` | bin | egui manager and prompter. | `eframe`, `egui`, `zbus`, `notify`, Wayland clipboard crate |
 
@@ -307,8 +308,8 @@ unwrap MK before it counts):
   needed.
 - **The TPM and login-password slots:** unsealed or derived with the login
   password. The password comes from the re-authentication that every
-  rotating operation requires (§6), or from `pam_aleph` during a password
-  change. It is zeroized once the rotation completes.
+  rotating operation requires (§6). It is zeroized once the rotation
+  completes. (A password change replaces these slots instead: §5.)
 - **Each FIDO2 slot:** needs that key's touch. The prompter walks through
   them in turn.
 
@@ -506,8 +507,10 @@ without being zeroized. `mlock` does not keep pages out of a hibernation image
     (no `/etc/pam.d/aleph-check`, or an account `pam_unix` cannot verify),
     the TPM slots are skipped rather than risked, while login-password
     slots are still tried; TPM slots therefore need `pam_unix` accounts.
-    Passwords from `pam_aleph` were accepted by the login stack and skip
-    the check.
+    Passwords from `pam_aleph` were accepted by the login stack, but are
+    checked too whenever PAM can check, so a wrong one sent to `pam.sock`
+    by any same-user process never reaches the TPM or marks a slot stale.
+    Only when PAM cannot check is the login stack trusted.
   - **TPM slots are tried newest first.** Once one rejects a password PAM
     accepted, it and every older TPM slot are marked stale without being
     tried, so a changed password costs one failed attempt, not one per
@@ -526,17 +529,39 @@ without being zeroized. `mlock` does not keep pages out of a hibernation image
     offers to set it to a random value that is printed for the user to
     record. This is opt-in, never the default, because losing it means the
     lockout counter can only be reset by waiting.
-- **Password change:** when `pam_aleph` passes the old and new passwords,
-  `alephd`:
-  1. unseals the slot with the old password
-  2. seals a **new** KEK under the new password
-  3. rotates MK
-  4. removes the old slot
+- **Password change:** `pam_aleph` passes the old and new passwords from
+  `passwd`. It runs even when `pam_unix` failed to make the change, so
+  `alephd` acts only on a new password PAM accepts (or when PAM cannot
+  check). It then replaces every password slot: one **new** TPM slot
+  sealed under the new password (with a fresh KEK) replaces the TPM slots,
+  and one new login-password slot replaces any login-password slot.
+  - If every other slot is a recovery slot, MK rotates, so the old
+    password and old blobs open nothing written from then on.
+  - FIDO2 slots need a touch, which `passwd` cannot give. In that case
+    the old slots are removed keeping MK, and a **pending rotation** is
+    recorded. `aleph status` and every unlock say so until a rotation is
+    run (`aleph keyslot rotate-master`, which needs the keys). Until then,
+    an old copy of the file, plus the old password, plus this machine's
+    TPM, still yields an MK that opens newer files.
+  - A locked vault is never unlocked for this: a copy is opened with the
+    old password, changed, checked against the high-water mark, and
+    written.
 
   There is no `ObjectChangeAuth`, because the old private blob would stay
-  loadable with the old password on this TPM indefinitely. If the password
-  was changed out of band, the slot goes `stale`. The prompter then asks
-  for the old password, or offers FIDO2, and re-seals.
+  loadable with the old password on this TPM indefinitely.
+- **Out-of-band change:** if the password was changed without `pam_aleph`,
+  the next typed password PAM accepts opens no TPM slot (every one is
+  stale, or the newest rejects it with `AuthFailed`). The prompter then
+  asks for the previous password (`OldPassword`).
+  - It is tried only on the newest TPM slot, straight at the TPM (PAM no
+    longer knows it), at most twice per conversation, each counted by the
+    typing limit.
+  - Declining the question returns to the choice of method, where a FIDO2
+    touch also works.
+  - Either way, once the vault is open the password slots are replaced
+    under the current password, as for a password change.
+  - A `WrongUser` refusal does not lead to the question, since the
+    previous password cannot fix it.
 
 ### FIDO2 (libfido2 via `fido2-rs`)
 
@@ -652,44 +677,80 @@ data.
 
 Verified against a stock Omarchy install on 2026-09-26.
 
-- **The shared substack.** aleph installs `/etc/pam.d/aleph`:
+- **The lines.** aleph's lines go straight into each service, each with
+  a `-` prefix, so a missing module is silently skipped (an `include` of a
+  missing substack file could make the whole service fail; DECISIONS.md
+  E4):
 
   ```
-  auth      optional  pam_aleph.so
-  password  optional  pam_aleph.so
-  session   optional  pam_aleph.so
+  -auth      optional  pam_aleph.so
+  -session   optional  pam_aleph.so
+  -password  optional  pam_aleph.so
   ```
 
-- **Which services include it**, with setup editing each and keeping a
-  backup:
+- **Which services get them**, with setup editing each and keeping a
+  backup (Plan 4b; by hand until then, `docs/testing.md`):
 
   | Service | Change |
   |---|---|
-  | `/etc/pam.d/sddm` (graphical login) | Replace the `pam_gnome_keyring` lines with `auth include aleph` after `auth include system-login`, and `session include aleph` after `session include system-login`. |
-  | `/etc/pam.d/omarchy-lock-password` (hyprlock) | Add `auth include aleph` at the very end, after `pam_faillock authsucc`, so it only ever sees a password `pam_unix` has accepted. |
-  | `/etc/pam.d/passwd` | Add `password include aleph` after `password include system-auth`, so that `passwd` changes reach aleph. |
-  | `system-login` and `system-remote-login` | **Not edited.** An SSH login must not unlock the desktop vault. |
-  | `sddm-autologin` | **Not edited.** It has no password, so first-use mode applies. |
+  | `/etc/pam.d/sddm` (graphical login) | Remove the `pam_gnome_keyring` lines; add `-auth optional pam_aleph.so` after `auth include system-login`, and `-session optional pam_aleph.so` after `session include system-login`. |
+  | `/etc/pam.d/omarchy-lock-password` (hyprlock) | Add `-auth optional pam_aleph.so` at the very end, after `pam_faillock authsucc`, so it only ever sees a password `pam_unix` has accepted. |
+  | `/etc/pam.d/passwd` | Add `-password optional pam_aleph.so` after `password include system-auth`, so that `passwd` changes reach aleph (`pam_gnome_keyring` stays, so a later revert still unlocks gnome-keyring at login). |
+  | `system-login`, `system-auth`, `system-local-login`, `system-remote-login`, `login` | **Never edited.** An SSH login must not unlock the desktop vault, and a TTY login stays the escape hatch. |
+  | `sddm-autologin` | Only its `pam_gnome_keyring` lines are removed (they would start gnome-keyring directly); nothing is added: it has no password, so first-use mode applies. |
 
 - **Placement:** in every service, `pam_aleph` comes after the
   `pam_unix`/`pam_faillock` success path. A mistyped password never
   reaches aleph, and never costs a TPM dictionary-attack attempt.
 - **Handing over the password:**
   - `pam_aleph` stores the password with `pam_set_data`, using a cleanup
-    that zeroizes it.
+    that zeroizes it, when it cannot deliver it at once.
   - To deliver it, the module forks a child that drops to the target
-    user's uid and gid (`setgroups`/`setgid`/`setuid`, as
-    `pam_gnome_keyring` does) and connects to `pam.sock`. The parent waits,
-    with a 5-second limit.
+    user's uid and gid (`setgroups`/`setgid`/`setuid`, only when running
+    as root, as `pam_gnome_keyring` does) and connects to
+    `/run/user/<uid>/aleph/pam.sock`.
+  - The host may be multithreaded, so the child calls only
+    async-signal-safe functions on data prepared before the fork. It
+    closes every descriptor it inherited but its report pipe, sends with
+    `MSG_NOSIGNAL`, and has an `alarm` backstop (with `SIGALRM` reset to
+    its default and unblocked).
+  - The child reports its result as one byte on a pipe. The parent waits
+    on the pipe with a 5-second limit, kills the child through a pidfd,
+    and reaps it through the pidfd. The host's `SIGCHLD` handling is never
+    touched.
   - `alephd` checks `SO_PEERCRED` against its own uid.
+  - The wire format is `aleph-pam-proto` (§3). A `socket=<path>` module
+    argument replaces the socket path; it exists for tests.
 - **When it sends:**
-  - login sends at `session` open, once the user's systemd instance is up
-  - the lock screen sends during `auth`
-  - `passwd` sends the old and new passwords during `password`
+  - `auth` sends at once if `pam.sock` exists (the lock screen, or a
+    second login; on a second login the vault then unlocks before the
+    `account` and `session` stacks run, which is harmless: it is the
+    user's own vault and the password was right). Otherwise, or if that
+    delivery fails, it keeps the password for `session` open, once the
+    user's systemd instance is up.
+  - `passwd` sends the old and new passwords in the update phase, only
+    when both are known (root setting another user's password supplies no
+    old one, and nothing is sent).
+  - It never prompts: without a password it does nothing.
+- **Listening:** `alephd.socket` owns `pam.sock` (`FileDescriptorName=pam`);
+  `alephd` takes that descriptor by name, or binds the socket itself when
+  not socket-activated (never replacing a socket something still serves).
+  A login password opens the vault at once, even while a prompter
+  conversation is open, including a security key's PIN question (the
+  hardware is not held while the prompter is asked). Whichever opens
+  first is kept; an open that finishes after the vault was unlocked,
+  written, and locked again reopens the current file rather than
+  installing its older copy. A password change waits its turn, but a new
+  password PAM rejects is refused before waiting, and when PAM cannot
+  vouch for the new password the old one must open the vault file
+  first.
 - **Never blocks login:** every failure is logged and returns
   `PAM_IGNORE`.
-- **Rate limiting:** `pam.sock` accepts at most 5 failed passwords per
-  minute, which bounds same-user guessing through the socket.
+- **Rate limiting:** `pam.sock` accepts at most 5 rejected passwords per
+  minute, which bounds same-user guessing through the socket. Refusals
+  that say nothing about the password (a busy or rate-limited TPM) do not
+  count. Requests still being answered count too, so parallel connections
+  cannot get past the limit, and at most 5 are in flight at once.
 
 ### Secret Service
 
@@ -712,7 +773,7 @@ Verified against a stock Omarchy install on 2026-09-26.
   whether MK is `mlock`ed, TPM usability, keyslots with stale marks),
   `Lock`, `Unlock`, `Create`, `EnrollTpm`, `EnrollFido2`,
   `RemoveKeyslot`, `RotateMaster`, `ReissueRecoveryKey`, `RetryKeyslot`,
-  `GetConfig`, `SetConfig`, and (Plan 4) `ImportGnomeKeyring`,
+  `GetConfig`, `SetConfig`, and (Plan 4b) `ImportGnomeKeyring`,
   `ExportToGnomeKeyring`, `Backup`, `Restore`.
 - **Methods that need the user take a prompter:** one end of a
   socketpair, passed as a Unix fd, speaking the prompter protocol. The
@@ -739,7 +800,7 @@ Configured in `~/.config/aleph/config.toml`:
 
 ```toml
 [lock]
-on_suspend = true        # logind PrepareForSleep(true), with a delay inhibitor
+on_suspend = true        # every sleep, suspend or hibernate: logind PrepareForSleep(true), with a delay inhibitor
 on_screen_lock = true    # logind Session.Lock (hypridle → loginctl lock-session)
 idle_timeout = 0         # seconds without secret access; 0 = disabled
 # setting everything false/0 = lock only at logout
@@ -747,12 +808,22 @@ idle_timeout = 0         # seconds without secret access; 0 = disabled
 
 - **Suspend and hibernate:** `alephd` holds a logind `delay` inhibitor for
   `sleep` while running.
-  1. On `PrepareForSleep(true)` it locks and zeroizes.
+  1. On `PrepareForSleep(true)` it locks and zeroizes (if `on_suspend`).
   2. Then it releases the inhibitor.
   3. On resume it takes the inhibitor again.
 
-  Hibernate is treated the same way, regardless of `on_suspend`, because
-  the hibernation image is written to disk.
+  logind does not say whether a suspend or a hibernation is coming, and
+  suspend-then-hibernate moves on to hibernating without another signal.
+  So `on_suspend` covers both. With it off, the master key can reach a
+  hibernation image, and `aleph config set lock.on_suspend false` warns
+  about this (swap must be encrypted, §4).
+- **Screen lock:** logind's `Session.Lock` for a session of this user
+  (`loginctl lock-session`, which hypridle sends), sent by logind itself
+  (the sender is checked against the name's owner: any peer can send a
+  directed signal).
+- **Idle:** no secret read or written for `idle_timeout` seconds.
+- Without a system bus or logind, `alephd` runs without the sleep and
+  screen-lock parts.
 
 ### Prompter orchestration
 
@@ -819,7 +890,7 @@ aleph restore [--from-bak | --accept-rollback] [<path>]
   6. system changes (sudo)
 
   Plan 3 implements steps 1, 2, and 4 (creating the vault) and says that
-  the rest is not available yet; Plan 4 adds 3, 5, and 6.
+  the rest is not available yet; Plan 4b adds 3, 5, and 6.
 - **Import** reads every collection and item through the Secret Service
   API while gnome-keyring still owns the bus name. That covers everything
   shown in Seahorse's Passwords view.
@@ -891,7 +962,7 @@ aleph restore [--from-bak | --accept-rollback] [<path>]
   - Installs:
     - binaries to `/usr/bin`, plus `aleph-tpmd` to `/usr/lib/aleph/`
     - `/usr/lib/security/pam_aleph.so`
-    - `/etc/pam.d/aleph` (the substack; `backup=` in the PKGBUILD)
+    
     - `/usr/lib/systemd/user/alephd.{service,socket}`
     - `/usr/lib/systemd/system/aleph-tpmd.{service,socket}`
     - the `.desktop` file and the icons:
@@ -959,8 +1030,19 @@ aleph restore [--from-bak | --accept-rollback] [<path>]
     empty.
   - Lock tests inject `PrepareForSleep` and `Lock`, then assert that keys
     are zeroized and the inhibitor has been released.
-- **PAM and setup:** `pamtester` in an Arch container against copies of
-  Omarchy's `sddm`, `omarchy-lock-password`, and `passwd`, covering:
+- **PAM (Plan 4a, no root):**
+  - the module logic, against a fake PAM handle
+  - the forked delivery, against a real socket (including a host that
+    ignores `SIGCHLD`)
+  - real Linux-PAM loading the built module through `pam_start_confdir`,
+    with `pam_exec expose_authtok` setting `PAM_AUTHTOK` from the test's
+    conversation
+  - `pam.sock` against the real daemon, including the module's delivery
+    code end to end
+- **PAM and setup (Plan 6, root container):** `pamtester` in an Arch
+  container against copies of Omarchy's `sddm`, `omarchy-lock-password`,
+  and `passwd`, covering the privilege drop and a `passwd` whose
+  `pam_unix` update fails (nothing may change), and:
   - a wrong password never reaches `pam_aleph`
   - a right one does, after dropping to the user's uid
   - SSH (`system-remote-login`) never reaches aleph
