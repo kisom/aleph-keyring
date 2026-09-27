@@ -1,0 +1,20 @@
+[package]
+name = "pam_aleph"
+description = "PAM module: hands the login password to alephd (login and screen unlock, passwd)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+# The module itself (libpam_aleph.so, installed as pam_aleph.so), and an
+# rlib so tests and alephd's tests can call its delivery code.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+aleph-pam-proto = { path = "../aleph-pam-proto" }
+libc.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

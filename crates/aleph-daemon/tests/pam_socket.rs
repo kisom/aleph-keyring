@@ -148,6 +148,29 @@ async fn a_password_change_arrives_through_the_socket() {
     assert!(!d.keyring.is_locked());
 }
 
+/// The module's own delivery code (fork, connect, answer) against the
+/// daemon's socket: the two ends agree.
+#[tokio::test(flavor = "multi_thread")]
+async fn pam_aleph_delivers_to_the_daemon() {
+    let (d, path) = served().await;
+    d.secrets.lock().await.unwrap();
+    let outcome = tokio::task::spawn_blocking(move || {
+        // SAFETY: getuid/getgid cannot fail.
+        let me = unsafe {
+            pam_aleph::deliver::Target {
+                uid: libc::getuid(),
+                gid: libc::getgid(),
+            }
+        };
+        let frame = unlock(PW).encode().unwrap();
+        pam_aleph::deliver::deliver(me, &path, &frame, pam_aleph::TIMEOUT)
+    })
+    .await
+    .unwrap();
+    assert_eq!(outcome, pam_aleph::deliver::Outcome::Accepted);
+    assert!(!d.keyring.is_locked());
+}
+
 /// A conversation nobody answers holds the daemon's operation lock; returns
 /// the prompter's end (drop it to end the conversation) and its thread.
 fn hold_a_conversation(

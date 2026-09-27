@@ -43,5 +43,6 @@ tempfile = { workspace = true, optional = true }
 [dev-dependencies]
 aleph-core = { path = "../aleph-core", features = ["insecure-test-params"] }
 aleph-daemon = { path = ".", features = ["testing"] }
+pam_aleph = { path = "../pam_aleph" }
 tempfile.workspace = true
 serde.workspace = true

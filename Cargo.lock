@@ -93,6 +93,7 @@ dependencies = [
  "hkdf",
  "libc",
  "num-bigint",
+ "pam_aleph",
  "serde",
  "serde_json",
  "sha2",
@@ -1234,6 +1235,16 @@ checksum = "9aa2b01e1d916879f73a53d01d1d6cee68adbb31d6d9177a8cfce093cced1d50"
 dependencies = [
  "futures-core",
  "pin-project-lite",
+]
+
+[[package]]
+name = "pam_aleph"
+version = "0.1.0"
+dependencies = [
+ "aleph-pam-proto",
+ "libc",
+ "tempfile",
+ "zeroize",
 ]
 
 [[package]]
