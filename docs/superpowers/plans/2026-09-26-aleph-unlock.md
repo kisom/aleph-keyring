@@ -7,10 +7,11 @@
 **Architecture:**
 - **`aleph-tpmd`** is the only process that talks to the TPM. It is a socket-activated system service running as a throwaway user in the `tss` group; users are never added to `tss`. It reads the caller's uid from the socket.
   - It seals `be32(uid) ‖ KEK` under an auth value derived from the password, a per-slot salt, and the uid.
-  - It verifies the parent key's Name before using it to salt a session.
-  - It rate-limits failed unseals per uid and reports TPM state.
+  - It unseals only under the parent whose Name the slot recorded, compared before that key salts a session.
+  - It serves login uids only, budgets the TPM's shared dictionary-attack counter so that aleph can never cause a TPM lockout, and reports TPM state.
+  - Each connection has its own thread and a 2 s deadline for its request; only TPM access is serialized.
 - **`aleph-unlock`**'s TPM client only speaks the protocol.
-- **FIDO2** runs behind `Keys`/`Authenticator` traits: a software mock for tests and a libfido2 backend. It requires PIN/UV by default, checks `hmac-secret` support, needs exactly one key to enroll, and preflights every connected key without a touch to find the right one at unlock.
+- **FIDO2** runs behind `Keys`/`Authenticator` traits: a software mock for tests and a libfido2 backend. It requires PIN/UV by default, checks `hmac-secret` support, needs exactly one key to enroll, and at unlock asks a lone key directly or preflights several without a touch to find the right one.
 
 **Tech Stack:** Rust 1.98, `tss-esapi` 7.7 (on `tpm2-tss` 4.2), `fido2-rs` 0.6 (on `libfido2` 1.17), `hkdf`/`sha2`/`hmac`, `libc` (`SO_PEERCRED`), `aleph-core`. Tests need `swtpm` 0.10 and `tpm2-tools` 5.8.
 
@@ -22,26 +23,34 @@
 
 ## Decisions made while prototyping
 
-Every task was prototyped, then replayed from this document on a fresh clone of `master` (`6f073ff`): red, then green, then clippy and fmt clean, with the final tree identical to the prototype. The security properties below were each checked by reverting them: the pinning test fails with the revert and passes once restored.
+Every task was prototyped, then replayed from this document on a fresh clone of `master` (code as of `6f073ff`): red, then green, then clippy and fmt clean, with the final tree identical to the prototype. The security properties below were each checked by reverting them: the pinning test fails with the revert and passes once restored. This revision folds in a plan review (a TPM-lockout attack across uids, a slow-client stall, the Name source, FIDO2 preflight errors, and minors); prototyping the fixes also found that `tss-esapi`'s `get_tpm_property` caches values forever.
 
-- **Parent key.** aleph's own ECC P-256/AES-256-CFB primary, re-created per use, whose Name is stable per TPM. When `ownerAuth` is set (TPMA_PERMANENT bit 0), the persistent TCG SRK at `0x81000001` is used instead; if it is absent, `NoParent`.
-  - The Name is recorded at seal time and checked before the parent salts a session. A slot from another TPM, or from before `ownerAuth` was set, is therefore `ParentMismatch`, with no password attempt.
+- **Parent key.** New slots are sealed under aleph's own ECC P-256/AES-256-CFB primary (`noDA`, like the TCG SRK), re-created per use, whose Name is stable per TPM. When `ownerAuth` is set (TPMA_PERMANENT bit 0), the persistent TCG SRK at `0x81000001` is used instead; if it is absent, `NoParent`.
+  - The Name is recorded at seal time. To unseal, the helper uses whichever available parent has that Name, so an SRK slot survives `ownerAuth` being cleared. No match is `ParentMismatch`, before any session or password attempt: a slot from another TPM, or an aleph-primary slot once `ownerAuth` is set.
+  - The Name compared is `Esys_TR_GetName` of the handle ESYS will salt with, not a separate `ReadPublic` answer.
   - Sessions always use AES-256-CFB parameter encryption. Task 5 corrects the spec, which said AES-128 for the SRK fallback; that AES-128 applies only to how the TPM protects child blobs under the SRK.
 - **Uid binding is layered.** The uid is part of the auth-value derivation, so another uid gets `AuthFailed`, and the sealed payload's stored uid is checked (`WrongUser`) as defense in depth.
 - **FIDO2 credProtect is level 2, not 3.** A level-3 credential is invisible to the no-touch preflight unless user verification happens first, so choosing among several keys would burn PIN retries on the wrong ones (`systemd-cryptenroll` uses level 2 too). Security is unchanged: PIN/UV is required at every unlock of a PIN/UV slot, and the key's `hmac-secret` without UV is a different value. Task 5 corrects the spec.
-- **Rate limiting:** 5 failed unseals per uid per 60 s. `Lockout` replies count as failures, so a locked-out caller cannot keep polling.
+- **Dictionary-attack budget, in three layers.** The TPM's failure counter is shared by every user and by `systemd-cryptenroll`, and a lockout survives reboot. A per-uid limit alone did not protect it: 5 failures per uid per minute from a few uids reached swtpm's default 3-try lockout at once.
+  - **Global reserve:** once `failed_tries ≥ max_tries − max(1, max_tries/2)`, every unseal is refused with `Busy` without asking the TPM. aleph therefore never causes a lockout, and at least half the budget stays for disk unlock. The cost is a temporary denial of TPM unlock (the spec's §2 now says so).
+  - **Per uid:** 2 failures per TPM `recovery_time` (at least 60 s), then `RateLimited`.
+  - **Login uids only** (`UID_MIN`–`UID_MAX` from `/etc/login.defs`), else `NotPermitted`. Tests use `Policy::allow_all()`.
+  - `Lockout` no longer needs counting as a failure: the reserve refuses long before it.
+- **TPM properties are read fresh** with `get_capability`. `Context::get_tpm_property` caches every value for the life of the context, so a long-lived helper would never see the failure counter move or `ownerAuth` change.
 - **Status:**
-  - `in_lockout` is the TPMA_PERMANENT bit **or** `failed_tries >= max_tries`, because swtpm never sets the bit.
+  - `in_lockout` is the TPMA_PERMANENT bit **or** `failed_tries >= max_tries` (so also when `max_tries` is 0), because swtpm never sets the bit.
   - `Status` is an empty struct variant (`Status {}`), because serde's internally tagged unit variants ignore unknown fields even with `deny_unknown_fields`.
-- **The helper serves connections one at a time,** each with 5 s read/write timeouts. The TPM is serial anyway, and a stuck client cannot hold it.
+- **Connections:** a thread each (at most 64, beyond which `Busy`), a 2 s deadline for the whole request (a per-read timeout alone lets a byte-a-second client stay forever), and one connection in flight per uid (a second gets `Busy` at once), so one user cannot occupy every thread. Only the TPM is serialized, behind its mutex.
+- **FIDO2 device selection:** a lone key is asked directly. With several, a key whose preflight errors counts as "not this key"; if none matches, the first error is reported. The credProtect level is passed through `make_credential` (`CRED_PROTECT`), and the mock hides level-3 credentials from preflight as real keys do. libfido2 codes `0x33` → `Fido2PinInvalid`, `0x3F` → `Fido2UvInvalid`, `0x27` → `Fido2Denied`.
 - **Test fixture:**
   - swtpm over loopback TCP. tss-esapi 7.7's `swtpm:` TCTI ignores `path=`.
   - It lives in `aleph-tpmd` behind the `testing` feature, shared with `aleph-unlock`'s tests.
   - Port selection, spawning, and the readiness probe are serialized by a process-wide lock, and the probe runs only while our own swtpm is alive. Without this, parallel tests hung: a test's swtpm lost a port race, and its probe connected to another test's single-client swtpm and blocked forever.
   - The fixture sets realistic DA parameters with `tpm2_dictionarylockout`, since tss-esapi 7.7 lacks `TPM2_DictionaryAttackParameters`. It can also provision a persistent SRK and set `ownerAuth` to test the fallback.
-- **systemd units** are in `packaging/systemd/`. `systemd-analyze verify` passes and `systemd-analyze security` rates the service 0.7 ("SAFE"). Plan 6 installs them.
+- **systemd units** are in `packaging/systemd/`: `Restart=on-failure`, `After=tpm2.target`, `LimitCORE=0`, `TSS2_LOG=all+NONE`, and the helper also sets `PR_SET_DUMPABLE=0`. `systemd-analyze verify` passes and `systemd-analyze security` rates the service 0.7 ("SAFE"). Plan 6 installs them.
 - **Not in this plan:**
-  - marking TPM slots stale after a failure (daemon, Plan 3/4)
+  - marking TPM slots stale after a failure (daemon, Plan 3/4). Only `AuthFailed` and `WrongUser` may mark a slot stale; `Lockout`, `RateLimited`, `Busy`, and `NotPermitted` say nothing about the slot.
+  - fuzzing the frame decoder (Plan 6, with the other `cargo-fuzz` targets)
   - the password-change flow: fresh seal, rotation, removing the old slot (Plan 4)
   - offering to set `lockoutAuth` (setup, Plan 4)
 
@@ -65,8 +74,8 @@ Every task was prototyped, then replayed from this document on a fresh clone of 
 
 1. **Another local user who copies your TPM slot blobs**, even knowing your password, must get nothing. → Task 2 `another_user_cannot_unseal_even_with_the_password`, `the_socket_binds_objects_to_the_callers_real_uid`.
 2. **A different TPM, an interposer substituting the parent key, or `ownerAuth` being set later** must be reported as `ParentMismatch` before any session is salted or any password reaches the TPM. With `ownerAuth` set, the persistent SRK must still work. → Task 2 `a_parent_name_mismatch_is_refused_without_an_auth_attempt`, `a_slot_from_another_tpm_is_a_parent_mismatch`, `with_owner_auth_set_the_persistent_srk_is_used`, `with_owner_auth_set_and_no_srk_enrollment_is_refused`.
-3. **One user guessing passwords** must not be able to exhaust the TPM-wide dictionary-attack counter. That counter is shared with other users and with `systemd-cryptenroll`. → Task 2 `failed_unseals_are_rate_limited_per_user`, `a_locked_out_caller_is_rate_limited_too`.
-4. **With several FIDO2 keys plugged in,** unlock must pick the right one without touching or PIN-prompting the others, and enrollment must refuse ambiguity. → Task 4 `unlock_picks_the_right_key_among_several_and_touches_only_it`, `enrollment_needs_exactly_one_key`.
+3. **Local users guessing passwords, from as many uids as they have, across many recovery windows,** must never drive the TPM into lockout (which would also block disk unlock and survive reboot), and a slow or idle client must not stall the helper for others. → Task 2 `guessing_from_many_uids_over_many_windows_never_locks_the_tpm`, `failed_unseals_are_rate_limited_per_user`, `only_login_uids_are_served`, `a_trickling_client_is_cut_off_and_does_not_queue_others`.
+4. **With several FIDO2 keys plugged in,** unlock must pick the right one without touching or PIN-prompting the others, even if one of them misbehaves, and enrollment must refuse ambiguity. → Task 4 `unlock_picks_the_right_key_among_several_and_touches_only_it`, `a_failing_preflight_does_not_stop_the_search`, `enrollment_needs_exactly_one_key`.
 5. **A thief with a PIN-protected FIDO2 key but no PIN** must not unlock. A key with neither PIN nor UV must be refused unless touch-only is explicitly chosen. → Task 4 `a_touch_without_verification_cannot_open_a_verified_slot`, `a_bare_key_is_refused_unless_touch_only_is_chosen`, `by_default_the_pin_is_required_at_enroll_and_unlock`.
 
 ## File Structure
@@ -77,9 +86,9 @@ crates/aleph-tpm-proto/src/lib.rs         Request/Response/Status/Failure, Seale
 crates/aleph-tpmd/
   Cargo.toml                              feature `testing` (swtpm fixture)
   src/lib.rs, main.rs                     socket activation (LISTEN_FDS) or --socket
-  src/tpm.rs                              Tpm: seal/unseal/status, parent selection + Name check
-  src/limiter.rs                          RateLimiter (5 failures / 60 s / uid)
-  src/server.rs                           Helper::handle, peer_uid, serve_connection, serve
+  src/tpm.rs                              Tpm: seal/unseal/status/da_counters, parent chosen by Name
+  src/limiter.rs                          global reserve threshold; RateLimiter (2 failures / recovery window / uid)
+  src/server.rs                           Policy, Helper::handle, peer_uid, deadline reads, threaded serve
   src/testing.rs                          SwTpm fixture (feature `testing`)
   tests/helper.rs, socket.rs              behaviour against swtpm; tests/tpm_hardware.rs (#[ignore])
 crates/aleph-unlock/
@@ -103,7 +112,7 @@ docs/testing.md, README.md, spec §5 corrections
   - `Request { Seal { secret }, Unseal { object, secret }, Status {} }`
   - `Parent { AlephPrimary, PersistentSrk, Unavailable }`
   - `Status { parent, owner_auth_set, lockout_auth_set, in_lockout, max_tries, recovery_time, lockout_recovery, failed_tries }`
-  - `Failure { AuthFailed, Lockout, RateLimited, WrongUser, ParentMismatch, NoParent, Malformed(String), Tpm(String) }`
+  - `Failure { AuthFailed, Lockout, RateLimited, Busy, NotPermitted, WrongUser, ParentMismatch, NoParent, Malformed(String), Tpm(String) }`
   - `Response { Sealed { object, kek }, Unsealed { kek }, Status(Status), Failed(Failure) }`
   - `write_frame(&mut impl Write, &T)`, `read_frame::<T>(&mut impl Read)` → `Result<_, FrameError { Io, TooLarge, Malformed }>`
 
@@ -257,6 +266,8 @@ mod tests {
             Failure::AuthFailed,
             Failure::Lockout,
             Failure::RateLimited,
+            Failure::Busy,
+            Failure::NotPermitted,
             Failure::WrongUser,
             Failure::ParentMismatch,
             Failure::NoParent,
@@ -443,8 +454,14 @@ pub enum Failure {
     AuthFailed,
     #[error("the TPM is in dictionary-attack lockout")]
     Lockout,
-    #[error("too many failed attempts; wait a minute")]
+    #[error("too many failed attempts from this user; wait for the TPM's recovery time")]
     RateLimited,
+    #[error(
+        "the TPM's failure budget is exhausted or this user has a request in progress; try later"
+    )]
+    Busy,
+    #[error("this user may not use the TPM helper (not a login uid)")]
+    NotPermitted,
     #[error("this sealed object belongs to another user")]
     WrongUser,
     #[error("the TPM's parent key does not match this slot (different TPM or tampering)")]
@@ -536,12 +553,14 @@ git commit -m "feat(tpm-proto): wire protocol for the aleph-tpmd helper" -m "Co-
   - `Tpm::open(tcti)`, `Tpm::open_default()` (reads `ALEPH_TCTI`, then `TPM2TOOLS_TCTI`)
   - `Tpm::seal(uid, secret) -> Result<(SealedObject, Zeroizing<[u8; 32]>)>`
   - `Tpm::unseal(uid, &SealedObject, secret) -> Result<Zeroizing<[u8; 32]>>`
-  - `Tpm::status() -> Result<Status>`
+  - `Tpm::status() -> Result<Status>`, `Tpm::da_counters() -> Result<(failed_tries, max_tries, recovery_time)>`
+  - feature `testing` → `Tpm::seal_with_payload_uid(auth_uid, payload_uid, secret)`
   - `TpmError { Unavailable, AuthFailed, Lockout, WrongUser, ParentMismatch, NoParent, Malformed, Tpm }`
-  - `limiter::{RateLimiter, MAX_FAILURES = 5, WINDOW = 60 s}`
-  - `Helper::new(Tpm)`, `.handle(uid, Request) -> Response`, `.handle_at(uid, Request, Instant)`
-  - `server::{peer_uid, serve_connection, serve, IO_TIMEOUT = 5 s}`
-  - feature `testing` → `testing::SwTpm { start(), tcti(), tpm(), helper(), provision_persistent_srk(), set_owner_auth(), set_da_parameters(max_tries, recovery_time, lockout_recovery) }`
+  - `limiter::{RateLimiter { blocked(uid, now, window), record_failure(uid, now, window) }, FAILURES_PER_UID = 2, MIN_WINDOW = 60 s, reserve_threshold(max_tries), window(recovery_time_secs)}`
+  - `server::Policy { uid_min, uid_max; from_login_defs(&str), system(), allow_all(), allows(uid) }`
+  - `Helper::new(Tpm, Policy)`, `.handle(uid, Request) -> Response`, `.handle_at(uid, Request, Instant)`, `.claim(uid) -> Option<Claim>`
+  - `server::{peer_uid, serve_connection(&Helper, UnixStream), serve(&UnixListener, Arc<Helper>) -> !, REQUEST_DEADLINE = 2 s, WRITE_TIMEOUT = 5 s, MAX_CONNECTIONS = 64}`
+  - feature `testing` → `testing::SwTpm { start(), tcti(), tpm(), helper() (allow-all policy), helper_with(Policy), provision_persistent_srk(), set_owner_auth(), clear_owner_auth(), set_da_parameters(max_tries, recovery_time, lockout_recovery) }`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -673,31 +692,60 @@ Create `crates/aleph-tpmd/src/limiter.rs` (tests only for now):
 
 ```rust
 #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.failures.len()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    const W: Duration = Duration::from_secs(600);
+
     #[test]
-    fn blocks_after_max_failures_within_the_window_then_recovers() {
+    fn blocks_after_the_per_uid_budget_then_recovers_after_the_window() {
         let t0 = Instant::now();
         let mut l = RateLimiter::default();
-        for i in 0..MAX_FAILURES {
-            assert!(!l.blocked(1000, t0), "blocked after {i}");
-            l.record_failure(1000, t0);
+        for i in 0..FAILURES_PER_UID {
+            assert!(!l.blocked(1000, t0, W), "blocked after {i}");
+            l.record_failure(1000, t0, W);
         }
-        assert!(l.blocked(1000, t0));
-        assert!(l.blocked(1000, t0 + WINDOW - Duration::from_secs(1)));
-        assert!(!l.blocked(1000, t0 + WINDOW));
+        assert!(l.blocked(1000, t0, W));
+        assert!(l.blocked(1000, t0 + W - Duration::from_secs(1), W));
+        assert!(!l.blocked(1000, t0 + W, W));
     }
 
     #[test]
     fn uids_are_limited_independently() {
         let t0 = Instant::now();
         let mut l = RateLimiter::default();
-        for _ in 0..MAX_FAILURES {
-            l.record_failure(1000, t0);
+        for _ in 0..FAILURES_PER_UID {
+            l.record_failure(1000, t0, W);
         }
-        assert!(l.blocked(1000, t0));
-        assert!(!l.blocked(1001, t0));
+        assert!(l.blocked(1000, t0, W));
+        assert!(!l.blocked(1001, t0, W));
+    }
+
+    #[test]
+    fn stale_uids_are_forgotten() {
+        let t0 = Instant::now();
+        let mut l = RateLimiter::default();
+        for uid in 0..1000 {
+            l.record_failure(uid, t0, W);
+        }
+        l.record_failure(5000, t0 + W, W);
+        assert_eq!(l.tracked(), 1);
+    }
+
+    #[test]
+    fn the_reserve_keeps_half_the_tries_and_at_least_one() {
+        assert_eq!(reserve_threshold(32), 16);
+        assert_eq!(reserve_threshold(3), 2);
+        assert_eq!(reserve_threshold(1), 0);
+        assert_eq!(reserve_threshold(0), 0);
+        assert_eq!(window(600), Duration::from_secs(600));
+        assert_eq!(window(0), MIN_WINDOW);
     }
 }
 ```
@@ -710,7 +758,8 @@ Create `crates/aleph-tpmd/tests/helper.rs`:
 use std::time::Instant;
 
 use aleph_tpm_proto::{Failure, Parent, Request, Response, SealedObject, Secret};
-use aleph_tpmd::limiter::{MAX_FAILURES, WINDOW};
+use aleph_tpmd::limiter::{FAILURES_PER_UID, reserve_threshold, window};
+use aleph_tpmd::server::Policy;
 use aleph_tpmd::testing::SwTpm;
 
 const UID: u32 = 1000;
@@ -811,7 +860,7 @@ fn a_parent_name_mismatch_is_refused_without_an_auth_attempt() {
     let h = sw.helper();
     let (mut object, _) = seal(&h, UID, PW);
     object.srk_name[5] ^= 1;
-    for _ in 0..(MAX_FAILURES + 2) {
+    for _ in 0..(FAILURES_PER_UID + 2) {
         assert_eq!(
             unseal(&h, UID, &object, PW),
             Response::Failed(Failure::ParentMismatch)
@@ -876,7 +925,7 @@ fn failed_unseals_are_rate_limited_per_user() {
             at,
         )
     };
-    for _ in 0..MAX_FAILURES {
+    for _ in 0..FAILURES_PER_UID {
         assert_eq!(
             attempt(b"wrong", UID, t0),
             Response::Failed(Failure::AuthFailed)
@@ -899,7 +948,7 @@ fn failed_unseals_are_rate_limited_per_user() {
     ));
     // After the window, the user may try again.
     assert!(matches!(
-        attempt(PW, UID, t0 + WINDOW),
+        attempt(PW, UID, t0 + window(600)),
         Response::Unsealed { .. }
     ));
 }
@@ -929,8 +978,9 @@ fn many_operations_do_not_exhaust_tpm_handles() {
 
 #[test]
 fn repeated_wrong_passwords_reach_tpm_lockout() {
-    // Bypass the helper's rate limit to reach the TPM's own lockout.
+    // Bypass the helper's limits to reach the TPM's own lockout.
     let sw = SwTpm::start();
+    sw.set_da_parameters(3, 600, 86400);
     let mut tpm = sw.tpm();
     let (object, _) = tpm.seal(UID, PW).unwrap();
     let mut saw_lockout = false;
@@ -973,11 +1023,12 @@ fn status_reports_a_fresh_tpm() {
 #[test]
 fn with_owner_auth_set_the_persistent_srk_is_used() {
     let sw = SwTpm::start();
+    // One long-lived helper throughout: it must notice ownerAuth change.
+    let h = sw.helper();
     // A slot sealed under aleph's primary before ownerAuth was set...
-    let (old, _) = seal(&sw.helper(), UID, PW);
+    let (old, _) = seal(&h, UID, PW);
     sw.provision_persistent_srk();
     sw.set_owner_auth();
-    let h = sw.helper();
     let Response::Status(s) = h.handle(UID, Request::Status {}) else {
         panic!()
     };
@@ -1013,40 +1064,139 @@ fn with_owner_auth_set_and_no_srk_enrollment_is_refused() {
     );
 }
 
-/// Lockout replies count against the caller too, so a locked-out user
-/// cannot keep polling the TPM (swtpm's default is 3 tries).
+/// The attack the budgets exist for: many uids (a compromised account can
+/// have several, and every login uid has its own budget) guessing across
+/// many recovery windows. The TPM must never reach lockout, which would
+/// also block disk unlock and survive reboot; refusing with `Busy` is the
+/// accepted cost.
 #[test]
-fn a_locked_out_caller_is_rate_limited_too() {
-    let sw = SwTpm::start();
-    let h = sw.helper();
-    let (object, _) = seal(&h, UID, PW);
-    let t0 = Instant::now();
-    let mut replies = Vec::new();
-    for _ in 0..MAX_FAILURES {
-        replies.push(h.handle_at(
-            UID,
-            Request::Unseal {
-                object: object.clone(),
-                secret: Secret(b"wrong".to_vec()),
-            },
-            t0,
-        ));
+fn guessing_from_many_uids_over_many_windows_never_locks_the_tpm() {
+    for max_tries in [3, 32] {
+        let sw = SwTpm::start();
+        sw.set_da_parameters(max_tries, 600, 86400);
+        let h = sw.helper();
+        let t0 = Instant::now();
+        let uids: Vec<u32> = (0..20).map(|i| UID + i).collect();
+        let objects: Vec<_> = uids.iter().map(|&u| seal(&h, u, PW).0).collect();
+        let mut busy = 0;
+        for w in 0..5 {
+            let at = t0 + window(600) * w;
+            for (&uid, object) in uids.iter().zip(&objects) {
+                for _ in 0..(FAILURES_PER_UID + 1) {
+                    let reply = h.handle_at(
+                        uid,
+                        Request::Unseal {
+                            object: object.clone(),
+                            secret: Secret(b"guess".to_vec()),
+                        },
+                        at,
+                    );
+                    match reply {
+                        Response::Failed(Failure::AuthFailed | Failure::RateLimited) => {}
+                        Response::Failed(Failure::Busy) => busy += 1,
+                        other => panic!("max_tries {max_tries}: {other:?}"),
+                    }
+                }
+            }
+        }
+        assert!(busy > 0, "the reserve never engaged");
+        let Response::Status(s) = h.handle(UID, Request::Status {}) else {
+            panic!()
+        };
+        assert!(!s.in_lockout, "max_tries {max_tries}: TPM locked out");
+        assert_eq!(s.failed_tries, reserve_threshold(max_tries));
+        // Disk unlock (or anything else) still has the reserve.
+        assert!(s.max_tries - s.failed_tries >= 1);
     }
-    assert!(
-        replies.contains(&Response::Failed(Failure::Lockout)),
-        "{replies:?}"
-    );
-    assert_eq!(
+}
+
+/// An object whose auth value is right but whose payload names another
+/// uid is `WrongUser`, and counts against the caller.
+#[test]
+fn a_payload_for_another_uid_is_wrong_user() {
+    let sw = SwTpm::start();
+    sw.set_da_parameters(32, 600, 86400);
+    let (object, _) = sw.tpm().seal_with_payload_uid(UID, UID + 1, PW).unwrap();
+    let h = sw.helper();
+    let t0 = Instant::now();
+    let attempt = || {
         h.handle_at(
             UID,
             Request::Unseal {
-                object,
-                secret: Secret(PW.to_vec())
+                object: object.clone(),
+                secret: Secret(PW.to_vec()),
             },
-            t0
-        ),
-        Response::Failed(Failure::RateLimited)
+            t0,
+        )
+    };
+    for _ in 0..FAILURES_PER_UID {
+        assert_eq!(attempt(), Response::Failed(Failure::WrongUser));
+    }
+    assert_eq!(attempt(), Response::Failed(Failure::RateLimited));
+}
+
+#[test]
+fn only_login_uids_are_served() {
+    let sw = SwTpm::start();
+    let h = sw.helper_with(Policy {
+        uid_min: 1000,
+        uid_max: 60000,
+    });
+    for uid in [0, 999, 60001, u32::MAX] {
+        for request in [
+            Request::Seal {
+                secret: Secret(PW.to_vec()),
+            },
+            Request::Status {},
+        ] {
+            assert_eq!(
+                h.handle(uid, request),
+                Response::Failed(Failure::NotPermitted),
+                "uid {uid}"
+            );
+        }
+    }
+    let (object, kek) = seal(&h, 1000, PW);
+    assert_eq!(unsealed_kek(unseal(&h, 1000, &object, PW)), kek);
+    seal(&h, 60000, PW);
+}
+
+#[test]
+fn the_policy_reads_login_defs() {
+    let text = "# comment\nUID_MIN\t\t 2000\nUID_MAX 3000\nGID_MIN 5\nUID_MAX_ bogus\n";
+    assert_eq!(
+        Policy::from_login_defs(text),
+        Policy {
+            uid_min: 2000,
+            uid_max: 3000
+        }
     );
+    assert_eq!(
+        Policy::from_login_defs(""),
+        Policy {
+            uid_min: 1000,
+            uid_max: 60000
+        }
+    );
+}
+
+/// A slot sealed under the persistent SRK keeps working after `ownerAuth`
+/// is cleared, although new slots then go under aleph's primary.
+#[test]
+fn a_slot_unseals_under_whichever_parent_it_names() {
+    let sw = SwTpm::start();
+    sw.provision_persistent_srk();
+    sw.set_owner_auth();
+    let (object, kek) = seal(&sw.helper(), UID, PW);
+    sw.clear_owner_auth();
+    let h = sw.helper();
+    let Response::Status(s) = h.handle(UID, Request::Status {}) else {
+        panic!()
+    };
+    assert_eq!(s.parent, Parent::AlephPrimary);
+    assert_eq!(unsealed_kek(unseal(&h, UID, &object, PW)), kek);
+    let (fresh, _) = seal(&h, UID, PW);
+    assert_ne!(fresh.srk_name, object.srk_name);
 }
 ```
 
@@ -1165,6 +1315,59 @@ fn a_garbage_frame_gets_a_malformed_reply() {
     assert!(matches!(reply, Response::Failed(Failure::Malformed(_))));
     server.join().unwrap();
 }
+
+/// A client trickling its request a byte at a time (which a per-read
+/// timeout would never catch) is cut off at the request deadline; while
+/// it holds its uid's slot, a second connection from the same uid is told
+/// `Busy` at once rather than queued behind it.
+#[test]
+fn a_trickling_client_is_cut_off_and_does_not_queue_others() {
+    use aleph_tpmd::server::REQUEST_DEADLINE;
+    use std::time::{Duration, Instant};
+
+    let sw = SwTpm::start();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tpm.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let helper = Arc::new(sw.helper());
+    std::thread::spawn(move || aleph_tpmd::server::serve(&listener, helper));
+
+    let start = Instant::now();
+    let mut slow = UnixStream::connect(&path).unwrap();
+    slow.write_all(&100u32.to_be_bytes()).unwrap();
+    let mut trickle = slow.try_clone().unwrap();
+    std::thread::spawn(move || {
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(200));
+            if trickle.write_all(b"\xa0").is_err() {
+                break;
+            }
+        }
+    });
+    std::thread::sleep(Duration::from_millis(200));
+
+    let t = Instant::now();
+    assert_eq!(
+        call(&path, &Request::Status {}),
+        Response::Failed(Failure::Busy)
+    );
+    assert!(t.elapsed() < Duration::from_millis(500));
+
+    let reply: Response = read_frame(&mut slow).unwrap();
+    assert!(
+        matches!(reply, Response::Failed(Failure::Malformed(_))),
+        "{reply:?}"
+    );
+    let cut_off = start.elapsed();
+    assert!(
+        cut_off >= REQUEST_DEADLINE && cut_off < REQUEST_DEADLINE + Duration::from_secs(1),
+        "{cut_off:?}"
+    );
+    assert!(matches!(
+        call(&path, &Request::Status {}),
+        Response::Status(_)
+    ));
+}
 ```
 
 Create `crates/aleph-tpmd/tests/tpm_hardware.rs`:
@@ -1201,16 +1404,39 @@ Expected: the build fails because `server::Helper`, `tpm::{Tpm, TpmError}`, and 
 Insert above the `#[cfg(test)]` line in `crates/aleph-tpmd/src/limiter.rs`:
 
 ```rust
-//! Per-uid rate limiting of failed unseals (spec §5): at most
-//! [`MAX_FAILURES`] per [`WINDOW`]. It protects the TPM's dictionary-attack
-//! counter, which is shared by every user and by `systemd-cryptenroll`,
-//! from any one local user.
+//! Rate limiting of failed unseals (spec §5), in two layers.
+//!
+//! The TPM's dictionary-attack counter is shared by every user and by
+//! `systemd-cryptenroll` disk unlock, and a lockout survives reboot. So:
+//!
+//! - **Global reserve:** the helper refuses any DA-counted unseal once
+//!   the TPM's failure counter reaches [`reserve_threshold`], half of its
+//!   maximum. aleph can therefore never drive the TPM into lockout, and
+//!   the other half stays available to disk unlock.
+//! - **Per-uid budget:** each uid may have at most [`FAILURES_PER_UID`]
+//!   failures outstanding per TPM recovery interval (the time the TPM
+//!   takes to forget one failure), so one user cannot spend the whole
+//!   reserve alone.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-pub const MAX_FAILURES: usize = 5;
-pub const WINDOW: Duration = Duration::from_secs(60);
+/// Failures a uid may have outstanding within one recovery window.
+pub const FAILURES_PER_UID: usize = 2;
+/// Window used when the TPM reports a recovery time of zero.
+pub const MIN_WINDOW: Duration = Duration::from_secs(60);
+
+/// The TPM failure count at which the helper stops attempting DA-counted
+/// unseals: half of `max_tries`, keeping at least one try in reserve. A
+/// TPM with `max_tries == 0` is always locked for DA-protected auth.
+pub fn reserve_threshold(max_tries: u32) -> u32 {
+    max_tries.saturating_sub((max_tries / 2).max(1))
+}
+
+/// The per-uid window for a TPM recovery time in seconds.
+pub fn window(recovery_time_secs: u32) -> Duration {
+    Duration::from_secs(recovery_time_secs.into()).max(MIN_WINDOW)
+}
 
 #[derive(Default)]
 pub struct RateLimiter {
@@ -1218,31 +1444,30 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    /// Whether `uid` is currently blocked.
-    pub fn blocked(&mut self, uid: u32, now: Instant) -> bool {
-        self.prune(uid, now);
+    /// Whether `uid` has used up its budget within `window`.
+    pub fn blocked(&mut self, uid: u32, now: Instant, window: Duration) -> bool {
+        self.prune(now, window);
         self.failures
             .get(&uid)
-            .is_some_and(|f| f.len() >= MAX_FAILURES)
+            .is_some_and(|f| f.len() >= FAILURES_PER_UID)
     }
 
     /// Record a failed unseal by `uid`.
-    pub fn record_failure(&mut self, uid: u32, now: Instant) {
-        self.prune(uid, now);
+    pub fn record_failure(&mut self, uid: u32, now: Instant, window: Duration) {
+        self.prune(now, window);
         self.failures.entry(uid).or_default().push_back(now);
     }
 
-    fn prune(&mut self, uid: u32, now: Instant) {
-        if let Some(f) = self.failures.get_mut(&uid) {
-            while f.front().is_some_and(|t| now.duration_since(*t) >= WINDOW) {
+    /// Forget failures older than `window`, for every uid (bounded memory
+    /// however many uids have come and gone).
+    fn prune(&mut self, now: Instant, window: Duration) {
+        self.failures.retain(|_, f| {
+            while f.front().is_some_and(|t| now.duration_since(*t) >= window) {
                 f.pop_front();
             }
-            if f.is_empty() {
-                self.failures.remove(&uid);
-            }
-        }
+            !f.is_empty()
+        });
     }
-}
 ```
 
 Replace `crates/aleph-tpmd/src/tpm.rs` with:
@@ -1250,12 +1475,17 @@ Replace `crates/aleph-tpmd/src/tpm.rs` with:
 ```rust
 //! The helper's TPM operations (spec §5, "TPM, via aleph-tpmd").
 //!
-//! - **Parent:** aleph's own primary (ECC P-256, AES-256-CFB), re-created
-//!   from a fixed template on each use, whose Name is therefore stable per
-//!   TPM. When `ownerAuth` is set that is impossible, and the persistent TCG
-//!   SRK at `0x81000001` is used instead. Either way the parent's Name is
-//!   recorded at seal time and checked before it salts a session, which
-//!   detects a different TPM or an interposer substituting a key.
+//! - **Parent:** new objects are sealed under aleph's own primary (ECC
+//!   P-256, AES-256-CFB, `noDA`), re-created from a fixed template on each
+//!   use, whose Name is therefore stable per TPM. When `ownerAuth` is set
+//!   that is impossible, and the persistent TCG SRK at `0x81000001` is used
+//!   instead. The parent's Name is recorded at seal time. To unseal, the
+//!   helper uses whichever available parent has that Name (so an SRK slot
+//!   keeps working if `ownerAuth` is cleared later), and fails with
+//!   `ParentMismatch` if none does: a different TPM, or an interposer
+//!   substituting a key. The Name compared is the one ESYS itself holds for
+//!   the handle (`Esys_TR_GetName`), i.e. the key that will salt the
+//!   session.
 //! - **Sealed object:** a keyed hash holding `be32(uid) ‖ KEK`, authorized
 //!   by `HKDF(secret, salt = auth_salt, info = "aleph tpm auth v1" ‖
 //!   be32(uid))`. Unseal returns the KEK only to the uid it was sealed for.
@@ -1270,17 +1500,18 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use tss_esapi::Context;
 use tss_esapi::attributes::{ObjectAttributesBuilder, SessionAttributesBuilder};
-use tss_esapi::constants::PropertyTag;
 use tss_esapi::constants::SessionType;
 use tss_esapi::constants::response_code::Tss2ResponseCodeKind;
+use tss_esapi::constants::{CapabilityType, PropertyTag};
 use tss_esapi::handles::{KeyHandle, ObjectHandle, PersistentTpmHandle, SessionHandle, TpmHandle};
 use tss_esapi::interface_types::algorithm::{HashingAlgorithm, PublicAlgorithm};
 use tss_esapi::interface_types::ecc::EccCurve;
 use tss_esapi::interface_types::resource_handles::Hierarchy;
 use tss_esapi::interface_types::session_handles::AuthSession;
 use tss_esapi::structures::{
-    Auth, EccPoint, KeyedHashScheme, Private, Public, PublicBuilder, PublicEccParametersBuilder,
-    PublicKeyedHashParameters, SensitiveData, SymmetricDefinition, SymmetricDefinitionObject,
+    Auth, CapabilityData, EccPoint, KeyedHashScheme, Private, Public, PublicBuilder,
+    PublicEccParametersBuilder, PublicKeyedHashParameters, SensitiveData, SymmetricDefinition,
+    SymmetricDefinitionObject,
 };
 use tss_esapi::tcti_ldr::TctiNameConf;
 use tss_esapi::traits::{Marshall, UnMarshall};
@@ -1360,12 +1591,33 @@ impl Tpm {
         uid: u32,
         secret: &[u8],
     ) -> Result<(SealedObject, Zeroizing<[u8; KEK_LEN]>)> {
+        self.seal_inner(uid, uid, secret)
+    }
+
+    /// Test hook: seal with the auth value for `auth_uid` but the payload
+    /// naming `payload_uid`, so the payload check is testable on its own.
+    #[cfg(feature = "testing")]
+    pub fn seal_with_payload_uid(
+        &mut self,
+        auth_uid: u32,
+        payload_uid: u32,
+        secret: &[u8],
+    ) -> Result<(SealedObject, Zeroizing<[u8; KEK_LEN]>)> {
+        self.seal_inner(auth_uid, payload_uid, secret)
+    }
+
+    fn seal_inner(
+        &mut self,
+        uid: u32,
+        payload_uid: u32,
+        secret: &[u8],
+    ) -> Result<(SealedObject, Zeroizing<[u8; KEK_LEN]>)> {
         let mut kek = Zeroizing::new([0u8; KEK_LEN]);
         getrandom::fill(kek.as_mut()).map_err(|e| TpmError::Tpm(e.to_string()))?;
         let mut auth_salt = [0u8; AUTH_SALT_LEN];
         getrandom::fill(&mut auth_salt).map_err(|e| TpmError::Tpm(e.to_string()))?;
         let mut payload = Zeroizing::new(Vec::with_capacity(4 + KEK_LEN));
-        payload.extend_from_slice(&uid.to_be_bytes());
+        payload.extend_from_slice(&payload_uid.to_be_bytes());
         payload.extend_from_slice(kek.as_slice());
         let data = SensitiveData::try_from(payload.to_vec()).map_err(tpm_err)?;
         let auth = auth_value(secret, &auth_salt, uid)?;
@@ -1444,13 +1696,9 @@ impl Tpm {
 
     /// TPM state for `aleph setup` (spec §5).
     pub fn status(&mut self) -> Result<Status> {
-        let prop = |ctx: &mut Context, tag| {
-            ctx.get_tpm_property(tag)
-                .map_err(map_tss)
-                .map(|v| v.unwrap_or(0))
-        };
+        let prop = |ctx: &mut Context, tag| property(ctx, tag);
         let permanent = prop(&mut self.ctx, PropertyTag::Permanent)?;
-        let parent = match self.parent() {
+        let parent = match self.seal_parent() {
             Ok(p) => {
                 let kind = if p.transient {
                     Parent::AlephPrimary
@@ -1470,9 +1718,9 @@ impl Tpm {
             owner_auth_set: permanent & PERMANENT_OWNER_AUTH_SET != 0,
             lockout_auth_set: permanent & PERMANENT_LOCKOUT_AUTH_SET != 0,
             // Not every TPM (swtpm, for one) sets the inLockout bit; the
-            // counter reaching the maximum is the definition.
-            in_lockout: permanent & PERMANENT_IN_LOCKOUT != 0
-                || (max_tries > 0 && failed_tries >= max_tries),
+            // counter reaching the maximum is the definition, and a maximum
+            // of zero locks DA-protected authorization permanently.
+            in_lockout: permanent & PERMANENT_IN_LOCKOUT != 0 || failed_tries >= max_tries,
             max_tries,
             recovery_time: prop(&mut self.ctx, PropertyTag::LockoutInterval)?,
             lockout_recovery: prop(&mut self.ctx, PropertyTag::LockoutRecovery)?,
@@ -1480,54 +1728,95 @@ impl Tpm {
         })
     }
 
-    /// The parent for this TPM: aleph's primary unless `ownerAuth` is set,
-    /// then the persistent SRK if present.
-    fn parent(&mut self) -> Result<ParentKey> {
-        let permanent = self
+    /// `(failed_tries, max_tries, recovery_time)`: the dictionary-attack
+    /// counters the helper budgets against.
+    pub fn da_counters(&mut self) -> Result<(u32, u32, u32)> {
+        Ok((
+            property(&mut self.ctx, PropertyTag::LockoutCounter)?,
+            property(&mut self.ctx, PropertyTag::MaxAuthFail)?,
+            property(&mut self.ctx, PropertyTag::LockoutInterval)?,
+        ))
+    }
+
+    fn owner_auth_set(&mut self) -> Result<bool> {
+        Ok(property(&mut self.ctx, PropertyTag::Permanent)? & PERMANENT_OWNER_AUTH_SET != 0)
+    }
+
+    /// aleph's own primary (possible only while `ownerAuth` is empty).
+    fn aleph_primary(&mut self) -> Result<ParentKey> {
+        let handle = self
             .ctx
-            .get_tpm_property(PropertyTag::Permanent)
+            .execute_with_nullauth_session(|ctx| {
+                ctx.create_primary(
+                    Hierarchy::Owner,
+                    primary_template()?,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })
             .map_err(map_tss)?
-            .unwrap_or(0);
-        let (handle, transient) = if permanent & PERMANENT_OWNER_AUTH_SET == 0 {
-            let key = self
-                .ctx
-                .execute_with_nullauth_session(|ctx| {
-                    ctx.create_primary(
-                        Hierarchy::Owner,
-                        primary_template()?,
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
-                })
-                .map_err(map_tss)?
-                .key_handle;
-            (key, true)
-        } else {
-            let handle = PersistentTpmHandle::new(SRK_HANDLE).map_err(tpm_err)?;
-            let object = self
-                .ctx
-                .execute_without_session(|ctx| {
-                    ctx.tr_from_tpm_public(TpmHandle::Persistent(handle))
-                })
-                .map_err(|_| TpmError::NoParent)?;
-            (KeyHandle::from(object), false)
-        };
-        let name = match self.ctx.read_public(handle) {
-            Ok((_, name, _)) => name.value().to_vec(),
+            .key_handle;
+        self.named(handle, true)
+    }
+
+    /// The persistent SRK, if provisioned.
+    fn persistent_srk(&mut self) -> Result<ParentKey> {
+        let handle = PersistentTpmHandle::new(SRK_HANDLE).map_err(tpm_err)?;
+        let object = self
+            .ctx
+            .execute_without_session(|ctx| ctx.tr_from_tpm_public(TpmHandle::Persistent(handle)))
+            .map_err(|_| TpmError::NoParent)?;
+        self.named(KeyHandle::from(object), false)
+    }
+
+    /// Wrap `handle` with the Name ESYS holds for it: the key that will
+    /// salt sessions, whatever a later ReadPublic might claim.
+    fn named(&mut self, handle: KeyHandle, transient: bool) -> Result<ParentKey> {
+        match self.ctx.tr_get_name(handle.into()) {
+            Ok(name) => Ok(ParentKey {
+                handle,
+                name: name.value().to_vec(),
+                transient,
+            }),
             Err(e) => {
                 if transient {
                     let _ = self.ctx.flush_context(handle.into());
                 }
-                return Err(map_tss(e));
+                Err(map_tss(e))
             }
-        };
-        Ok(ParentKey {
-            handle,
-            name,
-            transient,
-        })
+        }
+    }
+
+    /// The parent new objects are sealed under: aleph's primary unless
+    /// `ownerAuth` is set, then the persistent SRK if present.
+    fn seal_parent(&mut self) -> Result<ParentKey> {
+        if self.owner_auth_set()? {
+            self.persistent_srk()
+        } else {
+            self.aleph_primary()
+        }
+    }
+
+    /// The available parent whose Name is `expected`, else
+    /// `ParentMismatch`.
+    fn parent_named(&mut self, expected: &[u8]) -> Result<ParentKey> {
+        if !self.owner_auth_set()? {
+            let primary = self.aleph_primary()?;
+            if primary.name == expected {
+                return Ok(primary);
+            }
+            self.release(primary);
+        }
+        match self.persistent_srk() {
+            Ok(srk) if srk.name == expected => Ok(srk),
+            Ok(srk) => {
+                self.release(srk);
+                Err(TpmError::ParentMismatch)
+            }
+            Err(_) => Err(TpmError::ParentMismatch),
+        }
     }
 
     fn release(&mut self, parent: ParentKey) {
@@ -1536,7 +1825,7 @@ impl Tpm {
         }
     }
 
-    /// Get the parent, verify its Name against `expected` (if any), open a
+    /// Get the parent (the one named `expected`, or the seal parent), open a
     /// salted parameter-encrypting session bound to it, run `f`, and flush
     /// everything transient.
     fn with_parent<T>(
@@ -1544,11 +1833,10 @@ impl Tpm {
         expected: Option<&[u8]>,
         f: impl FnOnce(&mut Context, &ParentKey, AuthSession) -> Result<T>,
     ) -> Result<T> {
-        let parent = self.parent()?;
-        if expected.is_some_and(|name| name != parent.name.as_slice()) {
-            self.release(parent);
-            return Err(TpmError::ParentMismatch);
-        }
+        let parent = match expected {
+            Some(name) => self.parent_named(name)?,
+            None => self.seal_parent()?,
+        };
         let result = start_session(&mut self.ctx, parent.handle).and_then(|session| {
             let out = f(&mut self.ctx, &parent, session);
             flush_session(&mut self.ctx, session);
@@ -1570,14 +1858,35 @@ fn auth_value(secret: &[u8], salt: &[u8; AUTH_SALT_LEN], uid: u32) -> Result<Aut
     Auth::try_from(okm.to_vec()).map_err(tpm_err)
 }
 
+/// A TPM property, read fresh (0 if the TPM does not report it).
+/// `Context::get_tpm_property` caches every value forever, which is wrong
+/// for a long-lived helper: the DA counter and `ownerAuth` change.
+fn property(ctx: &mut Context, tag: PropertyTag) -> Result<u32> {
+    let (data, _) = ctx
+        .execute_without_session(|ctx| {
+            ctx.get_capability(CapabilityType::TpmProperties, tag.into(), 1)
+        })
+        .map_err(map_tss)?;
+    let CapabilityData::TpmProperties(props) = data else {
+        return Err(TpmError::Tpm("unexpected capability data".into()));
+    };
+    Ok(props
+        .into_iter()
+        .find(|p| p.property() == tag)
+        .map_or(0, |p| p.value()))
+}
+
 /// ECC P-256 restricted decryption key protecting children with
-/// AES-256-CFB.
+/// AES-256-CFB. `noDA` (as in the TCG SRK template): using the parent
+/// itself needs no secret, so it should keep working during lockout; the
+/// sealed objects under it remain DA-protected.
 fn primary_template() -> tss_esapi::Result<Public> {
     let attributes = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
         .with_sensitive_data_origin(true)
         .with_user_with_auth(true)
+        .with_no_da(true)
         .with_decrypt(true)
         .with_restricted(true)
         .build()?;
@@ -1667,34 +1976,129 @@ Replace `crates/aleph-tpmd/src/server.rs` with:
 ```rust
 //! Request handling and the socket loop.
 //!
-//! The caller's uid comes only from `SO_PEERCRED`. Connections are served
-//! one at a time (the TPM is serial anyway), each with read and write
-//! timeouts so an idle or slow client cannot hold the helper.
+//! The caller's uid comes only from `SO_PEERCRED`, and only login uids
+//! are served ([`Policy`]). Each connection gets its own thread (at most
+//! [`MAX_CONNECTIONS`]) and must deliver its whole request within
+//! [`REQUEST_DEADLINE`], so a slow or idle client cannot hold the helper;
+//! a uid may have one connection in flight at a time, so one user cannot
+//! take every thread. Only the TPM itself is serialized.
 
-use std::io;
+use std::collections::HashSet;
+use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::Mutex;
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aleph_tpm_proto::{Failure, Request, Response, Secret, read_frame, write_frame};
 
-use crate::limiter::RateLimiter;
+use crate::limiter::{RateLimiter, reserve_threshold, window};
 use crate::tpm::{Tpm, TpmError};
 
-/// How long a client may take to send its request or read the reply.
-pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a client has to deliver its whole request.
+pub const REQUEST_DEADLINE: Duration = Duration::from_secs(2);
+/// How long a client may take to read the reply.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Connections served at once; more are refused with `Busy`.
+pub const MAX_CONNECTIONS: usize = 64;
+
+/// Which uids the helper serves: login users only (system accounts have
+/// no business sealing secrets, and each served uid is a DA budget).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Policy {
+    pub uid_min: u32,
+    pub uid_max: u32,
+}
+
+impl Policy {
+    /// `UID_MIN`/`UID_MAX` from `login.defs` text, defaulting to the
+    /// shadow-utils values 1000 and 60000.
+    pub fn from_login_defs(text: &str) -> Self {
+        let mut policy = Self {
+            uid_min: 1000,
+            uid_max: 60000,
+        };
+        for line in text.lines() {
+            let mut words = line.split_whitespace();
+            let (Some(key), Some(value)) = (words.next(), words.next()) else {
+                continue;
+            };
+            let Ok(value) = value.parse() else { continue };
+            match key {
+                "UID_MIN" => policy.uid_min = value,
+                "UID_MAX" => policy.uid_max = value,
+                _ => {}
+            }
+        }
+        policy
+    }
+
+    /// The system's policy, from `/etc/login.defs` (defaults if absent).
+    pub fn system() -> Self {
+        Self::from_login_defs(
+            &std::fs::read_to_string(Path::new("/etc/login.defs")).unwrap_or_default(),
+        )
+    }
+
+    /// Every uid (tests, which run as arbitrary users).
+    pub fn allow_all() -> Self {
+        Self {
+            uid_min: 0,
+            uid_max: u32::MAX,
+        }
+    }
+
+    pub fn allows(&self, uid: u32) -> bool {
+        (self.uid_min..=self.uid_max).contains(&uid)
+    }
+}
 
 pub struct Helper {
     tpm: Mutex<Tpm>,
     limiter: Mutex<RateLimiter>,
+    policy: Policy,
+    in_flight: Mutex<HashSet<u32>>,
+    connections: AtomicUsize,
+}
+
+/// A uid's in-flight slot, released on drop.
+pub struct Claim<'a> {
+    helper: &'a Helper,
+    uid: u32,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        lock(&self.helper.in_flight).remove(&self.uid);
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl Helper {
-    pub fn new(tpm: Tpm) -> Self {
+    pub fn new(tpm: Tpm, policy: Policy) -> Self {
         Self {
             tpm: Mutex::new(tpm),
             limiter: Mutex::new(RateLimiter::default()),
+            policy,
+            in_flight: Mutex::new(HashSet::new()),
+            connections: AtomicUsize::new(0),
+        }
+    }
+
+    /// Take `uid`'s in-flight slot, or `None` if it already has a request
+    /// in progress.
+    pub fn claim(&self, uid: u32) -> Option<Claim<'_>> {
+        // Not `then_some`: that would build (and drop) a Claim even when
+        // the insert fails, releasing the other request's slot.
+        if lock(&self.in_flight).insert(uid) {
+            Some(Claim { helper: self, uid })
+        } else {
+            None
         }
     }
 
@@ -1705,7 +2109,10 @@ impl Helper {
 
     /// `handle` with an explicit clock, for tests.
     pub fn handle_at(&self, uid: u32, request: Request, now: Instant) -> Response {
-        let mut tpm = self.tpm.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.policy.allows(uid) {
+            return Response::Failed(Failure::NotPermitted);
+        }
+        let mut tpm = lock(&self.tpm);
         match request {
             Request::Seal { secret } => match tpm.seal(uid, &secret.0) {
                 Ok((object, kek)) => Response::Sealed {
@@ -1715,22 +2122,29 @@ impl Helper {
                 Err(e) => Response::Failed(failure(e)),
             },
             Request::Unseal { object, secret } => {
-                let mut limiter = self.limiter.lock().unwrap_or_else(|e| e.into_inner());
-                if limiter.blocked(uid, now) {
+                let (failed, max, recovery) = match tpm.da_counters() {
+                    Ok(c) => c,
+                    Err(e) => return Response::Failed(failure(e)),
+                };
+                let window = window(recovery);
+                let mut limiter = lock(&self.limiter);
+                if limiter.blocked(uid, now, window) {
                     return Response::Failed(Failure::RateLimited);
+                }
+                // Never spend the second half of the TPM's budget: that is
+                // what keeps aleph from ever locking the TPM out.
+                if failed >= reserve_threshold(max) {
+                    return Response::Failed(Failure::Busy);
                 }
                 match tpm.unseal(uid, &object, &secret.0) {
                     Ok(kek) => Response::Unsealed {
                         kek: Secret(kek.to_vec()),
                     },
                     Err(e) => {
-                        // Lockout counts too: a locked-out caller must not be
-                        // able to keep polling the TPM.
-                        if matches!(
-                            e,
-                            TpmError::AuthFailed | TpmError::WrongUser | TpmError::Lockout
-                        ) {
-                            limiter.record_failure(uid, now);
+                        // (A Lockout reply needs no counting: the reserve
+                        // check above already refuses long before it.)
+                        if matches!(e, TpmError::AuthFailed | TpmError::WrongUser) {
+                            limiter.record_failure(uid, now, window);
                         }
                         Response::Failed(failure(e))
                     }
@@ -1780,29 +2194,76 @@ pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     Ok(cred.uid)
 }
 
+/// Reads that fail once `deadline` passes, however the client paces its
+/// bytes (a per-read timeout alone lets a byte-a-second client stay).
+struct DeadlineReader<'a> {
+    stream: &'a UnixStream,
+    deadline: Instant,
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        self.stream.set_read_timeout(Some(remaining))?;
+        (&*self.stream).read(buf)
+    }
+}
+
 /// Serve one connection: one request, one response.
 pub fn serve_connection(helper: &Helper, mut stream: UnixStream) -> io::Result<()> {
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let uid = peer_uid(&stream)?;
-    let response = match read_frame::<Request>(&mut stream) {
+    let Some(_claim) = helper.claim(uid) else {
+        return reply(&mut stream, &Response::Failed(Failure::Busy));
+    };
+    let mut reader = DeadlineReader {
+        stream: &stream,
+        deadline: Instant::now() + REQUEST_DEADLINE,
+    };
+    let response = match read_frame::<Request>(&mut reader) {
         Ok(request) => helper.handle(uid, request),
         Err(e) => Response::Failed(Failure::Malformed(e.to_string())),
     };
-    write_frame(&mut stream, &response).map_err(io::Error::other)
+    reply(&mut stream, &response)
 }
 
-/// Accept and serve connections forever. Per-connection errors are logged
-/// and do not stop the helper.
-pub fn serve(listener: &UnixListener, helper: &Helper) -> ! {
+fn reply(stream: &mut UnixStream, response: &Response) -> io::Result<()> {
+    write_frame(stream, response).map_err(io::Error::other)
+}
+
+/// Accept connections forever, each on its own thread. Per-connection
+/// errors are logged and do not stop the helper.
+pub fn serve(listener: &UnixListener, helper: Arc<Helper>) -> ! {
     loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                if let Err(e) = serve_connection(helper, stream) {
+        let mut stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                eprintln!("aleph-tpmd: accept error: {e}");
+                continue;
+            }
+        };
+        if helper.connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+            helper.connections.fetch_sub(1, Ordering::SeqCst);
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+            let _ = reply(&mut stream, &Response::Failed(Failure::Busy));
+            continue;
+        }
+        let helper = Arc::clone(&helper);
+        let spawned = std::thread::Builder::new().spawn({
+            let helper = Arc::clone(&helper);
+            move || {
+                if let Err(e) = serve_connection(&helper, stream) {
                     eprintln!("aleph-tpmd: connection error: {e}");
                 }
+                helper.connections.fetch_sub(1, Ordering::SeqCst);
             }
-            Err(e) => eprintln!("aleph-tpmd: accept error: {e}"),
+        });
+        if let Err(e) = spawned {
+            helper.connections.fetch_sub(1, Ordering::SeqCst);
+            eprintln!("aleph-tpmd: cannot spawn a connection thread: {e}");
         }
     }
 }
@@ -1899,8 +2360,13 @@ impl SwTpm {
         crate::Tpm::open(&self.tcti()).unwrap()
     }
 
+    /// A helper serving every uid (tests run as whoever runs them).
     pub fn helper(&self) -> crate::Helper {
-        crate::Helper::new(self.tpm())
+        self.helper_with(crate::server::Policy::allow_all())
+    }
+
+    pub fn helper_with(&self, policy: crate::server::Policy) -> crate::Helper {
+        crate::Helper::new(self.tpm(), policy)
     }
 
     fn raw(&self) -> Context {
@@ -1975,6 +2441,22 @@ impl SwTpm {
         })
         .unwrap();
     }
+
+    /// Clear the owner authorization set by [`Self::set_owner_auth`].
+    pub fn clear_owner_auth(&self) {
+        use tss_esapi::handles::{AuthHandle, ObjectHandle};
+        use tss_esapi::structures::Auth;
+        let mut ctx = self.raw();
+        ctx.tr_set_auth(
+            ObjectHandle::Owner,
+            Auth::try_from(b"owner".to_vec()).unwrap(),
+        )
+        .unwrap();
+        ctx.execute_with_nullauth_session(|ctx| {
+            ctx.hierarchy_change_auth(AuthHandle::Owner, Auth::default())
+        })
+        .unwrap();
+    }
 }
 
 impl SwTpm {
@@ -2031,7 +2513,9 @@ Replace `crates/aleph-tpmd/src/main.rs` with:
 use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixListener;
 use std::process::ExitCode;
+use std::sync::Arc;
 
+use aleph_tpmd::server::Policy;
 use aleph_tpmd::{Helper, Tpm};
 
 const SD_LISTEN_FDS_START: i32 = 3;
@@ -2062,6 +2546,10 @@ fn listener() -> std::io::Result<UnixListener> {
 }
 
 fn main() -> ExitCode {
+    // No core dumps and no ptrace by same-uid processes: this process
+    // holds KEKs in memory. (The unit also sets LimitCORE=0.)
+    // SAFETY: prctl(PR_SET_DUMPABLE, 0) has no memory-safety preconditions.
+    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
     let listener = match listener() {
         Ok(l) => l,
         Err(e) => {
@@ -2076,7 +2564,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    aleph_tpmd::server::serve(&listener, &Helper::new(tpm))
+    aleph_tpmd::server::serve(&listener, Arc::new(Helper::new(tpm, Policy::system())))
 }
 ```
 
@@ -2084,8 +2572,8 @@ fn main() -> ExitCode {
 
 Run: `cargo test -p aleph-tpmd && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
 Expected:
-- unit `2 passed`, `helper` `15 passed`, `socket` `3 passed`, `tpm_hardware` `1 ignored`
-- about 2 s in total
+- unit `4 passed`, `helper` `19 passed`, `socket` `4 passed`, `tpm_hardware` `1 ignored`
+- about 3 s in total (the trickling-client test waits out the 2 s deadline)
 - `WARNING:tcti:…`/`WARNING:esys:…` lines on stderr: expected (readiness probes and deliberate failures)
 
 Run it 3 times. It must never hang; a hang means the fixture's start lock is missing.
@@ -2094,9 +2582,16 @@ Run it 3 times. It must never hang; a hang means the fixture's start lock is mis
 
 Revert each of these one at a time, run the named test and see it FAIL, then restore (`touch` the file) and see it pass:
 - In `tpm.rs`, delete `info.extend_from_slice(&uid.to_be_bytes());` in `auth_value` **and** change `if bytes[..4] != uid.to_be_bytes() {` to `if false && bytes[..4] != uid.to_be_bytes() {`. Test: `--test helper another_user_cannot_unseal`.
-- In `tpm.rs` `with_parent`, prefix the Name check's condition with `false &&`. Test: `--test helper a_parent_name_mismatch`.
-- In `server.rs`, replace `limiter.record_failure(uid, now);` with `let _ = &limiter;`. Test: `--test helper failed_unseals_are_rate_limited`.
-- In `server.rs`, remove `| TpmError::Lockout` from the counted errors. Test: `--test helper a_locked_out_caller`.
+- In `tpm.rs`, only the payload change above. Test: `--test helper a_payload_for_another_uid`.
+- In `tpm.rs` `parent_named`, change `if primary.name == expected {` to `if true {`. Test: `--test helper a_parent_name_mismatch`.
+- In `tpm.rs` `parent_named`, change `Ok(srk) if srk.name == expected => Ok(srk),` to `Ok(srk) if true => Ok(srk),`. Test: `--test helper with_owner_auth_set_the_persistent_srk_is_used`.
+- In `tpm.rs` `with_parent`, replace `Some(name) => self.parent_named(name)?,` with `Some(name) => { let p = self.seal_parent()?; if p.name != name { self.release(p); return Err(TpmError::ParentMismatch); } p }`. Test: `--test helper a_slot_unseals_under_whichever_parent`.
+- In `tpm.rs` `property`, make the first statement `if true { return ctx.get_tpm_property(tag).map_err(map_tss).map(|v| v.unwrap_or(0)); }`. Tests: `--test helper guessing_from_many_uids` and `--test helper with_owner_auth_set_the_persistent_srk_is_used`.
+- In `server.rs`, replace `limiter.record_failure(uid, now, window);` with `let _ = &limiter;`. Test: `--test helper failed_unseals_are_rate_limited`.
+- In `server.rs`, prefix `failed >= reserve_threshold(max)` with `false &&`. Test: `--test helper guessing_from_many_uids`.
+- In `server.rs`, prefix `!self.policy.allows(uid)` with `false &&`. Test: `--test helper only_login_uids_are_served`.
+- In `server.rs` `DeadlineReader::read`, replace the `remaining` computation with `let remaining = Duration::from_secs(1);`. Test: `--test socket a_trickling_client`.
+- In `server.rs` `claim`, append `|| true` to the `insert(uid)` condition. Test: `--test socket a_trickling_client`.
 
 - [ ] **Step 6: Commit**
 
@@ -2116,7 +2611,7 @@ git commit -m "feat(tpmd): TPM helper with uid binding, parent Name check, rate 
   - `tpm::{DEFAULT_SOCKET = "/run/aleph/tpm.sock", TIMEOUT = 30 s}`
   - `TpmClient::new(path)`, `TpmClient::from_env()` (reads `ALEPH_TPM_SOCKET`)
   - `.seal(password) -> Result<(Kek, TpmSlot)>`, `.unseal(&TpmSlot, password) -> Result<Kek>`, `.status() -> Result<Status>`
-  - `Error`: `Core`, `TpmUnavailable`, `TpmAuthFailed`, `TpmLockout`, `TpmRateLimited`, `TpmWrongUser`, `TpmParentMismatch`, `TpmNoParent`, `TpmSlotMalformed`, `SecretRequired`, `Tpm`, plus the FIDO2 variants Task 4 uses
+  - `Error`: `Core`, `TpmUnavailable`, `TpmAuthFailed`, `TpmLockout`, `TpmRateLimited`, `TpmBusy`, `TpmNotPermitted`, `TpmWrongUser`, `TpmParentMismatch`, `TpmNoParent`, `TpmSlotMalformed`, `SecretRequired`, `Tpm`, plus the FIDO2 variants Tasks 4–5 use (`Fido2NoDevice`, `Fido2MultipleDevices`, `Fido2Unsupported`, `Fido2PinNotSet`, `Fido2UvInvalid`, `Fido2Denied`, `Fido2PinRequired`, `Fido2PinInvalid`, `Fido2PinBlocked`, `Fido2NoCredential`, `Fido2Timeout`, `Fido2(String)`)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2212,6 +2707,7 @@ zeroize.workspace = true
 aleph-core = { path = "../aleph-core", features = ["insecure-test-params"] }
 aleph-tpm-proto = { path = "../aleph-tpm-proto" }
 aleph-tpmd = { path = "../aleph-tpmd", features = ["testing"] }
+libc.workspace = true
 tempfile.workspace = true
 ```
 
@@ -2247,8 +2743,19 @@ pub enum Error {
     #[error("the TPM is in dictionary-attack lockout; wait and retry")]
     TpmLockout,
 
-    #[error("too many failed TPM attempts; wait a minute")]
+    #[error("too many failed TPM attempts; wait a few minutes")]
     TpmRateLimited,
+
+    /// Temporary: the TPM's shared failure budget is spent (aleph keeps
+    /// the rest for disk unlock), or another request is in progress. Not
+    /// a reason to mark the slot stale.
+    #[error(
+        "the TPM is not accepting password attempts right now; try later or use another method"
+    )]
+    TpmBusy,
+
+    #[error("aleph-tpmd serves login users only")]
+    TpmNotPermitted,
 
     #[error("this TPM slot belongs to another user")]
     TpmWrongUser,
@@ -2282,6 +2789,12 @@ pub enum Error {
     )]
     Fido2PinNotSet,
 
+    #[error("FIDO2 built-in verification (fingerprint) failed")]
+    Fido2UvInvalid,
+
+    #[error("the FIDO2 operation was declined on the key")]
+    Fido2Denied,
+
     #[error("FIDO2 PIN is required")]
     Fido2PinRequired,
 
@@ -2311,6 +2824,7 @@ use std::os::unix::net::UnixListener;
 use std::sync::Arc;
 
 use aleph_core::{LockedVault, RecoveryKey, SlotKind, UnlockedVault};
+use aleph_tpmd::server::Policy;
 use aleph_tpmd::testing::SwTpm;
 use aleph_unlock::{Error, TpmClient};
 
@@ -2325,12 +2839,15 @@ struct Helper {
 }
 
 fn helper() -> Helper {
-    let sw = SwTpm::start();
+    helper_with(SwTpm::start(), Policy::allow_all())
+}
+
+fn helper_with(sw: SwTpm, policy: Policy) -> Helper {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tpm.sock");
     let listener = UnixListener::bind(&path).unwrap();
-    let helper = Arc::new(sw.helper());
-    std::thread::spawn(move || aleph_tpmd::server::serve(&listener, &helper));
+    let helper = Arc::new(sw.helper_with(policy));
+    std::thread::spawn(move || aleph_tpmd::server::serve(&listener, helper));
     Helper {
         _sw: sw,
         _dir: dir,
@@ -2372,6 +2889,26 @@ fn helper_failures_map_to_specific_errors() {
         h.client.unseal(&corrupt, PW),
         Err(Error::TpmSlotMalformed(_))
     ));
+}
+
+#[test]
+fn helper_refusals_map_to_specific_errors() {
+    // A TPM allowing one failure has no budget to spare: every unseal is
+    // refused as Busy before it reaches the TPM.
+    let sw = SwTpm::start();
+    sw.set_da_parameters(1, 600, 86400);
+    let h = helper_with(sw, Policy::allow_all());
+    let (_, slot) = h.client.seal(PW).unwrap();
+    assert!(matches!(h.client.unseal(&slot, PW), Err(Error::TpmBusy)));
+
+    // SAFETY: getuid has no preconditions.
+    let me = unsafe { libc::getuid() };
+    let others = Policy {
+        uid_min: me.wrapping_add(1),
+        uid_max: me.wrapping_add(1),
+    };
+    let h = helper_with(SwTpm::start(), others);
+    assert!(matches!(h.client.seal(PW), Err(Error::TpmNotPermitted)));
 }
 
 #[test]
@@ -2555,6 +3092,8 @@ fn unexpected(response: Response) -> Error {
             Failure::AuthFailed => Error::TpmAuthFailed,
             Failure::Lockout => Error::TpmLockout,
             Failure::RateLimited => Error::TpmRateLimited,
+            Failure::Busy => Error::TpmBusy,
+            Failure::NotPermitted => Error::TpmNotPermitted,
             Failure::WrongUser => Error::TpmWrongUser,
             Failure::ParentMismatch => Error::TpmParentMismatch,
             Failure::NoParent => Error::TpmNoParent,
@@ -2569,7 +3108,7 @@ fn unexpected(response: Response) -> Error {
 - [ ] **Step 4: Run the tests, clippy, and fmt**
 
 Run: `cargo test -p aleph-unlock && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
-Expected: `tpm_client` `6 passed`.
+Expected: `tpm_client` `7 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2586,12 +3125,13 @@ git commit -m "feat(unlock): TPM client for aleph-tpmd" -m "Co-Authored-By: Clau
 - Consumes: `aleph_core::{Fido2Slot { credential_id, salt, uv_required, pin_required }, Kek::try_init, crypto::{hkdf, random_array}}`; Task 3 `Error` FIDO2 variants.
 - Produces:
   - `fido2::RP_ID = "aleph"`
+  - `CredProtect { UvOptional, UvOptionalWithId, UvRequired }`, `CRED_PROTECT = CredProtect::UvOptionalWithId`
   - `DeviceInfo { hmac_secret, pin_set, uv }`
-  - `trait Authenticator { info, make_credential(rp_id, pin, uv), has_credential(rp_id, credential_id), hmac_secret(rp_id, credential_id, salt, pin, uv) }`
+  - `trait Authenticator { info, make_credential(rp_id, protect, pin, uv), has_credential(rp_id, credential_id), hmac_secret(rp_id, credential_id, salt, pin, uv) }`
   - `trait Keys { devices(&mut self) -> Result<Vec<&mut dyn Authenticator>>; any_present(&mut self) -> bool }`
   - `Verification { PinOrUv (default), TouchOnly }`
   - `enroll(&mut dyn Keys, pin, Verification) -> Result<(Kek, Fido2Slot)>`, `unlock(&mut dyn Keys, &Fido2Slot, pin) -> Result<Kek>`
-  - `mock::{MockAuthenticator { new, with_pin, with_uv, pub hmac_secret_supported, pub uv_capable, pub touches }, MockKeys { pub devices, one }}`
+  - `mock::{MockAuthenticator { new, with_pin, with_uv, pub hmac_secret_supported, pub uv_capable, pub touches, pub fail_preflight }, MockKeys { pub devices, one }}`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2618,6 +3158,7 @@ zeroize.workspace = true
 aleph-core = { path = "../aleph-core", features = ["insecure-test-params"] }
 aleph-tpm-proto = { path = "../aleph-tpm-proto" }
 aleph-tpmd = { path = "../aleph-tpmd", features = ["testing"] }
+libc.workspace = true
 tempfile.workspace = true
 ```
 
@@ -2642,7 +3183,7 @@ Create `crates/aleph-unlock/src/fido2/mod.rs` containing only `pub mod mock;`, `
 use aleph_core::{LockedVault, RecoveryKey, SlotKind, UnlockedVault};
 use aleph_unlock::Error;
 use aleph_unlock::fido2::mock::{MockAuthenticator, MockKeys};
-use aleph_unlock::fido2::{self, Keys, Verification};
+use aleph_unlock::fido2::{self, Authenticator, CRED_PROTECT, CredProtect, Keys, Verification};
 
 fn same_kek(a: &aleph_core::Kek, b: &aleph_core::Kek) -> bool {
     let mk = aleph_core::KeyHandle::generate().unwrap();
@@ -2814,6 +3355,58 @@ fn a_touch_without_verification_cannot_open_a_verified_slot() {
     ));
 }
 
+/// A key whose preflight errors is "not this key": the right key among
+/// several still unlocks, and only if none matches is the error reported.
+#[test]
+fn a_failing_preflight_does_not_stop_the_search() {
+    let mut keys = MockKeys::one(MockAuthenticator::with_pin(PIN));
+    let (kek, slot) = fido2::enroll(&mut keys, Some(PIN), Verification::PinOrUv).unwrap();
+    let mut broken = MockAuthenticator::new();
+    broken.fail_preflight = true;
+    keys.devices.insert(0, broken);
+    assert!(same_kek(
+        &kek,
+        &fido2::unlock(&mut keys, &slot, Some(PIN)).unwrap()
+    ));
+    keys.devices[1] = MockAuthenticator::new();
+    assert!(matches!(
+        fido2::unlock(&mut keys, &slot, Some(PIN)),
+        Err(Error::Fido2(m)) if m == "preflight failed"
+    ));
+}
+
+/// With one key there is nothing to choose between: no preflight, so a
+/// preflight quirk cannot block it.
+#[test]
+fn a_single_key_is_asked_directly() {
+    let mut keys = MockKeys::one(MockAuthenticator::with_pin(PIN));
+    let (kek, slot) = fido2::enroll(&mut keys, Some(PIN), Verification::PinOrUv).unwrap();
+    keys.devices[0].fail_preflight = true;
+    assert!(same_kek(
+        &kek,
+        &fido2::unlock(&mut keys, &slot, Some(PIN)).unwrap()
+    ));
+}
+
+/// Enrollment uses credProtect level 2, which the multi-key preflight
+/// depends on: a level-3 credential is invisible to it.
+#[test]
+fn enrollment_uses_cred_protect_level_2() {
+    assert_eq!(CRED_PROTECT, CredProtect::UvOptionalWithId);
+    let mut hidden = MockAuthenticator::with_pin(PIN);
+    let id = hidden
+        .make_credential(fido2::RP_ID, CredProtect::UvRequired, Some(PIN), false)
+        .unwrap();
+    assert!(!hidden.has_credential(fido2::RP_ID, &id).unwrap());
+    let mut keys = MockKeys::one(MockAuthenticator::with_pin(PIN));
+    let (_, slot) = fido2::enroll(&mut keys, Some(PIN), Verification::PinOrUv).unwrap();
+    assert!(
+        keys.devices[0]
+            .has_credential(fido2::RP_ID, &slot.credential_id)
+            .unwrap()
+    );
+}
+
 #[test]
 fn any_present_reflects_connected_keys() {
     assert!(!MockKeys::default().any_present());
@@ -2869,9 +3462,16 @@ Replace `crates/aleph-unlock/src/fido2/mod.rs` with:
 //!   level 2 suffices: level 3 would also hide the credential from the
 //!   no-touch preflight, and choosing among several keys would then burn
 //!   PIN retries on the wrong ones.
-//! - **Unlock** preflights every connected key with a no-touch assertion
-//!   to find the one holding the slot's credential, then asks only that
-//!   key for a touch.
+//!   What level 2 gives away: anyone holding the key (no PIN) can learn
+//!   that it holds a given credential ID, and can obtain the key's
+//!   *non-UV* hmac-secret output for it, which opens nothing aleph
+//!   enrolled with UV.
+//! - **Unlock** with a single key connected asks it directly. With several,
+//!   it preflights each with a no-touch assertion to find the one holding
+//!   the slot's credential, then asks only that key for a touch. A key
+//!   whose preflight fails (unplugged mid-scan, a firmware quirk) is
+//!   treated as "not this key"; if no key matches, the first such error is
+//!   reported instead of "no credential".
 //!
 //! All hardware access goes through [`Keys`] and [`Authenticator`], so the
 //! logic is tested against [`mock::MockKeys`].
@@ -2889,6 +3489,20 @@ use crate::error::{Error, Result};
 pub const RP_ID: &str = "aleph";
 const KEK_INFO: &[u8] = b"aleph fido2 v1";
 
+/// CTAP2.1 credProtect levels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredProtect {
+    /// Level 1: usable without UV, discoverable.
+    UvOptional,
+    /// Level 2: usable without UV only when the credential ID is given.
+    UvOptionalWithId,
+    /// Level 3: every use requires UV (so no no-touch preflight either).
+    UvRequired,
+}
+
+/// The level aleph enrolls with (see the module docs for why 2).
+pub const CRED_PROTECT: CredProtect = CredProtect::UvOptionalWithId;
+
 /// What a key supports, from `authenticatorGetInfo`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceInfo {
@@ -2904,8 +3518,14 @@ pub trait Authenticator {
     fn info(&mut self) -> Result<DeviceInfo>;
 
     /// Create a non-resident credential with `hmac-secret` enabled and
-    /// credProtect "UV optional with credential ID". Requires a touch.
-    fn make_credential(&mut self, rp_id: &str, pin: Option<&str>, uv: bool) -> Result<Vec<u8>>;
+    /// credProtect `protect`. Requires a touch.
+    fn make_credential(
+        &mut self,
+        rp_id: &str,
+        protect: CredProtect,
+        pin: Option<&str>,
+        uv: bool,
+    ) -> Result<Vec<u8>>;
 
     /// Whether this key holds `credential_id`: an assertion without user
     /// presence (no touch, no PIN).
@@ -2968,7 +3588,7 @@ pub fn enroll(
         Verification::PinOrUv => return Err(Error::Fido2PinNotSet),
         Verification::TouchOnly => (None, false),
     };
-    let credential_id = device.make_credential(RP_ID, pin, uv)?;
+    let credential_id = device.make_credential(RP_ID, CRED_PROTECT, pin, uv)?;
     let salt = aleph_core::crypto::random_array::<32>()?;
     let secret = device.hmac_secret(RP_ID, &credential_id, &salt, pin, uv)?;
     let slot = Fido2Slot {
@@ -2989,22 +3609,33 @@ pub fn unlock(keys: &mut dyn Keys, slot: &Fido2Slot, pin: Option<&str>) -> Resul
     // its UV secret and yield the wrong KEK: ignore it.
     let pin = if slot.pin_required { pin } else { None };
     let mut devices = keys.devices()?;
-    if devices.is_empty() {
-        return Err(Error::Fido2NoDevice);
+    let ask = |device: &mut &mut dyn Authenticator| {
+        let secret = device.hmac_secret(
+            RP_ID,
+            &slot.credential_id,
+            &slot.salt,
+            pin,
+            slot.uv_required,
+        )?;
+        derive_kek(&secret)
+    };
+    match devices.len() {
+        0 => return Err(Error::Fido2NoDevice),
+        // Nothing to choose between: skip the preflight round trip.
+        1 => return ask(&mut devices[0]),
+        _ => {}
     }
+    let mut first_error = None;
     for device in devices.iter_mut() {
-        if device.has_credential(RP_ID, &slot.credential_id)? {
-            let secret = device.hmac_secret(
-                RP_ID,
-                &slot.credential_id,
-                &slot.salt,
-                pin,
-                slot.uv_required,
-            )?;
-            return derive_kek(&secret);
+        match device.has_credential(RP_ID, &slot.credential_id) {
+            Ok(true) => return ask(device),
+            Ok(false) => {}
+            Err(e) => {
+                first_error.get_or_insert(e);
+            }
         }
     }
-    Err(Error::Fido2NoCredential)
+    Err(first_error.unwrap_or(Error::Fido2NoCredential))
 }
 
 fn derive_kek(secret: &[u8; 32]) -> Result<Kek> {
@@ -3030,7 +3661,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use super::{Authenticator, DeviceInfo, Keys};
+use super::{Authenticator, CredProtect, DeviceInfo, Keys};
 use crate::error::{Error, Result};
 
 const PIN_RETRIES: u8 = 8;
@@ -3040,10 +3671,12 @@ pub struct MockAuthenticator {
     pin: Option<String>,
     pub uv_capable: bool,
     pin_retries: u8,
-    /// Credential ID → (RP ID, per-credential secret).
-    credentials: HashMap<Vec<u8>, (String, [u8; 32])>,
+    /// Credential ID → (RP ID, protection, per-credential secret).
+    credentials: HashMap<Vec<u8>, (String, CredProtect, [u8; 32])>,
     /// Touches performed on this key.
     pub touches: usize,
+    /// Make the no-touch preflight fail (a key unplugged mid-scan).
+    pub fail_preflight: bool,
 }
 
 impl MockAuthenticator {
@@ -3056,6 +3689,7 @@ impl MockAuthenticator {
             pin_retries: PIN_RETRIES,
             credentials: HashMap::new(),
             touches: 0,
+            fail_preflight: false,
         }
     }
 
@@ -3123,7 +3757,13 @@ impl Authenticator for MockAuthenticator {
         })
     }
 
-    fn make_credential(&mut self, rp_id: &str, pin: Option<&str>, uv: bool) -> Result<Vec<u8>> {
+    fn make_credential(
+        &mut self,
+        rp_id: &str,
+        protect: CredProtect,
+        pin: Option<&str>,
+        uv: bool,
+    ) -> Result<Vec<u8>> {
         if !self.hmac_secret_supported {
             return Err(Error::Fido2Unsupported);
         }
@@ -3131,15 +3771,19 @@ impl Authenticator for MockAuthenticator {
         let id = aleph_core::crypto::random_array::<32>()?.to_vec();
         let secret = aleph_core::crypto::random_array::<32>()?;
         self.credentials
-            .insert(id.clone(), (rp_id.to_string(), secret));
+            .insert(id.clone(), (rp_id.to_string(), protect, secret));
         Ok(id)
     }
 
     fn has_credential(&mut self, rp_id: &str, credential_id: &[u8]) -> Result<bool> {
+        if self.fail_preflight {
+            return Err(Error::Fido2("preflight failed".into()));
+        }
+        // A level-3 credential is invisible to an assertion without UV.
         Ok(self
             .credentials
             .get(credential_id)
-            .is_some_and(|(rp, _)| rp == rp_id))
+            .is_some_and(|(rp, protect, _)| rp == rp_id && *protect != CredProtect::UvRequired))
     }
 
     fn hmac_secret(
@@ -3150,7 +3794,7 @@ impl Authenticator for MockAuthenticator {
         pin: Option<&str>,
         uv: bool,
     ) -> Result<Zeroizing<[u8; 32]>> {
-        let (cred_rp, secret) = self
+        let (cred_rp, _, secret) = self
             .credentials
             .get(credential_id)
             .cloned()
@@ -3197,12 +3841,15 @@ impl Keys for MockKeys {
 - [ ] **Step 4: Run the tests, clippy, and fmt**
 
 Run: `cargo test -p aleph-unlock && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
-Expected: `fido2` `13 passed`; `tpm_client` still `6 passed`.
+Expected: `fido2` `16 passed`; `tpm_client` still `7 passed`.
 
 - [ ] **Step 5: Confirm the FIDO2 tests have teeth**
 
 Revert one at a time, see the test FAIL, then restore and see it pass:
-- In `unlock`, replace `if device.has_credential(RP_ID, &slot.credential_id)? {` with `if true {`. Test: `--test fido2 unlock_picks_the_right_key`.
+- In `unlock`, replace `Ok(true) => return ask(device),` and the `Ok(false) => {}` line after it with `Ok(_) => return ask(device),`. Test: `--test fido2 unlock_picks_the_right_key`.
+- In `unlock`, replace the `Err(e) => { first_error.get_or_insert(e); }` arm with `Err(e) => return Err(e),`. Test: `--test fido2 a_failing_preflight`.
+- In `unlock`, replace `1 => return ask(&mut devices[0]),` with `1 => {}`. Test: `--test fido2 a_single_key_is_asked_directly`.
+- Set `CRED_PROTECT` to `CredProtect::UvRequired`. Test: `--test fido2 unlock_picks_the_right_key`.
 - In `enroll`, replace `Verification::PinOrUv => return Err(Error::Fido2PinNotSet),` with `Verification::PinOrUv => (None, false),`. Test: `--test fido2 a_bare_key_is_refused`.
 
 - [ ] **Step 6: Commit**
@@ -3220,7 +3867,7 @@ git commit -m "feat(unlock): FIDO2 with PIN/UV by default, multi-key preflight, 
 
 **Interfaces:**
 - Consumes: Task 4 traits.
-- Produces: `fido2::libfido2::{Libfido2Keys::new(), Libfido2Authenticator}`. It re-enumerates keys on every call, checks `hmac-secret` via `getInfo`, uses `Protection::UvOptionalWithId`, and preflights with `up = false`.
+- Produces: `fido2::libfido2::{Libfido2Keys::new(), Libfido2Authenticator}`. It re-enumerates keys on every call, checks `hmac-secret` via `getInfo`, sets the `CredProtect` level it is given, and preflights with `up = false`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3248,6 +3895,7 @@ zeroize.workspace = true
 aleph-core = { path = "../aleph-core", features = ["insecure-test-params"] }
 aleph-tpm-proto = { path = "../aleph-tpm-proto" }
 aleph-tpmd = { path = "../aleph-tpmd", features = ["testing"] }
+libc.workspace = true
 tempfile.workspace = true
 ```
 
@@ -3269,9 +3917,16 @@ Replace `crates/aleph-unlock/src/fido2/mod.rs` with (Task 4's version plus `pub 
 //!   level 2 suffices: level 3 would also hide the credential from the
 //!   no-touch preflight, and choosing among several keys would then burn
 //!   PIN retries on the wrong ones.
-//! - **Unlock** preflights every connected key with a no-touch assertion
-//!   to find the one holding the slot's credential, then asks only that
-//!   key for a touch.
+//!   What level 2 gives away: anyone holding the key (no PIN) can learn
+//!   that it holds a given credential ID, and can obtain the key's
+//!   *non-UV* hmac-secret output for it, which opens nothing aleph
+//!   enrolled with UV.
+//! - **Unlock** with a single key connected asks it directly. With several,
+//!   it preflights each with a no-touch assertion to find the one holding
+//!   the slot's credential, then asks only that key for a touch. A key
+//!   whose preflight fails (unplugged mid-scan, a firmware quirk) is
+//!   treated as "not this key"; if no key matches, the first such error is
+//!   reported instead of "no credential".
 //!
 //! All hardware access goes through [`Keys`] and [`Authenticator`], so the
 //! logic is tested against [`mock::MockKeys`].
@@ -3290,6 +3945,20 @@ use crate::error::{Error, Result};
 pub const RP_ID: &str = "aleph";
 const KEK_INFO: &[u8] = b"aleph fido2 v1";
 
+/// CTAP2.1 credProtect levels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredProtect {
+    /// Level 1: usable without UV, discoverable.
+    UvOptional,
+    /// Level 2: usable without UV only when the credential ID is given.
+    UvOptionalWithId,
+    /// Level 3: every use requires UV (so no no-touch preflight either).
+    UvRequired,
+}
+
+/// The level aleph enrolls with (see the module docs for why 2).
+pub const CRED_PROTECT: CredProtect = CredProtect::UvOptionalWithId;
+
 /// What a key supports, from `authenticatorGetInfo`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceInfo {
@@ -3305,8 +3974,14 @@ pub trait Authenticator {
     fn info(&mut self) -> Result<DeviceInfo>;
 
     /// Create a non-resident credential with `hmac-secret` enabled and
-    /// credProtect "UV optional with credential ID". Requires a touch.
-    fn make_credential(&mut self, rp_id: &str, pin: Option<&str>, uv: bool) -> Result<Vec<u8>>;
+    /// credProtect `protect`. Requires a touch.
+    fn make_credential(
+        &mut self,
+        rp_id: &str,
+        protect: CredProtect,
+        pin: Option<&str>,
+        uv: bool,
+    ) -> Result<Vec<u8>>;
 
     /// Whether this key holds `credential_id`: an assertion without user
     /// presence (no touch, no PIN).
@@ -3369,7 +4044,7 @@ pub fn enroll(
         Verification::PinOrUv => return Err(Error::Fido2PinNotSet),
         Verification::TouchOnly => (None, false),
     };
-    let credential_id = device.make_credential(RP_ID, pin, uv)?;
+    let credential_id = device.make_credential(RP_ID, CRED_PROTECT, pin, uv)?;
     let salt = aleph_core::crypto::random_array::<32>()?;
     let secret = device.hmac_secret(RP_ID, &credential_id, &salt, pin, uv)?;
     let slot = Fido2Slot {
@@ -3390,22 +4065,33 @@ pub fn unlock(keys: &mut dyn Keys, slot: &Fido2Slot, pin: Option<&str>) -> Resul
     // its UV secret and yield the wrong KEK: ignore it.
     let pin = if slot.pin_required { pin } else { None };
     let mut devices = keys.devices()?;
-    if devices.is_empty() {
-        return Err(Error::Fido2NoDevice);
+    let ask = |device: &mut &mut dyn Authenticator| {
+        let secret = device.hmac_secret(
+            RP_ID,
+            &slot.credential_id,
+            &slot.salt,
+            pin,
+            slot.uv_required,
+        )?;
+        derive_kek(&secret)
+    };
+    match devices.len() {
+        0 => return Err(Error::Fido2NoDevice),
+        // Nothing to choose between: skip the preflight round trip.
+        1 => return ask(&mut devices[0]),
+        _ => {}
     }
+    let mut first_error = None;
     for device in devices.iter_mut() {
-        if device.has_credential(RP_ID, &slot.credential_id)? {
-            let secret = device.hmac_secret(
-                RP_ID,
-                &slot.credential_id,
-                &slot.salt,
-                pin,
-                slot.uv_required,
-            )?;
-            return derive_kek(&secret);
+        match device.has_credential(RP_ID, &slot.credential_id) {
+            Ok(true) => return ask(device),
+            Ok(false) => {}
+            Err(e) => {
+                first_error.get_or_insert(e);
+            }
         }
     }
-    Err(Error::Fido2NoCredential)
+    Err(first_error.unwrap_or(Error::Fido2NoCredential))
 }
 
 fn derive_kek(secret: &[u8; 32]) -> Result<Kek> {
@@ -3426,6 +4112,9 @@ mod tests {
     #[test]
     fn libfido2_error_codes_map_to_user_meaningful_errors() {
         assert!(matches!(map_code(0x31), Error::Fido2PinInvalid));
+        assert!(matches!(map_code(0x33), Error::Fido2PinInvalid));
+        assert!(matches!(map_code(0x3f), Error::Fido2UvInvalid));
+        assert!(matches!(map_code(0x27), Error::Fido2Denied));
         assert!(matches!(map_code(0x32), Error::Fido2PinBlocked));
         assert!(matches!(map_code(0x34), Error::Fido2PinBlocked));
         assert!(matches!(map_code(0x35), Error::Fido2PinNotSet));
@@ -3461,7 +4150,7 @@ use fido2_rs::device::{Device, DeviceList};
 use fido2_rs::error::Error as FidoRsError;
 use zeroize::Zeroizing;
 
-use super::{Authenticator, DeviceInfo, Keys};
+use super::{Authenticator, CredProtect, DeviceInfo, Keys};
 use crate::error::{Error, Result};
 
 /// One connected key, opened when enumerated.
@@ -3479,7 +4168,13 @@ impl Authenticator for Libfido2Authenticator {
         })
     }
 
-    fn make_credential(&mut self, rp_id: &str, pin: Option<&str>, uv: bool) -> Result<Vec<u8>> {
+    fn make_credential(
+        &mut self,
+        rp_id: &str,
+        protect: CredProtect,
+        pin: Option<&str>,
+        uv: bool,
+    ) -> Result<Vec<u8>> {
         let mut cred = Credential::new().map_err(map_err)?;
         cred.set_client_data_hash(aleph_core::crypto::random_array::<32>()?)
             .map_err(map_err)?;
@@ -3494,11 +4189,12 @@ impl Authenticator for Libfido2Authenticator {
         cred.set_cose_type(CoseType::ES256).map_err(map_err)?;
         cred.set_extension(Extensions::HMAC_SECRET | Extensions::CRED_PROTECT)
             .map_err(map_err)?;
-        // Level 2: the credential is usable without UV when its ID is
-        // given, so the no-touch preflight can find it. Security comes from
-        // requiring UV/PIN at unlock (the UV hmac-secret differs).
-        cred.set_protection(Protection::UvOptionalWithId)
-            .map_err(map_err)?;
+        cred.set_protection(match protect {
+            CredProtect::UvOptional => Protection::UvOptional,
+            CredProtect::UvOptionalWithId => Protection::UvOptionalWithId,
+            CredProtect::UvRequired => Protection::UvRequired,
+        })
+        .map_err(map_err)?;
         cred.set_rk(Opt::False).map_err(map_err)?;
         if uv {
             cred.set_uv(Opt::True).map_err(map_err)?;
@@ -3589,15 +4285,18 @@ impl Keys for Libfido2Keys {
 
 // libfido2 error codes (fido/err.h).
 const FIDO_ERR_UNSUPPORTED_EXTENSION: i32 = 0x16;
+const FIDO_ERR_OPERATION_DENIED: i32 = 0x27;
 const FIDO_ERR_INVALID_CREDENTIAL: i32 = 0x22;
 const FIDO_ERR_UNSUPPORTED_OPTION: i32 = 0x2b;
 const FIDO_ERR_NO_CREDENTIALS: i32 = 0x2e;
 const FIDO_ERR_USER_ACTION_TIMEOUT: i32 = 0x2f;
 const FIDO_ERR_PIN_INVALID: i32 = 0x31;
 const FIDO_ERR_PIN_BLOCKED: i32 = 0x32;
+const FIDO_ERR_PIN_AUTH_INVALID: i32 = 0x33;
 const FIDO_ERR_PIN_AUTH_BLOCKED: i32 = 0x34;
 const FIDO_ERR_PIN_NOT_SET: i32 = 0x35;
 const FIDO_ERR_PIN_REQUIRED: i32 = 0x36;
+const FIDO_ERR_UV_INVALID: i32 = 0x3f;
 const FIDO_ERR_ACTION_TIMEOUT: i32 = 0x3a;
 const FIDO_ERR_UV_BLOCKED: i32 = 0x3c;
 const FIDO_ERR_NOTFOUND: i32 = -10;
@@ -3612,7 +4311,9 @@ fn map_err(e: FidoRsError) -> Error {
 
 fn map_code(code: i32) -> Error {
     match code {
-        FIDO_ERR_PIN_INVALID => Error::Fido2PinInvalid,
+        FIDO_ERR_PIN_INVALID | FIDO_ERR_PIN_AUTH_INVALID => Error::Fido2PinInvalid,
+        FIDO_ERR_UV_INVALID => Error::Fido2UvInvalid,
+        FIDO_ERR_OPERATION_DENIED => Error::Fido2Denied,
         FIDO_ERR_PIN_BLOCKED | FIDO_ERR_PIN_AUTH_BLOCKED | FIDO_ERR_UV_BLOCKED => {
             Error::Fido2PinBlocked
         }
@@ -3634,7 +4335,7 @@ Create `crates/aleph-unlock/tests/fido2_hardware.rs`:
 //!
 //! With one key plugged in (PIN set, or built-in UV):
 //! `ALEPH_FIDO2_PIN=<pin, if set> cargo test -p aleph-unlock --test fido2_hardware -- --ignored`
-//! Touch the key twice to enroll, then once to unlock.
+//! Touch the key twice to enroll, once to unlock, then twice more.
 
 use aleph_unlock::fido2::libfido2::Libfido2Keys;
 use aleph_unlock::fido2::{self, Keys, Verification};
@@ -3645,12 +4346,32 @@ fn hardware_key_enroll_and_unlock() {
     let pin = std::env::var("ALEPH_FIDO2_PIN").ok();
     let mut keys = Libfido2Keys::new();
     assert!(keys.any_present(), "plug in a FIDO2 key");
-    eprintln!("touch the key twice to enroll, then once to unlock");
+    eprintln!("touch the key twice to enroll, once to unlock, then twice more");
     let (kek, slot) = fido2::enroll(&mut keys, pin.as_deref(), Verification::PinOrUv).unwrap();
     let back = fido2::unlock(&mut keys, &slot, pin.as_deref()).unwrap();
     let mk = aleph_core::KeyHandle::generate().unwrap();
     let w = mk.wrap(&kek, b"t").unwrap();
     assert!(aleph_core::KeyHandle::unwraps_to(&back, &w, b"t", &mk.id()));
+
+    // What credProtect level 2 rests on: this key's hmac-secret output
+    // without verification differs from the verified one, so a touch
+    // alone cannot recompute the KEK.
+    let mut devices = keys.devices().unwrap();
+    let key = &mut devices[0];
+    let id = &slot.credential_id;
+    let verified = key
+        .hmac_secret(
+            fido2::RP_ID,
+            id,
+            &slot.salt,
+            pin.as_deref(),
+            slot.uv_required,
+        )
+        .unwrap();
+    let touch_only = key
+        .hmac_secret(fido2::RP_ID, id, &slot.salt, None, false)
+        .unwrap();
+    assert_ne!(*verified, *touch_only);
 }
 ```
 
@@ -3680,10 +4401,16 @@ Create `packaging/systemd/aleph-tpmd.service`:
 Description=aleph keyring TPM helper
 Documentation=https://github.com/kisom/aleph-keyring
 Requires=aleph-tpmd.socket
-After=aleph-tpmd.socket
+After=aleph-tpmd.socket tpm2.target
 
 [Service]
 ExecStart=/usr/lib/aleph/aleph-tpmd
+Restart=on-failure
+# The helper handles KEKs: no core dumps. The TSS library's own logging
+# would echo every expected failure (wrong password, missing SRK) to the
+# journal; the helper reports what matters itself.
+LimitCORE=0
+Environment=TSS2_LOG=all+NONE
 # A throwaway user whose only privilege is the tss group (spec §5). Users
 # themselves are never added to tss.
 DynamicUser=yes
@@ -3810,20 +4537,133 @@ cargo fmt --check
 ~~~
 ```
 
-In `docs/superpowers/specs/2026-09-26-aleph-design.md` §5:
+Update the spec (§2 threat model; §5 TPM helper service, connections, protocol, parent choice, rate limiting, and sessions; FIDO2 credProtect and device selection; §9 wording) by applying this patch with `git apply`:
 
-1. Replace the **Sessions** bullet with:
-   > - **Sessions:** HMAC sessions salted to the verified parent, with AES-256-CFB parameter encryption in both directions, whichever parent is used. (The SRK fallback's AES-128 affects only how the TPM protects child blobs under that parent, not the session.)
-2. In FIDO2 **Enrollment**, replace "`credProtect = 3` (userVerificationRequired)" with:
-   > `credProtect = 2` ("UV optional with credential ID"). Level 2 rather than 3: a level-3 credential is invisible to the no-touch preflight below unless UV happens first, so choosing among several keys would burn PIN retries on the wrong ones (`systemd-cryptenroll` uses level 2 for the same reason). The protection level 3 would add is already provided: aleph requires UV/PIN at every unlock of a PIN/UV slot, and the key's `hmac-secret` without UV is a different secret, so a touch alone derives the wrong KEK.
-3. In §9 FIDO2, replace "`credProtect`/UV defaults" with "PIN/UV defaults".
+```diff
+--- a/docs/superpowers/specs/2026-09-26-aleph-design.md
++++ b/docs/superpowers/specs/2026-09-26-aleph-design.md
+@@ -85,3 +85,3 @@
+ | **A same-user process, briefly** (malware that runs once) | While the vault is unlocked it can read every secret, as with gnome-keyring. Enrolling a new slot, changing configuration, or removing a slot requires re-authentication, so the process cannot turn brief access into permanent access (§6). Removing a slot rotates MK, which revokes any keyslot the process added (§4). |
+-| **A different local user** | Nothing. The TPM helper binds sealed objects to the caller's uid (§5), and the vault file is mode `0600`. |
++| **A different local user** | No secrets. The TPM helper binds sealed objects to the caller's uid (§5), and the vault file is mode `0600`. By guessing wrong passwords they can spend the helper's share of the TPM's failure budget and so deny TPM unlock to everyone for a while; FIDO2, recovery, and password fallback still work. They cannot drive the TPM into lockout, which would also block TPM disk unlock and survive reboot (§5, rate limiting). |
+ 
+@@ -377,3 +377,9 @@
+   (`aleph-tpmd.socket` → `/run/aleph/tpm.sock`, mode `0666`). Access
+-  control is by peer uid, not by file mode.
++  control is by peer uid, not by file mode, and only login uids
++  (`UID_MIN`–`UID_MAX` from `/etc/login.defs`) are served; others get
++  `NotPermitted`.
++- **Connections:** each connection has its own thread (at most 64) and one
++  request, which must arrive in full within 2 seconds however the client
++  paces it. A uid may have one connection in progress; a second gets
++  `Busy` at once. Only TPM access itself is serialized.
+ - **Sandboxing:** it runs with `DynamicUser=yes` and
+@@ -383,6 +389,9 @@
+   an empty `CapabilityBoundingSet`, and so on.
+-- **Protocol:** length-prefixed CBOR frames (`aleph-tpm-proto`):
+-  - `Seal { secret, uid_bound: true }` → `{ public, private, auth_salt, srk_name }`
+-  - `Unseal { public, private, auth_salt, srk_name, secret }` → `{ kek }`
+-  - `Status` → `{ srk_present, lockout_auth_set, max_tries, recovery_time, lockout_recovery, failed_tries }`
++- **Protocol:** length-prefixed CBOR frames of at most 64 KiB
++  (`aleph-tpm-proto`), decoded strictly (unknown fields are errors):
++  - `Seal { secret }` → `Sealed { object: { public, private, auth_salt, srk_name }, kek }`
++    (the helper generates the KEK)
++  - `Unseal { object, secret }` → `Unsealed { kek }`
++  - `Status {}` → `{ parent, owner_auth_set, lockout_auth_set, in_lockout, max_tries, recovery_time, lockout_recovery, failed_tries }`
++  - any request → `Failed(AuthFailed | Lockout | RateLimited | Busy | NotPermitted | WrongUser | ParentMismatch | NoParent | Malformed | Tpm)`
+ 
+@@ -402,4 +411,5 @@
+   - By default the helper re-creates aleph's own primary on each use: ECC
+-    P-256 with an AES-256-CFB symmetric parent, under the owner hierarchy.
+-    This keeps the post-quantum margin of §2.
++    P-256 with an AES-256-CFB symmetric parent, under the owner hierarchy,
++    with `noDA` (like the TCG SRK: using the parent needs no secret). This
++    keeps the post-quantum margin of §2.
+   - If `ownerAuth` is set, which makes that impossible, it falls back to
+@@ -410,8 +420,12 @@
+     same Name. Whichever parent is used, its Name is recorded in the slot
+-    (`srk_name`) and checked before the helper uses the key to salt a
+-    session. A mismatch is an error: it means a different TPM, or an active
+-    interposer substituting a key.
++    (`srk_name`). To unseal, the helper uses whichever available parent has
++    that Name, so slots survive `ownerAuth` being set or cleared later as
++    long as their parent still exists. The Name compared is the one ESYS
++    holds for the handle (`Esys_TR_GetName`), i.e. the key that will salt
++    the session. No match is an error (`ParentMismatch`): a different TPM,
++    or an active interposer substituting a key.
+ - **Sessions:** HMAC sessions salted to the verified parent, with
+-  parameter encryption in both directions. That is AES-256-CFB with aleph's
+-  primary, or AES-128-CFB with the SRK fallback.
++  AES-256-CFB parameter encryption in both directions, whichever parent is
++  used. (The SRK fallback's AES-128 affects only how the TPM protects
++  child blobs under that parent, not the session.)
+ - **Sealed object:** a keyed hash with `fixedTPM`, `fixedParent`, and
+@@ -419,10 +433,18 @@
+   protection stays on. There are no PCR policies in v1.
+-- **Rate limiting:**
+-  - at most 5 failed unseals per uid per minute
+-  - after a failure, the daemon marks the slot `stale` and stops trying it
+-    automatically until the user re-enrolls it or explicitly retries it,
+-    so an outdated password does not keep consuming dictionary-attack
+-    attempts
+-  - the TPM's own counter is TPM-wide, and is shared with
+-    `systemd-cryptenroll` TPM2+PIN disk unlock
++- **Rate limiting.** The TPM's failure counter is TPM-wide, shared with
++  `systemd-cryptenroll` TPM2+PIN disk unlock, and a lockout survives
++  reboot. So the helper budgets it in two layers:
++  - **Global reserve:** once the TPM's failure count reaches
++    `max_tries − max(1, max_tries / 2)`, the helper refuses every unseal
++    with `Busy` without asking the TPM. aleph can therefore never cause a
++    TPM lockout, and at least half the budget stays for disk unlock. The
++    count falls by one per `recovery_time`, so `Busy` is temporary.
++  - **Per uid:** at most 2 failed unseals per uid per `recovery_time`
++    (at least 60 s), then `RateLimited`, so one user cannot spend the
++    whole reserve alone.
++  - After an `AuthFailed` or `WrongUser` failure, the daemon marks the
++    slot `stale` and stops trying it automatically until the user
++    re-enrolls it or explicitly retries it, so an outdated password does
++    not keep consuming attempts. `Lockout`, `RateLimited`, and `Busy` say
++    nothing about the slot and do not mark it stale.
+ - **`Status` and setup:**
+@@ -450,3 +472,10 @@
+   - `makeCredential` with the `hmac-secret` extension, non-resident, RP ID
+-    `"aleph"`, `credProtect = 3` (userVerificationRequired)
++    `"aleph"`, `credProtect = 2` ("UV optional with credential ID"). Level 2
++    rather than 3: a level-3 credential is invisible to the no-touch
++    preflight below unless UV happens first, so choosing among several
++    keys would burn PIN retries on the wrong ones (`systemd-cryptenroll`
++    uses level 2 for the same reason). The protection level 3 would add is
++    already provided: aleph requires UV/PIN at every unlock of a PIN/UV
++    slot, and the key's `hmac-secret` without UV is a different secret, so
++    a touch alone derives the wrong KEK.
+   - defaults to requiring user verification: the PIN, or on-device UV
+@@ -456,5 +485,10 @@
+ - **Unlock:**
+-  - **Device selection:** with several keys plugged in, each is
+-    preflighted with `getAssertion(up = false)` on the slot's credential ID
+-    to find the one that holds it, then only that key is asked for a touch.
++  - **Device selection:** with one key plugged in, it is asked directly.
++    With several, each is preflighted with `getAssertion(up = false)` on
++    the slot's credential ID to find the one that holds it, then only that
++    key is asked for a touch. A key whose preflight errors is skipped; if
++    no key matches, the first such error is reported.
++  - **What level 2 exposes:** anyone holding the key, without its PIN, can
++    learn whether it holds a given credential ID and obtain its non-UV
++    `hmac-secret` output, which opens nothing enrolled with PIN/UV.
+   - `getAssertion` with the slot's salt yields the `hmac-secret` output,
+@@ -806,3 +840,3 @@
+ - **FIDO2:** a mock `Authenticator`, including multiple devices,
+-  preflight selection, and `credProtect`/UV defaults. A manual checklist
++  preflight selection, and PIN/UV defaults. A manual checklist
+   with a real key (`docs/testing.md`) is run before each release.
+```
 
 - [ ] **Step 4: Run the whole workspace, clippy, fmt, and check the units**
 
 Run: `cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
 Expected:
 - core unchanged (58 unit, 27 vault, 10 write, golden, zeroize)
-- `aleph-tpm-proto` 6, `aleph-tpmd` 2 + 15 + 3, `aleph-unlock` 1 + 13 + 6
+- `aleph-tpm-proto` 6, `aleph-tpmd` 4 + 19 + 4, `aleph-unlock` 1 + 16 + 7
 - `fido2_hardware` and `tpm_hardware` `1 ignored` each
 
 Then check the units as described in `docs/testing.md`: `systemd-analyze verify` prints nothing, and `systemd-analyze security --offline=true` reports about 0.7 "SAFE".
