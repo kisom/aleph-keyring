@@ -70,7 +70,8 @@ impl Channel {
 
     /// Send a message that needs a reply and wait for it (up to the
     /// timeout). `Cancel` becomes `Error::Cancelled`. Never the recovery-key
-    /// question: only the recovery conversation asks it.
+    /// question: that goes through [`Channel::ask_recovery_key`], which only
+    /// the recovery conversation calls.
     pub fn ask(&mut self, msg: &ToPrompter) -> Result<FromPrompter> {
         debug_assert!(msg.needs_reply());
         if matches!(msg, ToPrompter::RecoveryKey { .. }) {
@@ -79,6 +80,14 @@ impl Channel {
             ));
         }
         self.ask_any(msg)
+    }
+
+    /// Ask for the recovery key (the recovery conversation only).
+    pub(crate) fn ask_recovery_key(&mut self, error: Option<String>) -> Result<Secret> {
+        match self.ask_any(&ToPrompter::RecoveryKey { error })? {
+            FromPrompter::RecoveryKey { key } => Ok(key),
+            other => Err(Error::Prompt(format!("unexpected reply {other:?}"))),
+        }
     }
 
     fn ask_any(&mut self, msg: &ToPrompter) -> Result<FromPrompter> {

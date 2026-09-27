@@ -28,6 +28,8 @@ use crate::prompt::{Caller, Channel, FromPrompter, Method, Purpose, Secret, ToPr
 use crate::state::SlotState;
 use crate::store::Store;
 
+mod custody;
+
 /// The TPM, as the engine uses it (the real one is `aleph_unlock::TpmClient`).
 pub trait Tpm: Send {
     fn seal(&self, password: &[u8]) -> aleph_unlock::Result<(Kek, TpmSlot)>;
@@ -121,6 +123,13 @@ pub struct Proof {
     login: Option<Zeroizing<String>>,
     /// The FIDO2 slot touched, and its KEK.
     fido2: Option<(Uuid, Kek)>,
+}
+
+/// A fresh unlock method to set up (create, recovery).
+enum NewMethod {
+    /// The login password, which PAM accepted.
+    Password(Zeroizing<String>),
+    Fido2,
 }
 
 /// The result of opening the vault file with one slot.
@@ -516,6 +525,7 @@ impl Keyring {
                 // Waiting is not something to retry at once, and a key's
                 // PIN budget for this conversation is spent (each wrong
                 // PIN costs one of the key's lifetime retries).
+                // (A corrupt file does not open by asking again, either.)
                 Err(
                     e @ (Error::Cancelled
                     | Error::Prompt(_)
@@ -523,7 +533,10 @@ impl Keyring {
                     | Error::UnlockedElsewhere
                     | Error::Sleeping
                     | Error::TooManyAttempts { .. }
-                    | Error::Unlock(aleph_unlock::Error::Fido2PinInvalid)),
+                    | Error::Unlock(aleph_unlock::Error::Fido2PinInvalid)
+                    | Error::Core(
+                        aleph_core::Error::HeaderTampered | aleph_core::Error::BodyTampered,
+                    )),
                 ) => {
                     return Err(e);
                 }
@@ -878,6 +891,9 @@ impl Keyring {
             }
         };
         let untrusted = trust(&inner.store, &vault)?;
+        if inner.store.expected_vault_id().is_none() {
+            inner.store.expect_vault_id(vault.vault_id())?;
+        }
         let ids: HashSet<Uuid> = vault.keyslots().map(|k| k.id).collect();
         inner.state.retain(|id| ids.contains(&id))?;
         inner.vault = Some(vault);
@@ -1381,6 +1397,72 @@ impl Keyring {
         Err(Error::WrongPassword)
     }
 
+    /// Ask which fresh unlock method to set up (recovery): the login
+    /// password (checked with PAM, as for create) or a security key.
+    fn choose_new_method(&self, chan: &mut Channel) -> Result<NewMethod> {
+        let mut error = Some("choose the new unlock method".to_string());
+        for _ in 0..MAX_ATTEMPTS {
+            let reply = chan.ask(&ToPrompter::Ask {
+                methods: vec![Method::Password, Method::Fido2],
+                error: error.take(),
+                retry_after: None,
+            })?;
+            match reply {
+                FromPrompter::Fido2 {} => return Ok(NewMethod::Fido2),
+                FromPrompter::Password { password } => {
+                    let now = Instant::now();
+                    if let Some(wait) = lock(&self.inner).typed.blocked(now) {
+                        return Err(Error::TooManyAttempts { retry_after: wait });
+                    }
+                    if lock(&self.hw).password.check(password.expose())? {
+                        return Ok(NewMethod::Password(Zeroizing::new(
+                            password.expose().to_string(),
+                        )));
+                    }
+                    lock(&self.inner).typed.record_failure(now);
+                    error = Some(Error::WrongPassword.to_string());
+                }
+                other => return Err(Error::Prompt(format!("unexpected reply {other:?}"))),
+            }
+        }
+        Err(Error::Invalid("too many attempts".into()))
+    }
+
+    /// Add a fresh unlock method's slot to `vault`: a TPM slot sealed under
+    /// the login password (a login-password slot without a usable TPM), or
+    /// a security key. Returns the slot and its KEK (for a rotation).
+    fn add_method(
+        &self,
+        chan: &mut Channel,
+        vault: &mut UnlockedVault,
+        method: NewMethod,
+    ) -> Result<(Uuid, Kek)> {
+        match method {
+            NewMethod::Password(password) => {
+                let hw = lock(&self.hw);
+                if hw.tpm.usable() {
+                    let (kek, slot) = hw.tpm.seal(password.as_bytes())?;
+                    Ok((vault.add_keyslot("tpm", SlotKind::Tpm(slot), &kek)?, kek))
+                } else {
+                    drop(hw);
+                    let id = vault.add_login_password_slot(
+                        "login password",
+                        password.as_bytes(),
+                        self.argon2,
+                    )?;
+                    Ok((id, vault.login_password_kek(id, password.as_bytes())?))
+                }
+            }
+            NewMethod::Fido2 => {
+                let (kek, slot) = self.enroll_key(chan, false)?;
+                Ok((
+                    vault.add_keyslot("security key", SlotKind::Fido2(slot), &kek)?,
+                    kek,
+                ))
+            }
+        }
+    }
+
     /// Create the vault with a recovery slot and one unlock method.
     pub fn create(&self, chan: &mut Channel, method: Method) -> Result<()> {
         let _op = self.begin(chan)?;
@@ -1396,29 +1478,15 @@ impl Keyring {
             let mut vault = UnlockedVault::create()?;
             let key = RecoveryKey::generate()?;
             vault.add_recovery_slot("recovery", &key.recipient().public_key())?;
-            match method {
-                Method::Password => {
-                    let password = self.ask_password(chan)?;
-                    let hw = lock(&self.hw);
-                    if hw.tpm.usable() {
-                        let (kek, slot) = hw.tpm.seal(password.as_bytes())?;
-                        vault.add_keyslot("tpm", SlotKind::Tpm(slot), &kek)?;
-                    } else {
-                        vault.add_login_password_slot(
-                            "login password",
-                            password.as_bytes(),
-                            self.argon2,
-                        )?;
-                    }
-                }
-                Method::Fido2 => {
-                    let (kek, slot) = self.enroll_key(chan, false)?;
-                    vault.add_keyslot("security key", SlotKind::Fido2(slot), &kek)?;
-                }
-            }
+            let method = match method {
+                Method::Password => NewMethod::Password(self.ask_password(chan)?),
+                Method::Fido2 => NewMethod::Fido2,
+            };
+            self.add_method(chan, &mut vault, method)?;
             show_recovery_key(chan, &key)?;
             let mut inner = lock(&self.inner);
             inner.store.write(&vault)?;
+            inner.store.expect_vault_id(vault.vault_id())?;
             inner.untrusted = None;
             // Going to sleep: the file is written, but nothing is left
             // unlocked through it.
@@ -1631,6 +1699,15 @@ impl Keyring {
 /// rolled back, replaced, or re-keyed elsewhere (§4 "Generation and
 /// high-water mark"). Raises the mark otherwise.
 fn trust(store: &Store, vault: &UnlockedVault) -> Result<Option<&'static str>> {
+    // A different vault at the path (its own history unknown here) is
+    // never trusted by default; restore, create, and an accepted rollback
+    // change which vault is expected.
+    if store
+        .expected_vault_id()
+        .is_some_and(|id| id != vault.vault_id())
+    {
+        return Ok(Some("a different vault than this machine last used"));
+    }
     Ok(match store.raise(vault)? {
         Standing::Unrecorded | Standing::Current | Standing::Newer => None,
         Standing::Pending => {
