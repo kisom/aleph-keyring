@@ -1,0 +1,14 @@
+[Unit]
+Description=aleph keyring TPM helper socket
+Documentation=https://github.com/kisom/aleph-keyring
+
+[Socket]
+ListenStream=/run/aleph/tpm.sock
+# Any local user may connect; the helper binds every object to the
+# caller's uid (SO_PEERCRED), so access control is per uid, not per file.
+SocketMode=0666
+DirectoryMode=0755
+Accept=no
+
+[Install]
+WantedBy=sockets.target

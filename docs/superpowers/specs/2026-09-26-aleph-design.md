@@ -83,7 +83,7 @@ attacker holds.
 | **The vault file and this machine, powered off** (LUKS unlocked by some other means, or a pre-boot evil maid) | TPM slots: security reduces to the strength of the login password, unless the TPM's `lockoutAuth` is set. With an empty `lockoutAuth`, which is the Linux default, anyone with raw TPM access can reset dictionary-attack protection and guess at about one TPM round-trip per guess. `aleph setup` reports whether `lockoutAuth` is set and what the lockout parameters are (§5). FIDO2 slots: the attacker also needs the key and its PIN (PIN/UV is the default, §5). |
 | **This machine while suspended** (LUKS key and aleph MK in RAM) | aleph locks and zeroizes MK before suspend, holding a logind delay inhibitor until that is done (§6). Secrets that clients have already fetched (browser safe-storage keys, NetworkManager, cached git credentials) are out of aleph's reach. The attacker then holds the file and the machine, and the row above applies. |
 | **A same-user process, briefly** (malware that runs once) | While the vault is unlocked it can read every secret, as with gnome-keyring. Enrolling a new slot, changing configuration, or removing a slot requires re-authentication, so the process cannot turn brief access into permanent access (§6). Removing a slot rotates MK, which revokes any keyslot the process added (§4). |
-| **A different local user** | Nothing. The TPM helper binds sealed objects to the caller's uid (§5), and the vault file is mode `0600`. |
+| **A different local user** | No secrets. The TPM helper binds sealed objects to the caller's uid (§5), and the vault file is mode `0600`. By guessing wrong passwords from two or more uids they can spend the helper's share of the TPM's failure budget and keep TPM unlock unavailable to everyone for as long as they keep guessing; FIDO2, recovery, and password fallback still work. They cannot drive the TPM into lockout, which would also block TPM disk unlock and survive reboot (§5, rate limiting). |
 
 **Out of scope:**
 
@@ -375,16 +375,27 @@ secrets in transit. `mlock` does not keep pages out of a hibernation image
 **The helper.**
 - **Service:** `aleph-tpmd` is a socket-activated system service
   (`aleph-tpmd.socket` → `/run/aleph/tpm.sock`, mode `0666`). Access
-  control is by peer uid, not by file mode.
+  control is by peer uid, not by file mode, and only login uids
+  (`UID_MIN`–`UID_MAX` from `/etc/login.defs`) are served; others get
+  `NotPermitted` before the helper reads their request. systemd-homed's
+  range (60001–60513) is served too.
+- **Connections:** each connection has its own thread (at most 64) and one
+  request, which must arrive in full within 2 seconds however the client
+  paces it. A uid may have one connection in progress; a second gets
+  `Busy` at once, as does any connection beyond 64, and the client
+  retries `Busy` for a few seconds. Only TPM access itself is serialized.
 - **Sandboxing:** it runs with `DynamicUser=yes` and
   `SupplementaryGroups=tss`. Only this service can open `/dev/tpmrm0`, and
   users are not in `tss`. It is sandboxed: `ProtectSystem=strict`,
   `PrivateNetwork=yes`, `DeviceAllow=/dev/tpmrm0 rw`, `NoNewPrivileges=yes`,
   an empty `CapabilityBoundingSet`, and so on.
-- **Protocol:** length-prefixed CBOR frames (`aleph-tpm-proto`):
-  - `Seal { secret, uid_bound: true }` → `{ public, private, auth_salt, srk_name }`
-  - `Unseal { public, private, auth_salt, srk_name, secret }` → `{ kek }`
-  - `Status` → `{ srk_present, lockout_auth_set, max_tries, recovery_time, lockout_recovery, failed_tries }`
+- **Protocol:** length-prefixed CBOR frames of at most 64 KiB
+  (`aleph-tpm-proto`), decoded strictly (unknown fields are errors):
+  - `Seal { secret }` → `Sealed { object: { public, private, auth_salt, srk_name }, kek }`
+    (the helper generates the KEK)
+  - `Unseal { object, secret }` → `Unsealed { kek }`
+  - `Status {}` → `{ parent, owner_auth_set, lockout_auth_set, in_lockout, max_tries, recovery_time, lockout_recovery, failed_tries }`
+  - any request → `Failed(AuthFailed | Lockout | RateLimited | Busy | Exhausted | NotPermitted | WrongUser | ParentMismatch | NoParent | Malformed | Tpm)`
 
   The helper keeps no state on disk.
 - **Binding to a uid:** the helper reads the caller's uid with
@@ -400,31 +411,50 @@ secrets in transit. `mlock` does not keep pages out of a hibernation image
   your password.
 - **Parent key:**
   - By default the helper re-creates aleph's own primary on each use: ECC
-    P-256 with an AES-256-CFB symmetric parent, under the owner hierarchy.
-    This keeps the post-quantum margin of §2.
+    P-256 with an AES-256-CFB symmetric parent, under the owner hierarchy,
+    with `noDA` (like the TCG SRK: using the parent needs no secret). This
+    keeps the post-quantum margin of §2.
   - If `ownerAuth` is set, which makes that impossible, it falls back to
     the persistent TCG standard SRK at `0x81000001`. That key uses
     AES-128-CFB, and `aleph status` reports it.
   - If neither is possible, `Status` says so and TPM enrollment is refused.
   - A primary created from a fixed template on a given TPM always has the
     same Name. Whichever parent is used, its Name is recorded in the slot
-    (`srk_name`) and checked before the helper uses the key to salt a
-    session. A mismatch is an error: it means a different TPM, or an active
-    interposer substituting a key.
+    (`srk_name`). To unseal, the helper uses whichever available parent has
+    that Name, so slots survive `ownerAuth` being set or cleared later as
+    long as their parent still exists. The Name compared is the one ESYS
+    holds for the handle (`Esys_TR_GetName`), i.e. the key that will salt
+    the session. No match is an error (`ParentMismatch`): a different TPM,
+    or an active interposer substituting a key.
 - **Sessions:** HMAC sessions salted to the verified parent, with
-  parameter encryption in both directions. That is AES-256-CFB with aleph's
-  primary, or AES-128-CFB with the SRK fallback.
+  AES-256-CFB parameter encryption in both directions, whichever parent is
+  used. (The SRK fallback's AES-128 affects only how the TPM protects
+  child blobs under that parent, not the session.)
 - **Sealed object:** a keyed hash with `fixedTPM`, `fixedParent`, and
   `userWithAuth`, authorized by its auth value. Dictionary-attack
   protection stays on. There are no PCR policies in v1.
-- **Rate limiting:**
-  - at most 5 failed unseals per uid per minute
-  - after a failure, the daemon marks the slot `stale` and stops trying it
-    automatically until the user re-enrolls it or explicitly retries it,
-    so an outdated password does not keep consuming dictionary-attack
-    attempts
-  - the TPM's own counter is TPM-wide, and is shared with
-    `systemd-cryptenroll` TPM2+PIN disk unlock
+- **Rate limiting.** The TPM's failure counter is TPM-wide, shared with
+  `systemd-cryptenroll` TPM2+PIN disk unlock, and a lockout survives
+  reboot. So the helper budgets it in two layers:
+  - **Global reserve:** once the TPM's failure count reaches
+    `max_tries − max(1, ⌊max_tries / 2⌋)`, the helper refuses every
+    unseal with `Exhausted` without asking the TPM. aleph can therefore
+    never cause a TPM lockout, and `max(1, ⌊max_tries / 2⌋)` tries stay
+    for disk unlock. The count falls by one per `recovery_time`. A TPM
+    whose threshold is 0 (`max_tries` ≤ 1) refuses TPM enrollment with
+    `Exhausted`. A `recovery_time` of 0 turns the TPM's counting off, and
+    with it the reserve.
+  - **Per uid:** at most 2 failed unseals per uid per 2 × `recovery_time`
+    (at least 60 s), then `RateLimited`. One uid guessing without pause
+    thus adds failures no faster than the TPM forgets them; it takes
+    several uids to hold the reserve at its limit.
+  - After an `AuthFailed` or `WrongUser` failure, the daemon marks the
+    slot `stale` and stops trying it automatically until the user
+    re-enrolls it or explicitly retries it, so an outdated password does
+    not keep consuming attempts. No other failure (`Lockout`,
+    `RateLimited`, `Busy`, `Exhausted`, `NotPermitted`, `ParentMismatch`,
+    `NoParent`, `Malformed`, `Tpm`) marks the slot stale; the prompter
+    reports them.
 - **`Status` and setup:**
   - `aleph setup` displays `lockout_auth_set`, `max_tries`, and the
     recovery times.
@@ -448,15 +478,29 @@ secrets in transit. `mlock` does not keep pages out of a hibernation image
 
 - **Enrollment:**
   - `makeCredential` with the `hmac-secret` extension, non-resident, RP ID
-    `"aleph"`, `credProtect = 3` (userVerificationRequired)
+    `"aleph"`, `credProtect = 2` ("UV optional with credential ID"). Level 2
+    rather than 3: a level-3 credential is invisible to the no-touch
+    preflight below unless UV happens first, so choosing among several
+    keys would burn PIN retries on the wrong ones (`systemd-cryptenroll`
+    uses level 2 for the same reason). The protection level 3 would add is
+    already provided: aleph requires UV/PIN at every unlock of a PIN/UV
+    slot, and the key's `hmac-secret` without UV is a different secret, so
+    a touch alone derives the wrong KEK.
   - defaults to requiring user verification: the PIN, or on-device UV
     where supported. Touch-only is an explicit opt-in
     (`--touch-only`, with a warning).
   - the key's `getInfo` must list `hmac-secret`, or enrollment is refused
 - **Unlock:**
-  - **Device selection:** with several keys plugged in, each is
-    preflighted with `getAssertion(up = false)` on the slot's credential ID
-    to find the one that holds it, then only that key is asked for a touch.
+  - **Device selection:** each plugged-in key is preflighted with
+    `getAssertion(up = false)`, without a PIN, on the slot's credential ID
+    to find the one that holds it, then only that key is asked for a PIN
+    and a touch. This holds for a single key too, so the slot of an absent
+    backup key never spends the plugged key's PIN retries. A key whose
+    preflight errors is skipped (or, if it is the only key, asked
+    directly); if no key matches, the first such error is reported.
+  - **What level 2 exposes:** anyone holding the key, without its PIN, can
+    learn whether it holds a given credential ID and obtain its non-UV
+    `hmac-secret` output, which opens nothing enrolled with PIN/UV.
   - `getAssertion` with the slot's salt yields the `hmac-secret` output,
     and the KEK is `HKDF(output, "aleph fido2 v1")`.
   - Supplying a PIN to a slot enrolled without one is ignored, because it
@@ -804,7 +848,7 @@ aleph restore [--from-bak | --accept-rollback] [<path>]
   - a password change produces a new object, and the old blob plus the old
     password no longer opens the vault, because MK rotated
 - **FIDO2:** a mock `Authenticator`, including multiple devices,
-  preflight selection, and `credProtect`/UV defaults. A manual checklist
+  preflight selection, and PIN/UV defaults. A manual checklist
   with a real key (`docs/testing.md`) is run before each release.
 - **Daemon:** a private `dbus-daemon` running `alephd` with a temporary
   vault and `swtpm`.

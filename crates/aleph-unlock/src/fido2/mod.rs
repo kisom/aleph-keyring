@@ -30,6 +30,7 @@
 //! All hardware access goes through [`Keys`] and [`Authenticator`], so the
 //! logic is tested against [`mock::MockKeys`].
 
+pub mod libfido2;
 pub mod mock;
 
 use aleph_core::{Fido2Slot, Kek};
