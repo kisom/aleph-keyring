@@ -313,7 +313,9 @@ fn an_accepted_rollback_never_lowers_the_mark() {
     k.unlock(&mut Interactive::new(vec![password(PW)]).channel(), None)
         .unwrap();
     assert!(k.status().unwrap().untrusted.is_some());
-    let decline = Interactive::new(vec![password(PW), no()]);
+    // Its method, the login password (an untrusted vault proves nothing
+    // alone), then the answer.
+    let decline = Interactive::new(vec![password(PW), password(PW), no()]);
     assert!(matches!(
         k.accept_rollback(&mut decline.channel()),
         Err(Error::Cancelled)
@@ -326,7 +328,7 @@ fn an_accepted_rollback_never_lowers_the_mark() {
             .iter()
             .any(|m| matches!(m, ToPrompter::Confirm { default: false, .. }))
     );
-    let accept = Interactive::new(vec![password(PW), yes()]);
+    let accept = Interactive::new(vec![password(PW), password(PW), yes()]);
     k.accept_rollback(&mut accept.channel()).unwrap();
     assert_eq!(k.status().unwrap().untrusted, None);
     let newer_generation = aleph_core::LockedVault::from_bytes(&newer)
@@ -852,6 +854,144 @@ fn restoring_from_bak_names_the_recorded_generation() {
         m,
         ToPrompter::Confirm { text, .. } if text.contains("last recorded generation")
     )));
+}
+
+/// Re-authentication proves only the unlocked vault: a file planted at the
+/// path (its method known to the planter) proves nothing, for a restore or
+/// for any other operation that asks for it (enrolling a key, say).
+#[test]
+fn reauthentication_proves_only_the_unlocked_vault() {
+    let (planted, key, backup) = foreign_vault();
+    let here = env();
+    let k = victim(&here);
+    k.unlock(&mut Interactive::new(vec![password(PW)]).channel(), None)
+        .unwrap();
+    std::fs::write(here.paths.vault(), &planted).unwrap();
+    let mut answers = vec![password("attacker")];
+    answers.extend(attacker_answers(&key));
+    assert!(
+        k.recover(&mut Interactive::new(answers).channel(), Some(&backup))
+            .is_err()
+    );
+    assert_eq!(std::fs::read(here.paths.vault()).unwrap(), planted);
+    assert!(
+        k.enroll_fido2(
+            &mut Interactive::new(vec![password("attacker"), pin(PIN)]).channel(),
+            false,
+        )
+        .is_err()
+    );
+    assert_eq!(kinds(&k), ["recovery", "tpm"]);
+}
+
+/// Accepting a rolled-back file needs the login password, whatever its
+/// own methods: an older copy holding a since-removed key is not accepted
+/// with that key.
+#[test]
+fn a_rollback_is_not_accepted_with_a_removed_key() {
+    let here = env();
+    let k = keyring(&here, MockKeys::one(MockAuthenticator::with_pin(PIN)));
+    create_capturing_key(&k);
+    k.enroll_fido2(
+        &mut Interactive::new(vec![password(PW), pin(PIN)]).channel(),
+        false,
+    )
+    .unwrap();
+    let old = std::fs::read(here.paths.vault()).unwrap();
+    let fido = k
+        .status()
+        .unwrap()
+        .keyslots
+        .into_iter()
+        .find(|s| s.kind == "fido2")
+        .unwrap()
+        .id;
+    k.remove_keyslot(&mut Interactive::new(vec![password(PW)]).channel(), fido)
+        .unwrap();
+    write_item(&k, "newer");
+    k.lock();
+    std::fs::write(here.paths.vault(), &old).unwrap();
+    k.unlock(&mut Interactive::new(vec![password(PW)]).channel(), None)
+        .unwrap();
+    assert!(k.status().unwrap().untrusted.is_some());
+    let p = Interactive::new(vec![FromPrompter::Fido2 {}, pin(PIN), yes()]);
+    assert!(k.accept_rollback(&mut p.channel()).is_err());
+    assert!(k.status().unwrap().untrusted.is_some());
+}
+
+/// Deleting the vault and the vault-id file does not make this a new
+/// machine: not while the daemon runs, nor after a restart (the high-water
+/// records remain).
+#[test]
+fn deleting_the_vault_id_does_not_skip_the_proof() {
+    let (_, key, backup) = foreign_vault();
+    let here = env();
+    let k = victim(&here);
+    std::fs::remove_file(here.paths.vault()).unwrap();
+    std::fs::remove_file(here.paths.expected_vault()).unwrap();
+    assert!(
+        k.recover(
+            &mut Interactive::new(attacker_answers(&key)).channel(),
+            Some(&backup)
+        )
+        .is_err()
+    );
+    drop(k);
+    let k = keyring(&here, MockKeys::one(MockAuthenticator::with_pin(PIN)));
+    assert!(
+        k.recover(
+            &mut Interactive::new(attacker_answers(&key)).channel(),
+            Some(&backup)
+        )
+        .is_err()
+    );
+    assert!(!here.paths.vault().exists());
+}
+
+/// While the daemon runs, it remembers the vault it has seen: deleting
+/// every trace of it (the files and the records) does not make this a new
+/// machine until a restart.
+#[test]
+fn a_running_daemon_remembers_its_vault() {
+    let (_, key, backup) = foreign_vault();
+    let here = env();
+    let k = victim(&here);
+    std::fs::remove_file(here.paths.vault()).unwrap();
+    for e in std::fs::read_dir(&here.paths.state_dir).unwrap() {
+        let path = e.unwrap().path();
+        if path.is_file() {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    assert!(
+        k.recover(
+            &mut Interactive::new(attacker_answers(&key)).channel(),
+            Some(&backup)
+        )
+        .is_err()
+    );
+    assert!(!here.paths.vault().exists());
+}
+
+/// A backup copy far behind the recorded mark (an old one put back as
+/// `.bak`) needs the login password, even under the same master key.
+#[test]
+fn an_old_backup_copy_needs_the_login_password() {
+    let env = env();
+    let k = keyring(&env, MockKeys::default());
+    create_capturing_key(&k);
+    write_item(&k, "first");
+    let old_bak = std::fs::read(env.paths.bak()).unwrap();
+    write_item(&k, "second");
+    write_item(&k, "third");
+    k.lock();
+    std::fs::write(env.paths.bak(), &old_bak).unwrap();
+    let file = std::fs::read(env.paths.vault()).unwrap();
+    let p = Interactive::new(vec![yes(), password(PW)]);
+    assert!(k.restore_from_bak(&mut p.channel()).is_err());
+    assert_eq!(std::fs::read(env.paths.vault()).unwrap(), file);
+    let p = Interactive::new(vec![yes(), password(PW), password(PW)]);
+    k.restore_from_bak(&mut p.channel()).unwrap();
 }
 
 /// A backup needs re-authentication; declined, nothing is written.

@@ -163,6 +163,9 @@ pub struct Keyring {
     last_access: Mutex<Instant>,
     /// The system is going to sleep: nothing is installed until it resumes.
     sleeping: std::sync::atomic::AtomicBool,
+    /// A vault has been here since this daemon started: deleting its files
+    /// does not make this a new machine (custody proof, E7).
+    seen_vault: std::sync::atomic::AtomicBool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -180,6 +183,7 @@ impl Keyring {
 
     /// A keyring on an already opened store.
     pub fn from_store(store: Store, paths: &Paths, backends: Backends) -> Self {
+        let seen = store.has_history();
         Self {
             inner: Mutex::new(Inner {
                 store,
@@ -194,6 +198,7 @@ impl Keyring {
             key_wait: Duration::from_secs(120),
             last_access: Mutex::new(Instant::now()),
             sleeping: std::sync::atomic::AtomicBool::new(false),
+            seen_vault: std::sync::atomic::AtomicBool::new(seen),
         }
     }
 
@@ -898,6 +903,8 @@ impl Keyring {
         inner.state.retain(|id| ids.contains(&id))?;
         inner.vault = Some(vault);
         inner.untrusted = untrusted;
+        self.seen_vault
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         *lock(&self.last_access) = Instant::now();
         Ok(untrusted.map(|why| Error::Untrusted(why).to_string()))
     }
@@ -913,7 +920,11 @@ impl Keyring {
             operation: operation.into(),
             caller: None,
         })?;
-        let current = lock(&self.inner).store.read()?;
+        // The file, and the unlocked vault it must turn out to be.
+        let (current, unlocked) = {
+            let inner = lock(&self.inner);
+            (inner.store.read()?, inner.vault.as_ref().map(|v| v.mark()))
+        };
         let methods = self.methods(&current);
         if methods.is_empty() {
             return Err(Error::NoMethodWorked(None));
@@ -938,6 +949,19 @@ impl Keyring {
             };
             match attempt {
                 Ok(opened) => {
+                    // Only the unlocked vault proves anything: a file put at
+                    // the path opens with whatever its planter chose.
+                    let m = opened.vault.mark();
+                    if !unlocked.is_some_and(|u| {
+                        u.vault_id == m.vault_id
+                            && u.mk_id == m.mk_id
+                            && m.generation >= u.generation
+                    }) {
+                        return Err(Error::Invalid(
+                            "the vault file on disk is not the unlocked keyring; lock it and unlock again"
+                                .into(),
+                        ));
+                    }
                     let fido2 = match (&password, opened.kek) {
                         (None, Some(kek)) => Some((opened.slot, kek)),
                         _ => None,
@@ -1487,6 +1511,8 @@ impl Keyring {
             let mut inner = lock(&self.inner);
             inner.store.write(&vault)?;
             inner.store.expect_vault_id(vault.vault_id())?;
+            self.seen_vault
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             inner.untrusted = None;
             // Going to sleep: the file is written, but nothing is left
             // unlocked through it.

@@ -163,7 +163,8 @@ gnome-keyring-daemon.service gnome-keyring-daemon.socket`):
    - Back on the first account, copy an older `vault.aleph` over the
      current one (daemon stopped): the next unlock reports a rollback and
      `aleph status` says writes are refused. `aleph restore
-     --accept-rollback` accepts it, after re-authentication, keeping the
+     --accept-rollback` accepts it, after re-authentication and the login
+     password, keeping the
      previous `.bak` as `vault.aleph.bak-<time>`.
    - Truncate `vault.aleph` (daemon stopped): `aleph restore --from-bak`
      brings back the previous version, keeping the broken file as

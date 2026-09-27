@@ -949,8 +949,13 @@ aleph restore [--from-bak | --accept-rollback] [<path>]
   unlocked and trusted, or opening the file there, which must turn out to
   be the recorded vault), or else the login password checked with PAM. A
   vault that fails authentication after its slot opens proves nothing
-  (a forged one fails the same way). Only a machine with no vault and
-  none expected needs no proof.
+  (a forged one fails the same way). Only a machine that has never had a
+  vault (no vault files, no records, and none seen since the daemon
+  started) needs no proof.
+- **Re-authentication** (for every operation that asks for it) proves
+  only the unlocked vault: the file it opens must be that vault (same ID
+  and master key, not behind it), so a file planted at the path proves
+  nothing.
 - An **older backup of the same vault** (older than the file there or
   than the generation recorded for it, even with the file gone) is
   restored only after a question naming both generations, saying that
@@ -962,10 +967,12 @@ aleph restore [--from-bak | --accept-rollback] [<path>]
 - **`aleph restore --from-bak`** replaces the vault with `.bak`, opened
   with the normal methods, after a question naming its generation and
   the one this machine last recorded; a `.bak` that is not the recorded
-  vault under its recorded master key also needs the login password. **`aleph restore --accept-rollback`**
+  vault under its recorded master key, at most one write behind, also
+  needs the login password. **`aleph restore --accept-rollback`**
   accepts the unlocked, untrusted vault as current, after
-  re-authentication (plus the login password for a vault that is not the
-  expected one) and an explicit yes naming what is accepted.
+  re-authentication, the login password (an untrusted vault is never the
+  expected one, and an older copy may hold a since-removed key), and an
+  explicit yes naming what is accepted.
 
 ### GUI (`aleph-gui`, eframe/egui)
 

@@ -149,6 +149,34 @@ impl Store {
         Err(Error::Invalid("too many kept copies of the vault".into()))
     }
 
+    /// Whether this machine has had a vault here: the vault file, its
+    /// backup copy, a kept copy, the expected id, or a high-water record.
+    /// (Deleting all of them is rewriting aleph's state, which the mark
+    /// does not defend against either.)
+    pub fn has_history(&self) -> bool {
+        if self.exists() || self.expected_vault_id().is_some() {
+            return true;
+        }
+        let any = |dir: &Path, wanted: &dyn Fn(&str) -> bool| {
+            std::fs::read_dir(dir)
+                .map(|d| {
+                    d.flatten()
+                        .any(|e| wanted(&e.file_name().to_string_lossy()))
+                })
+                .unwrap_or(false)
+        };
+        any(&self.paths.data_dir, &|n| {
+            n == "vault.aleph.bak"
+                || [
+                    "vault.aleph.replaced-",
+                    "vault.aleph.corrupt-",
+                    "vault.aleph.bak-",
+                ]
+                .iter()
+                .any(|p| n.starts_with(p))
+        }) || any(&self.paths.state_dir, &|n| n.starts_with("highwater-"))
+    }
+
     /// The vault this machine expects at the path, if one was recorded.
     pub fn expected_vault_id(&self) -> Option<Uuid> {
         std::fs::read_to_string(self.paths.expected_vault())

@@ -8,6 +8,36 @@ is updated to match wherever a decision changes it.
 
 ## 2026-09-27: Plan 4b split into custody (4b) and setup (4c)
 
+### F4. The independent review of the rewritten proof rule: fixes
+
+The rule F3 adopted was reviewed again, on its own, by a fresh reviewer,
+who broke it; each attack became a test that failed first:
+- **Re-authentication proved the file on disk, not the unlocked vault**
+  (since Plan 3). A same-user process that planted a vault whose method
+  it knew could pass it, for a restore and for every other operation
+  that asks for it (enrolling its own key, say). The opened file must
+  now be the unlocked vault: same ID and master key, not behind it.
+- **Accepting a rollback took the untrusted vault's own methods:** an
+  older copy holding a since-removed key was accepted with that key. It
+  now always needs the login password too.
+- **Deleting `vault-id` made "a machine with no vault"**, which needs no
+  proof. That now means no vault files, no records, and none seen since
+  the daemon started.
+- `--from-bak` now also needs `.bak` to be at most one write behind the
+  mark (else the login password).
+
+The reviewer found no deadlocks, and confirmed the question order in
+`recover` and `--from-bak` sound with these fixes.
+
+The TPM test flake: the harness's swtpm children inherited other tests'
+live TPM connections for their lifetime (seen with `ss`); they now start
+with every inherited descriptor close-on-exec. A rarer busy-helper
+timeout under full-suite load remains, as do two `pam.sock` listener
+tests racing a concurrent fork (a dropped listener still held until the
+child's exec); those tests now retry briefly, as the keyring tests
+already do for the daemon lock.
+
+
 ### F3. The final review of the executed Plan 4b branch: fixes
 
 Three critical and three important findings, each fixed with a test that

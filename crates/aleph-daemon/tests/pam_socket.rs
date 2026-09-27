@@ -257,6 +257,19 @@ async fn a_malformed_request_is_dropped() {
     assert!(send(&path, unlock(PW)).await.ok);
 }
 
+/// `listener` for a path whose listener was just dropped, retried briefly:
+/// a process another test forks holds a copy of it until its exec, and the
+/// path looks served meanwhile.
+fn listener_after_drop(path: &std::path::Path) -> std::os::unix::net::UnixListener {
+    for _ in 0..200 {
+        if let Ok(l) = aleph_daemon::pamsock::listener(path) {
+            return l;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    aleph_daemon::pamsock::listener(path).unwrap()
+}
+
 /// A leftover socket file (a crashed daemon) is replaced; anything else
 /// at the path is left alone.
 #[test]
@@ -264,7 +277,7 @@ fn the_listener_replaces_only_a_leftover_socket() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("run/aleph/pam.sock");
     drop(aleph_daemon::pamsock::listener(&path).unwrap());
-    let l = aleph_daemon::pamsock::listener(&path).unwrap();
+    let l = listener_after_drop(&path);
     drop(l);
     std::fs::remove_file(&path).unwrap();
     std::fs::write(&path, b"not a socket").unwrap();
@@ -282,5 +295,5 @@ fn the_listener_leaves_a_served_socket_alone() {
     assert!(aleph_daemon::pamsock::listener(&path).is_err());
     drop(serving);
     // (Nobody serves it now: a leftover, replaced.)
-    drop(aleph_daemon::pamsock::listener(&path).unwrap());
+    drop(listener_after_drop(&path));
 }

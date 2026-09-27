@@ -185,8 +185,9 @@ impl Keyring {
             }
             let Opened { vault, .. } = self.choose_and_open(chan, &bak)?;
             // A backup copy that is not the vault this machine expects, under
-            // the master key it recorded, proves nothing with its own methods
-            // (a planted one, or one forged with this vault's id): E7.
+            // the master key it recorded and at most one write behind, proves
+            // nothing with its own methods (a planted one, an old one, or one
+            // forged with this vault's id): E7.
             let (expected, recorded) = {
                 let inner = lock(&self.inner);
                 (
@@ -195,7 +196,9 @@ impl Keyring {
                 )
             };
             if expected != Some(vault.vault_id())
-                || !recorded.is_some_and(|r| r.mk_id == vault.mark().mk_id)
+                || !recorded.is_some_and(|r| {
+                    r.mk_id == vault.mark().mk_id && vault.mark().generation + 1 >= r.generation
+                })
             {
                 self.ask_password(chan)?;
             }
@@ -236,11 +239,10 @@ impl Keyring {
                 })?
             };
             self.reauth(chan, "Accept the vault file as it is")?;
-            // A vault that is not the one this machine expects proves
-            // nothing with its own methods: the login password too.
-            if !self.open_vault_is_expected() {
-                self.ask_password(chan)?;
-            }
+            // An untrusted vault is never the one this machine expects: its
+            // own methods (an older copy may hold a since-removed key) prove
+            // nothing alone. The login password too.
+            self.ask_password(chan)?;
             let (found, recorded) = {
                 let inner = lock(&self.inner);
                 let v = inner.vault.as_ref().ok_or(Error::Locked)?;
@@ -326,16 +328,18 @@ impl Keyring {
     /// file where none was recorded, an older copy, one forged with this
     /// vault's id, or one whose contents fail authentication. A vault's own
     /// methods prove nothing unless it is the recorded one. Only a machine
-    /// with no vault and none expected has nothing to prove.
+    /// that has never had a vault (no files, no records, none seen since
+    /// the daemon started) has nothing to prove.
     fn prove_local(&self, chan: &mut Channel, file: Option<&LockedVault>) -> Result<()> {
-        let (expected, exists, trusted) = {
+        let (expected, history, trusted) = {
             let inner = lock(&self.inner);
             (
                 inner.store.expected_vault_id(),
-                inner.store.exists(),
+                inner.store.has_history(),
                 inner.untrusted.is_none(),
             )
         };
+        let fresh = !history && !self.seen_vault.load(std::sync::atomic::Ordering::SeqCst);
         if !self.is_locked() {
             if self.open_vault_is_expected() && trusted {
                 return self
@@ -356,7 +360,7 @@ impl Keyring {
                     Err(e) => Err(e),
                 }
             }
-            (None, None) if !exists => Ok(()),
+            (None, None) if fresh => Ok(()),
             _ => self.ask_password(chan).map(|_| ()),
         }
     }
@@ -460,6 +464,8 @@ impl Keyring {
         kept.extend(inner.store.keep_bak_aside()?);
         inner.store.write(&vault)?;
         inner.store.expect_vault_id(vault.vault_id())?;
+        self.seen_vault
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let ids: HashSet<Uuid> = vault.keyslots().map(|k| k.id).collect();
         inner.state.retain(|id| ids.contains(&id))?;
         inner.state.set_rotation_pending(false)?;
