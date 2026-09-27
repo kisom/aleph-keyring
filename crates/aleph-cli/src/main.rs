@@ -255,6 +255,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         } => {
             let result = match (path, from_bak, accept_rollback) {
                 (Some(p), _, _) => {
+                    // Not a FIFO or device: opening one could wait forever.
+                    let meta =
+                        std::fs::metadata(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+                    if !meta.is_file() {
+                        return Err(format!("{}: not a regular file", p.display()));
+                    }
                     let file =
                         std::fs::File::open(&p).map_err(|e| format!("{}: {e}", p.display()))?;
                     c.converse("RestoreBackup", Args::File(file)).await?

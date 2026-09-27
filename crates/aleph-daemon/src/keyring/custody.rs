@@ -47,36 +47,26 @@ impl Keyring {
                                 .into(),
                         ));
                     }
-                    match lock(&self.inner).store.read() {
+                    // (A binding: a guard in a `match` scrutinee lives
+                    // through the arms, and the fallback locks again.)
+                    let read = lock(&self.inner).store.read();
+                    match read {
                         Ok(file) => file,
                         Err(_) => lock(&self.inner).store.read_bak()?,
                     }
                 }
             };
-            // E7: recovering the vault this machine expects needs only its
-            // recovery key; replacing anything (a backup over whatever is
-            // here, or a file that is not the expected vault) needs proof.
-            let expected = lock(&self.inner).store.expected_vault_id();
-            if backup.is_some() || expected != Some(source.vault_id()) {
+            let (expected, recorded) = {
+                let inner = lock(&self.inner);
+                (
+                    inner.store.expected_vault_id(),
+                    inner.store.recorded(source.vault_id())?,
+                )
+            };
+            // A backup replaces whatever is here: proof first (E7).
+            if backup.is_some() {
                 self.prove_local(chan, local.as_ref().ok())?;
-            }
-            // An older backup of this same vault: say what is lost.
-            if backup.is_some()
-                && let Ok(here) = &local
-                && here.vault_id() == source.vault_id()
-                && source.mark().generation < here.mark().generation
-            {
-                let reply = chan.ask(&ToPrompter::Confirm {
-                    text: format!(
-                        "This backup is generation {} of this keyring, and the file here is generation {}: anything written since the backup is not in it (the current file is kept). Restore it?",
-                        source.mark().generation,
-                        here.mark().generation
-                    ),
-                    default: false,
-                })?;
-                if reply != (FromPrompter::Confirm { yes: true }) {
-                    return Err(Error::Cancelled);
-                }
+                self.confirm_older_backup(chan, &source, local.as_ref().ok(), recorded)?;
             }
             let recovery = source
                 .keyslots()
@@ -84,6 +74,13 @@ impl Keyring {
                 .map(|k| k.id)
                 .ok_or_else(|| Error::Invalid("this vault has no recovery slot".into()))?;
             let mut vault = self.open_with_recovery_key(chan, &source, recovery)?;
+            // Recovering the vault this machine expects, as it last recorded
+            // it, needs only its recovery key. Anything else (another vault,
+            // or an older copy of this one, whose old recovery key may be
+            // all an attacker has) needs proof too (E7).
+            if backup.is_none() && !is_current(expected, recorded, &vault) {
+                self.prove_local(chan, local.as_ref().ok())?;
+            }
             let old: Vec<(Uuid, String)> = vault
                 .keyslots()
                 .filter(|k| !matches!(k.kind, SlotKind::Recovery(_)))
@@ -127,12 +124,20 @@ impl Keyring {
                 source.mark().generation.max(local_generation),
                 local.is_ok(),
             )?;
-            let reissued = self.offer_new_recovery_key(chan, slot, &kek)?;
-            Ok(Some(done_message(
-                "The keyring is restored",
-                &kept,
-                reissued,
-            )))
+            // The keyring is restored whatever happens to the offer.
+            let (reissued, note) = match self.offer_new_recovery_key(chan, slot, &kek) {
+                Ok(reissued) => (reissued, ""),
+                Err(e) => {
+                    tracing::info!("new recovery key not installed: {e}");
+                    (
+                        false,
+                        " The new recovery key was not installed; the old one still works (`aleph recovery reissue` issues a new one).",
+                    )
+                }
+            };
+            Ok(Some(
+                done_message("The keyring is restored", &kept, reissued) + note,
+            ))
         })
     }
 
@@ -156,6 +161,10 @@ impl Keyring {
                 let inner = lock(&self.inner);
                 (inner.store.read_bak()?, inner.store.read())
             };
+            let recorded = match lock(&self.inner).store.recorded(bak.vault_id())? {
+                Some(r) => format!("; this machine last recorded generation {}", r.generation),
+                None => String::new(),
+            };
             let what = match &current {
                 Ok(c) => format!(
                     "vault.aleph (generation {}) will be set aside and replaced by its backup copy (generation {})",
@@ -168,18 +177,28 @@ impl Keyring {
                 ),
             };
             let reply = chan.ask(&ToPrompter::Confirm {
-                text: format!("{what}. Continue?"),
+                text: format!("{what}{recorded}. Continue?"),
                 default: false,
             })?;
             if reply != (FromPrompter::Confirm { yes: true }) {
                 return Err(Error::Cancelled);
             }
-            // A backup copy that is not the vault this machine expects
-            // proves nothing with its own methods (E7).
-            if lock(&self.inner).store.expected_vault_id() != Some(bak.vault_id()) {
+            let Opened { vault, .. } = self.choose_and_open(chan, &bak)?;
+            // A backup copy that is not the vault this machine expects, under
+            // the master key it recorded, proves nothing with its own methods
+            // (a planted one, or one forged with this vault's id): E7.
+            let (expected, recorded) = {
+                let inner = lock(&self.inner);
+                (
+                    inner.store.expected_vault_id(),
+                    inner.store.recorded(vault.vault_id())?,
+                )
+            };
+            if expected != Some(vault.vault_id())
+                || !recorded.is_some_and(|r| r.mk_id == vault.mark().mk_id)
+            {
                 self.ask_password(chan)?;
             }
-            let Opened { vault, .. } = self.choose_and_open(chan, &bak)?;
             let current_generation = current
                 .as_ref()
                 .ok()
@@ -278,10 +297,16 @@ impl Keyring {
                 .to_backup_bytes()?;
             let mark = LockedVault::from_bytes(&bytes)?.mark();
             write(&bytes)?;
-            Ok(Some(format!(
+            let mut m = format!(
                 "Backup written: vault {}, generation {}. It holds only the recovery slot: it opens with your recovery key and nothing else.",
                 mark.vault_id, mark.generation
-            )))
+            );
+            if let Some(why) = lock(&self.inner).untrusted {
+                m.push_str(&format!(
+                    " Note: this vault file is not trusted (it was {why}); the backup holds it as it is."
+                ));
+            }
+            Ok(Some(m))
         })
     }
 
@@ -293,41 +318,87 @@ impl Keyring {
     }
 
     /// Prove the right to replace what is at the path (E7). The method of
-    /// the vault this machine expects proves it: re-authentication while it
-    /// is unlocked, or opening `file` if that is it (a file that fails
-    /// authentication after its slot opened, corrupt, counts: the
-    /// credential was right). Anything else (no file where a vault was
-    /// expected, an unreadable or different one, a file where none was
-    /// recorded) needs the login password, checked with PAM: a planted
-    /// vault's own methods prove nothing. Only a machine with no vault and
-    /// none expected has nothing to prove.
+    /// the vault this machine expects, as it last recorded it, proves it:
+    /// re-authentication while it is unlocked and trusted, or opening
+    /// `file` if that is it (same master key as recorded, not behind the
+    /// mark). Anything else needs the login password, checked with PAM: no
+    /// file where a vault was expected, an unreadable or different one, a
+    /// file where none was recorded, an older copy, one forged with this
+    /// vault's id, or one whose contents fail authentication. A vault's own
+    /// methods prove nothing unless it is the recorded one. Only a machine
+    /// with no vault and none expected has nothing to prove.
     fn prove_local(&self, chan: &mut Channel, file: Option<&LockedVault>) -> Result<()> {
-        let (expected, exists) = {
+        let (expected, exists, trusted) = {
             let inner = lock(&self.inner);
-            (inner.store.expected_vault_id(), inner.store.exists())
+            (
+                inner.store.expected_vault_id(),
+                inner.store.exists(),
+                inner.untrusted.is_none(),
+            )
         };
-        let proven = if !self.is_locked() {
-            if !self.open_vault_is_expected() {
-                return self.ask_password(chan).map(|_| ());
+        if !self.is_locked() {
+            if self.open_vault_is_expected() && trusted {
+                return self
+                    .reauth(chan, "Replace the keyring with a backup")
+                    .map(|_| ());
             }
-            self.reauth(chan, "Replace the keyring with a backup")
-                .map(|_| ())
-        } else {
-            match (file, expected) {
-                (Some(f), Some(id)) if f.vault_id() == id => {
-                    self.choose_and_open(chan, f).map(|_| ())
-                }
-                (None, None) if !exists => Ok(()),
-                _ => return self.ask_password(chan).map(|_| ()),
-            }
-        };
-        match proven {
-            Ok(())
-            | Err(Error::Core(
-                aleph_core::Error::HeaderTampered | aleph_core::Error::BodyTampered,
-            )) => Ok(()),
-            Err(e) => Err(e),
+            return self.ask_password(chan).map(|_| ());
         }
+        match (file, expected) {
+            (Some(f), Some(id)) if f.vault_id() == id => {
+                let recorded = lock(&self.inner).store.recorded(id)?;
+                match self.choose_and_open(chan, f) {
+                    Ok(opened) if is_current(expected, recorded, &opened.vault) => Ok(()),
+                    Ok(_)
+                    | Err(Error::Core(
+                        aleph_core::Error::HeaderTampered | aleph_core::Error::BodyTampered,
+                    )) => self.ask_password(chan).map(|_| ()),
+                    Err(e) => Err(e),
+                }
+            }
+            (None, None) if !exists => Ok(()),
+            _ => self.ask_password(chan).map(|_| ()),
+        }
+    }
+
+    /// Before an older backup of this vault replaces a newer one (the file
+    /// here, or the generation recorded for it, even with the file gone):
+    /// say what is lost, and name a newer `.bak`. Enter says no.
+    fn confirm_older_backup(
+        &self,
+        chan: &mut Channel,
+        source: &LockedVault,
+        local: Option<&LockedVault>,
+        recorded: Option<aleph_core::Mark>,
+    ) -> Result<()> {
+        let id = source.vault_id();
+        let backup = source.mark().generation;
+        let newest = local
+            .filter(|l| l.vault_id() == id)
+            .map(|l| l.mark().generation)
+            .into_iter()
+            .chain(recorded.map(|r| r.generation))
+            .max();
+        let Some(newest) = newest.filter(|&n| backup < n) else {
+            return Ok(());
+        };
+        let bak = match lock(&self.inner).store.read_bak() {
+            Ok(b) if b.vault_id() == id && b.mark().generation > backup => format!(
+                " vault.aleph.bak is generation {} and may be the better choice (`aleph restore --from-bak`).",
+                b.mark().generation
+            ),
+            _ => String::new(),
+        };
+        let reply = chan.ask(&ToPrompter::Confirm {
+            text: format!(
+                "This backup is generation {backup} of this keyring, and this machine has seen generation {newest}: anything written since the backup is not in it (the current file is kept).{bak} Restore it?"
+            ),
+            default: false,
+        })?;
+        if reply != (FromPrompter::Confirm { yes: true }) {
+            return Err(Error::Cancelled);
+        }
+        Ok(())
     }
 
     /// Open `source` with its recovery slot, asking for the key a few times.
@@ -438,4 +509,16 @@ fn done_message(what: &str, kept: &[std::path::PathBuf], reissued: bool) -> Stri
         m.push_str(" A new recovery key was issued: the old one no longer opens this keyring.");
     }
     m
+}
+
+/// Whether `vault` (opened, so authenticated) is the vault this machine
+/// expects, under the master key it recorded, and not behind the mark.
+fn is_current(
+    expected: Option<Uuid>,
+    recorded: Option<aleph_core::Mark>,
+    vault: &UnlockedVault,
+) -> bool {
+    let m = vault.mark();
+    expected == Some(m.vault_id)
+        && recorded.is_some_and(|r| r.mk_id == m.mk_id && m.generation >= r.generation)
 }

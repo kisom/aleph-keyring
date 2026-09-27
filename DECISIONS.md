@@ -8,6 +8,36 @@ is updated to match wherever a decision changes it.
 
 ## 2026-09-27: Plan 4b split into custody (4b) and setup (4c)
 
+### F3. The final review of the executed Plan 4b branch: fixes
+
+Three critical and three important findings, each fixed with a test that
+failed first (the proof rule then went to a second, independent
+reviewer):
+- **An older copy of this vault** (same ID) put back at the path, with
+  its old recovery key, was "the vault this machine expects" and needed
+  no proof. The expected vault now means the recorded ID and master key,
+  not behind the recorded generation; anything else needs proof.
+- **A plain `restore` with the vault missing deadlocked the daemon** (a
+  mutex guard in a `match` scrutinee lives through its arms, and the
+  `.bak` fallback locked again).
+- **Opening a file with the expected ID proved nothing:** the ID is
+  public, and a forged vault (an old backup recovered elsewhere onto the
+  attacker's key) opens with the attacker's key; the "corrupt counts as
+  proven" rule let a master-key mismatch through too. Opening proves only
+  if the opened vault is the recorded one; a corrupt file asks for the
+  login password. `--from-bak` applies the same rule to `.bak`.
+- A cancel at the new-recovery-key offer, after the vault was replaced,
+  reported failure; the restore is now reported, with a note.
+- The older-backup question now compares with the recorded generation
+  too (the file may be gone) and names a newer `.bak`; `--from-bak`
+  names the recorded generation.
+
+Minor fixes adopted: a backup of an untrusted vault says so; `aleph
+restore` refuses a FIFO or device instead of waiting on it. Deferred:
+removed items' D-Bus objects and `ItemDeleted` signals after a restore
+(the Secret Service re-sync), and listing kept files in `aleph status`.
+
+
 ### F2. The pre-execution review of the Plan 4b document: fixes adopted
 
 Two critical and three important findings, each fixed with a test that

@@ -506,6 +506,18 @@ fn a_planted_vault_is_not_accepted_with_its_own_password() {
     let p = Interactive::new(vec![password("attacker"), yes()]);
     assert!(k.accept_rollback(&mut p.channel()).is_err());
     assert!(k.status().unwrap().untrusted.is_some());
+    // A backup of it says it is not trusted.
+    let p = Interactive::new(vec![password("attacker")]);
+    k.backup(&mut p.channel(), |_| Ok(())).unwrap();
+    let done = p
+        .sent()
+        .into_iter()
+        .find_map(|m| match m {
+            ToPrompter::Done { message, .. } => message,
+            _ => None,
+        })
+        .unwrap();
+    assert!(done.contains("not trusted"), "{done}");
 }
 
 /// A planted vault unlocked with its own method (the attacker's security
@@ -540,12 +552,12 @@ fn an_unlocked_planted_vault_proves_nothing() {
     )
     .unwrap();
     assert!(k.status().unwrap().untrusted.is_some());
-    // Its own key for the proof, its recovery key, yes to dropping its
+    // Its recovery key, its own key for the proof, yes to dropping its
     // slot, and its key again as the new method.
     let answers = vec![
+        recovery(&key),
         FromPrompter::Fido2 {},
         pin(PIN),
-        recovery(&key),
         yes(),
         FromPrompter::Fido2 {},
         pin(PIN),
@@ -624,7 +636,8 @@ fn an_older_backup_of_this_vault_asks_first_and_the_newer_file_stays_detectable(
 }
 
 /// A vault whose slot opens but whose contents fail authentication
-/// (corrupt) is proven by its method once, and replaced; it is kept.
+/// (corrupt) proves nothing by opening (a forged file fails the same way):
+/// the login password is asked too. It is replaced and kept.
 #[test]
 fn a_corrupt_vault_is_replaced_after_its_method_opens_its_slot() {
     let other = env();
@@ -639,9 +652,206 @@ fn a_corrupt_vault_is_replaced_after_its_method_opens_its_slot() {
     let last = file.len() - 1;
     file[last] ^= 1;
     std::fs::write(here.paths.vault(), &file).unwrap();
-    let p = Interactive::new(vec![password(PW), recovery(&key2), password(PW), no()]);
+    let p = Interactive::new(vec![
+        password(PW),
+        password(PW),
+        recovery(&key2),
+        password(PW),
+        no(),
+    ]);
     k.recover(&mut p.channel(), Some(&bytes)).unwrap();
     assert_eq!(kept(&here, "vault.aleph.replaced-"), 1);
+}
+
+/// E7 against an older copy of this very vault (same id) and its old
+/// recovery key: put back at the path, it is not "the vault this machine
+/// expects" (it is behind the recorded mark), so recovering it needs proof.
+#[test]
+fn an_older_copy_of_this_vault_needs_proof() {
+    let here = env();
+    let k = keyring(&here, MockKeys::one(MockAuthenticator::with_pin(PIN)));
+    let key = create_capturing_key(&k);
+    let old = std::fs::read(here.paths.vault()).unwrap();
+    write_item(&k, "newer");
+    k.lock();
+    let current = std::fs::read(here.paths.vault()).unwrap();
+    std::fs::write(here.paths.vault(), &old).unwrap();
+    // The recovery key, yes to dropping the old slot, its own security key.
+    let p = Interactive::new(vec![
+        recovery(&key),
+        yes(),
+        FromPrompter::Fido2 {},
+        pin(PIN),
+        no(),
+    ]);
+    assert!(k.recover(&mut p.channel(), None).is_err());
+    assert_eq!(std::fs::read(here.paths.vault()).unwrap(), old);
+    assert!(k.is_locked());
+    drop(current);
+}
+
+/// A plain `restore` with the vault gone falls back to `.bak` (without
+/// hanging the daemon); `.bak` is behind the mark, so the login password
+/// is asked; an attacker's answers do not get through.
+#[test]
+fn recovering_from_the_backup_copy_needs_the_login_password() {
+    let here = env();
+    let k = keyring(&here, MockKeys::one(MockAuthenticator::with_pin(PIN)));
+    let key = create_capturing_key(&k);
+    write_item(&k, "first");
+    write_item(&k, "second");
+    k.lock();
+    std::fs::remove_file(here.paths.vault()).unwrap();
+    let (done, wait) = std::sync::mpsc::channel();
+    let k = std::sync::Arc::new(k);
+    {
+        let k = k.clone();
+        let key = key.clone();
+        std::thread::spawn(move || {
+            let p = Interactive::new(vec![
+                recovery(&key),
+                yes(),
+                FromPrompter::Fido2 {},
+                pin(PIN),
+                no(),
+            ]);
+            done.send(k.recover(&mut p.channel(), None).is_err())
+                .unwrap();
+        });
+    }
+    assert!(
+        wait.recv_timeout(std::time::Duration::from_secs(60))
+            .expect("recover hung")
+    );
+    assert!(!here.paths.vault().exists());
+    // The user: the recovery key, the login password, yes, a new method.
+    let p = Interactive::new(vec![
+        recovery(&key),
+        password(PW),
+        yes(),
+        password(PW),
+        no(),
+    ]);
+    k.recover(&mut p.channel(), None).unwrap();
+    assert_eq!(k.read(|b| b.collections[0].items.len()).unwrap(), 1);
+}
+
+/// A vault forged with this machine's vault id (an old backup recovered
+/// elsewhere onto the attacker's own key: same id, another master key)
+/// proves nothing by opening with the attacker's key.
+#[test]
+fn a_forged_vault_with_this_id_proves_nothing() {
+    let here = env();
+    let k = keyring(&here, MockKeys::one(MockAuthenticator::with_pin(PIN)));
+    let key = create_capturing_key(&k);
+    let backup = backup_of(&k);
+    write_item(&k, "newer");
+    k.lock();
+    let real = std::fs::read(here.paths.vault()).unwrap();
+    let state: Vec<(std::path::PathBuf, Vec<u8>)> = std::fs::read_dir(&here.paths.state_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.is_file())
+        .map(|p| {
+            let bytes = std::fs::read(&p).unwrap();
+            (p, bytes)
+        })
+        .collect();
+    // Forge: restore the old backup onto the attacker's key (as if on the
+    // attacker's machine), then put this machine back as it was.
+    let p = Interactive::new(vec![
+        password(PW),
+        yes(),
+        recovery(&key),
+        FromPrompter::Fido2 {},
+        pin(PIN),
+        no(),
+    ]);
+    k.recover(&mut p.channel(), Some(&backup)).unwrap();
+    k.lock();
+    let forged = std::fs::read(here.paths.vault()).unwrap();
+    std::fs::write(here.paths.vault(), &real).unwrap();
+    for (p, bytes) in &state {
+        std::fs::write(p, bytes).unwrap();
+    }
+    // Attack: plant the forgery, prove with the attacker's key, restore.
+    std::fs::write(here.paths.vault(), &forged).unwrap();
+    let p = Interactive::new(vec![
+        FromPrompter::Fido2 {},
+        pin(PIN),
+        yes(),
+        recovery(&key),
+        FromPrompter::Fido2 {},
+        pin(PIN),
+        no(),
+    ]);
+    assert!(k.recover(&mut p.channel(), Some(&backup)).is_err());
+    assert_eq!(std::fs::read(here.paths.vault()).unwrap(), forged);
+    // The same forgery as the backup copy, opened with the attacker's key.
+    std::fs::write(here.paths.vault(), &real).unwrap();
+    std::fs::write(here.paths.bak(), &forged).unwrap();
+    let p = Interactive::new(vec![yes(), FromPrompter::Fido2 {}, pin(PIN)]);
+    assert!(k.restore_from_bak(&mut p.channel()).is_err());
+    assert_eq!(std::fs::read(here.paths.vault()).unwrap(), real);
+}
+
+/// A cancel at the new-recovery-key offer, after the vault is replaced,
+/// still reports the restore (and the old key still works).
+#[test]
+fn a_restore_is_reported_even_if_the_new_recovery_key_is_declined_midway() {
+    let old = env();
+    let k = keyring(&old, MockKeys::default());
+    let key = create_capturing_key(&k);
+    let bytes = backup_of(&k);
+    let new = env();
+    let k = keyring(&new, MockKeys::default());
+    let p = Interactive::new(vec![recovery(&key), password(PW), FromPrompter::Cancel {}]);
+    k.recover(&mut p.channel(), Some(&bytes)).unwrap();
+    assert!(!k.is_locked());
+    let done = p
+        .sent()
+        .into_iter()
+        .find_map(|m| match m {
+            ToPrompter::Done { message, .. } => message,
+            _ => None,
+        })
+        .unwrap();
+    assert!(done.contains("not installed"), "{done}");
+}
+
+/// With the vault file gone, an older backup is still recognized as older
+/// (against the recorded mark) and asks first.
+#[test]
+fn an_older_backup_asks_first_even_with_the_vault_gone() {
+    let env = env();
+    let k = keyring(&env, MockKeys::default());
+    create_capturing_key(&k);
+    let bytes = backup_of(&k);
+    write_item(&k, "written after the backup");
+    k.lock();
+    std::fs::remove_file(env.paths.vault()).unwrap();
+    let p = Interactive::new(vec![password(PW), no()]);
+    assert!(matches!(
+        k.recover(&mut p.channel(), Some(&bytes)),
+        Err(Error::Cancelled)
+    ));
+}
+
+/// `--from-bak` names the generation this machine last recorded.
+#[test]
+fn restoring_from_bak_names_the_recorded_generation() {
+    let env = env();
+    let k = keyring(&env, MockKeys::default());
+    create_capturing_key(&k);
+    write_item(&k, "first");
+    write_item(&k, "second");
+    k.lock();
+    let p = Interactive::new(vec![no()]);
+    assert!(k.restore_from_bak(&mut p.channel()).is_err());
+    assert!(p.sent().iter().any(|m| matches!(
+        m,
+        ToPrompter::Confirm { text, .. } if text.contains("last recorded generation")
+    )));
 }
 
 /// A backup needs re-authentication; declined, nothing is written.

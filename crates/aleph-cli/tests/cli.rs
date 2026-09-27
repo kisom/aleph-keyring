@@ -336,4 +336,11 @@ async fn restore_says_when_there_is_nothing_to_do() {
     assert!(!ok && err.contains("nothing to recover"), "{err}");
     let (ok, _, err) = run(&d, &["restore", "--accept-rollback"], "").await;
     assert!(!ok && err.contains("nothing to accept"), "{err}");
+    // A FIFO is not opened (that would wait for a writer forever).
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("fifo");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let (ok, _, err) = run(&d, &["restore", fifo.to_str().unwrap()], "").await;
+    assert!(!ok && err.contains("not a regular file"), "{err}");
 }

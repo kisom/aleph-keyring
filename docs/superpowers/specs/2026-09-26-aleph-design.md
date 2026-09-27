@@ -938,21 +938,31 @@ aleph restore [--from-bak | --accept-rollback] [<path>]
   rotates MK, writes the result past every recorded generation (§4), and
   offers a new recovery key. A plain `restore` is refused while the
   vault is unlocked and trusted.
-- **Proof.** Recovering the vault this machine expects needs only its
-  recovery key. Anything else that replaces the vault (a backup, or a
-  file that is not the expected vault) needs proof, so a same-user
-  process holding an old backup and its recovery key cannot swap it in:
-  the expected vault's method (re-authentication while it is unlocked,
-  or opening it; a corrupt one whose slot opens counts), or, where the
-  expected vault is missing, unreadable, or not the file there, the login
-  password checked with PAM, since a planted vault's own methods prove
-  nothing. Only a machine with no vault and none expected needs no proof.
-- An **older backup of the same vault** is restored only after a
-  question naming both generations and saying that anything written
-  since the backup is not in it (Enter says no).
+- **Proof.** "The vault this machine expects" means its recorded ID
+  *and* master key, not behind the recorded generation: an ID alone is
+  public, and an older copy may open with an old recovery key. Recovering
+  that vault, as this machine last recorded it, needs only its recovery
+  key. Anything else that replaces the vault (a backup, another vault, an
+  older copy of this one, or one forged with its ID) needs proof, so a
+  same-user process holding an old backup and its recovery key cannot
+  swap it in: the recorded vault's method (re-authentication while it is
+  unlocked and trusted, or opening the file there, which must turn out to
+  be the recorded vault), or else the login password checked with PAM. A
+  vault that fails authentication after its slot opens proves nothing
+  (a forged one fails the same way). Only a machine with no vault and
+  none expected needs no proof.
+- An **older backup of the same vault** (older than the file there or
+  than the generation recorded for it, even with the file gone) is
+  restored only after a question naming both generations, saying that
+  anything written since the backup is not in it, and naming a newer
+  `.bak` (Enter says no).
+- If a restore succeeds but the new recovery key cannot be installed
+  (cancelled, or failed), the restore is still reported, with a note
+  that the old key still works.
 - **`aleph restore --from-bak`** replaces the vault with `.bak`, opened
-  with the normal methods; a `.bak` that is not the expected vault also
-  needs the login password. **`aleph restore --accept-rollback`**
+  with the normal methods, after a question naming its generation and
+  the one this machine last recorded; a `.bak` that is not the recorded
+  vault under its recorded master key also needs the login password. **`aleph restore --accept-rollback`**
   accepts the unlocked, untrusted vault as current, after
   re-authentication (plus the login password for a vault that is not the
   expected one) and an explicit yes naming what is accepted.
