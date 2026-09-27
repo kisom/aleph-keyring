@@ -365,6 +365,14 @@ impl UnlockedVault {
         unknown(&self.entries)
     }
 
+    /// Make the next write's generation at least `generation + 1`: for a
+    /// restored or accepted file, written past every generation this
+    /// machine has seen, so every older copy stays detectable. It never
+    /// lowers the generation.
+    pub fn advance_generation_past(&self, generation: u64) {
+        self.generation.fetch_max(generation, Ordering::SeqCst);
+    }
+
     /// Identity of the last-read or last-written generation.
     pub fn mark(&self) -> Mark {
         Mark {

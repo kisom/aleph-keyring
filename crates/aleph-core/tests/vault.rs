@@ -458,6 +458,20 @@ fn a_slot_can_be_removed_keeping_mk_but_never_the_recovery_slot() {
     ));
 }
 
+/// A restored or accepted vault is written past every generation this
+/// machine has seen: the next write is one more than the highest given,
+/// and advancing never lowers the generation.
+#[test]
+fn the_generation_can_be_advanced_but_never_lowered() {
+    let (v, ..) = sample();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.aleph");
+    v.advance_generation_past(41);
+    assert_eq!(v.write(&path).unwrap().generation, 42);
+    v.advance_generation_past(5);
+    assert_eq!(v.write(&path).unwrap().generation, 43);
+}
+
 #[test]
 fn rotation_needs_correct_keks_for_every_non_recovery_slot_and_changes_nothing_on_error() {
     let (mut v, _, rec, pw) = sample();
