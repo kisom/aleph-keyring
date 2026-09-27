@@ -147,6 +147,13 @@ impl KeyHandle {
         Ok(WrappedKey { nonce, ciphertext })
     }
 
+    /// Whether `kek` opens `wrapped` *and* the key inside is the one with
+    /// fingerprint `expected_id`, without mapping a page for it.
+    pub fn unwraps_to(kek: &Kek, wrapped: &WrappedKey, aad: &[u8], expected_id: &[u8; 16]) -> bool {
+        crypto::open(kek.expose(), &wrapped.nonce, aad, &wrapped.ciphertext)
+            .is_some_and(|pt| pt.len() == KEY_LEN && id_of(&pt) == *expected_id)
+    }
+
     /// Whether `kek` opens `wrapped`, without mapping a page for the
     /// result: for checks that discard the key.
     pub fn unwraps(kek: &Kek, wrapped: &WrappedKey, aad: &[u8]) -> bool {
@@ -193,9 +200,22 @@ impl KeyHandle {
         crypto::hmac_sha256_verify(&self.derive(info), data, tag)
     }
 
+    /// A public fingerprint of this master key: `HKDF(MK, "aleph mk id v1")`
+    /// truncated to 16 bytes. Changes whenever MK rotates.
+    pub fn id(&self) -> [u8; 16] {
+        id_of(self.mk.key())
+    }
+
     fn derive(&self, info: &[u8]) -> zeroize::Zeroizing<[u8; KEY_LEN]> {
         crypto::hkdf(self.mk.key(), info)
     }
+}
+
+fn id_of(mk: &[u8]) -> [u8; 16] {
+    let okm = crypto::hkdf(mk, b"aleph mk id v1");
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&okm[..16]);
+    id
 }
 
 impl std::fmt::Debug for KeyHandle {
@@ -230,6 +250,37 @@ mod tests {
         assert!(matches!(
             KeyHandle::unwrap(&kek, &wrapped, b"other-aad"),
             Err(Error::UnwrapFailed)
+        ));
+    }
+
+    #[test]
+    fn id_is_stable_per_key_and_differs_between_keys() {
+        let a = KeyHandle::generate().unwrap();
+        let b = KeyHandle::generate().unwrap();
+        assert_eq!(a.id(), a.id());
+        assert_ne!(a.id(), b.id());
+        // The fingerprint is not the key: it cannot unwrap anything.
+        assert_ne!(a.id(), [0u8; 16]);
+    }
+
+    #[test]
+    fn unwraps_to_also_checks_which_master_key_it_is() {
+        let mk = KeyHandle::generate().unwrap();
+        let kek = Kek::generate().unwrap();
+        let wrapped = mk.wrap(&kek, b"slot-aad").unwrap();
+        assert!(KeyHandle::unwraps_to(&kek, &wrapped, b"slot-aad", &mk.id()));
+        let other = KeyHandle::generate().unwrap();
+        assert!(!KeyHandle::unwraps_to(
+            &kek,
+            &wrapped,
+            b"slot-aad",
+            &other.id()
+        ));
+        assert!(!KeyHandle::unwraps_to(
+            &kek,
+            &wrapped,
+            b"other-aad",
+            &mk.id()
         ));
     }
 

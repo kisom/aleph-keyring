@@ -4,24 +4,23 @@
 use std::collections::BTreeMap;
 
 use aleph_core::model::DEFAULT_ALIAS;
-use aleph_core::{Argon2Kind, Argon2Params, Item, RecoveryKey, SecretBytes, UnlockedVault};
+use aleph_core::{Argon2Params, Item, RecoveryKey, SecretBytes, UnlockedVault};
 use ciborium::Value;
 use uuid::Uuid;
 
-pub const PASSPHRASE: &[u8] = b"correct horse";
+pub const PASSWORD: &[u8] = b"correct horse";
 
 pub const FAST: Argon2Params = Argon2Params::INSECURE_TEST;
 
-/// A vault with one recovery slot, one passphrase slot, and one item.
+/// A vault with a recovery slot, a login-password slot, and one item.
+/// Returns `(vault, recovery key, recovery slot id, password slot id)`.
 pub fn sample() -> (UnlockedVault, RecoveryKey, Uuid, Uuid) {
     let mut v = UnlockedVault::create().unwrap();
     let rk = RecoveryKey::generate().unwrap();
     let rec = v
-        .add_argon2_keyslot("recovery", Argon2Kind::RecoveryKey, rk.as_bytes(), FAST)
+        .add_recovery_slot("recovery", &rk.recipient().public_key())
         .unwrap();
-    let pass = v
-        .add_argon2_keyslot("passphrase", Argon2Kind::Passphrase, PASSPHRASE, FAST)
-        .unwrap();
+    let pw = v.add_login_password_slot("login", PASSWORD, FAST).unwrap();
     let login = v.body().resolve_alias(DEFAULT_ALIAS).unwrap().id;
     let attrs = BTreeMap::from([("service".to_string(), "github".to_string())]);
     v.body_mut().collection_mut(login).unwrap().upsert(
@@ -33,7 +32,7 @@ pub fn sample() -> (UnlockedVault, RecoveryKey, Uuid, Uuid) {
         ),
         false,
     );
-    (v, rk, rec, pass)
+    (v, rk, rec, pw)
 }
 
 pub fn first_secret(v: &UnlockedVault) -> Vec<u8> {
@@ -66,10 +65,30 @@ pub fn edit_header(bytes: &[u8], f: impl FnOnce(&mut Vec<(Value, Value)>)) -> Ve
             Value::Map(m) => m,
             _ => panic!("header is a CBOR map"),
         });
-        let mut buf = Vec::new();
-        ciborium::into_writer(&header, &mut buf).unwrap();
-        outer[1] = Value::Bytes(buf);
+        outer[1] = Value::Bytes(encode(&header));
     })
+}
+
+/// Decode each keyslot (a byte string holding a CBOR map), let `f` edit
+/// the list of decoded maps, re-encode them into the header.
+pub fn edit_slots(bytes: &[u8], f: impl FnOnce(&mut Vec<Value>)) -> Vec<u8> {
+    edit_header(bytes, |h| {
+        let Value::Array(raw) = field(h, "keyslots") else {
+            panic!("keyslots is an array")
+        };
+        let mut slots: Vec<Value> = raw
+            .iter()
+            .map(|b| ciborium::from_reader(b.as_bytes().unwrap().as_slice()).unwrap())
+            .collect();
+        f(&mut slots);
+        *raw = slots.iter().map(|s| Value::Bytes(encode(s))).collect();
+    })
+}
+
+pub fn encode(v: &Value) -> Vec<u8> {
+    let mut buf = Vec::new();
+    ciborium::into_writer(v, &mut buf).unwrap();
+    buf
 }
 
 pub fn field<'a>(map: &'a mut [(Value, Value)], name: &str) -> &'a mut Value {

@@ -25,9 +25,7 @@ impl RecoveryKey {
         try_init_secret(|buf| crypto::fill_random(buf)).map(Self)
     }
 
-    /// The bytes fed to Argon2id by today's recovery slot (private again
-    /// once the X-Wing recovery slot replaces it).
-    pub fn as_bytes(&self) -> &[u8; KEY_BYTES] {
+    fn as_bytes(&self) -> &[u8; KEY_BYTES] {
         self.0.expose_secret()
     }
 
@@ -189,6 +187,7 @@ mod tests {
             crate::xwing::PUBLIC_KEY_LEN
         );
     }
+
     #[test]
     fn parse_round_trips_format() {
         let k = RecoveryKey::generate().unwrap();

@@ -182,7 +182,7 @@ holds every decrypted secret. Separation protects MK, not the secrets.
   | `vault_id` | UUIDv4 (bytes) | |
   | `generation` | u64 | Incremented on every write. Starts at 1. |
   | `mk_id` | 16 bytes | `HKDF(MK, "aleph mk id v1")[..16]`. Changes when MK rotates. Not secret. |
-  | `keyslots` | array | Each element is one keyslot, below. |
+  | `keyslots` | array | Each element is a byte string holding one keyslot's CBOR, so that unknown slot types can be re-emitted byte-for-byte. |
 
 - `header_mac = HMAC-SHA-256(HKDF(MK, "aleph header v1"), MAGIC ‖ be32(format_version) ‖ header_bytes)`.
   It is computed over the exact stored bytes, never a re-encoding.
@@ -197,7 +197,8 @@ handled by the high-water mark below.
 ### Generation and high-water mark
 
 `alephd` records `(vault_id, generation, mk_id)` in
-`$XDG_STATE_HOME/aleph/highwater`, outside the vault's directory, so that
+`$XDG_STATE_HOME/aleph/highwater-<vault_id>` (one file per vault), outside
+the vault's directory, so that
 backups and sync do not carry it. The value is only raised, never lowered.
 
 On unlock:
@@ -207,6 +208,13 @@ On unlock:
   or by accepting it in the GUI.
 - **Same `generation` but a different `mk_id`:** the file has been
   replaced. Same handling.
+- **Higher `generation` with a different `mk_id`:** MK changed somewhere
+  other than this daemon, or someone holding an old MK is replaying it
+  under a forged generation (`Rekeyed`). Same handling.
+
+Only the daemon's own writes move the mark to a new MK: `write` returns
+the `Mark` it put on disk, and the daemon records exactly that. Marks of
+files it reads are only ever raised within the same MK.
 
 This defends against a sync peer or a restored backup silently undoing a
 rotation. It is not tamper-proof against an attacker who can also write

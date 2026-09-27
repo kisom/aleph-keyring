@@ -1,34 +1,39 @@
 //! Golden vault files. Every released format version gets a file here,
-//! and every later release must still open it. Never regenerate an
-//! existing version's file; add a new one for a new version.
+//! and every later release must still open it. Never regenerate a
+//! released version's file; add a new one for a new version. (v1 is not
+//! yet released: Plan 1b regenerated it for spec revision 2.)
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use aleph_core::model::DEFAULT_ALIAS;
 use aleph_core::{
-    Argon2Kind, Argon2Params, Item, LockedVault, RecoveryKey, SecretBytes, UnlockedVault,
+    Argon2Params, Item, LockedVault, RecoveryKey, SecretBytes, SlotKind, UnlockedVault,
 };
 
 const RECOVERY_KEY: &str = "000G-40R4-0M30-E209-185G-R38E-1W81-24GK-2GAH-C5RR-34D1-P70X-3RFG-CC6W";
-const PASSPHRASE: &[u8] = b"aleph golden v1";
+const PASSWORD: &[u8] = b"aleph golden v1";
 
 fn golden_path(version: u32) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/golden/v{version}.aleph"))
 }
 
 #[test]
-fn golden_v1_opens_with_recovery_key_and_passphrase() {
+fn golden_v1_opens_with_recovery_key_and_login_password() {
     let locked = LockedVault::read(&golden_path(1)).expect("golden v1 file present");
-    let slots = locked.keyslots();
+    let slots: Vec<_> = locked.keyslots().collect();
     assert_eq!(slots.len(), 2);
+    assert!(matches!(slots[0].kind, SlotKind::Recovery(_)));
+    assert!(matches!(slots[1].kind, SlotKind::LoginPassword(_)));
+    assert_eq!(locked.mark().generation, 1);
 
     let rk = RecoveryKey::parse(RECOVERY_KEY).unwrap();
-    for (slot, secret) in [
-        (slots[0].id, rk.as_bytes().as_slice()),
-        (slots[1].id, PASSPHRASE),
-    ] {
-        let v = locked.unlock_argon2(slot, secret).unwrap();
+    let opened = [
+        locked.unlock_recovery(slots[0].id, &rk).unwrap(),
+        locked.unlock_login_password(slots[1].id, PASSWORD).unwrap(),
+    ];
+    for v in &opened {
+        assert_eq!(v.mark(), locked.mark());
         let login = v.body().resolve_alias(DEFAULT_ALIAS).unwrap();
         assert_eq!(login.label, "Login");
         assert_eq!(login.items.len(), 1);
@@ -54,20 +59,10 @@ fn regenerate_golden_v1() {
     );
     let mut v = UnlockedVault::create().unwrap();
     let rk = RecoveryKey::parse(RECOVERY_KEY).unwrap();
-    v.add_argon2_keyslot(
-        "recovery",
-        Argon2Kind::RecoveryKey,
-        rk.as_bytes(),
-        Argon2Params::INSECURE_TEST,
-    )
-    .unwrap();
-    v.add_argon2_keyslot(
-        "passphrase",
-        Argon2Kind::Passphrase,
-        PASSPHRASE,
-        Argon2Params::INSECURE_TEST,
-    )
-    .unwrap();
+    v.add_recovery_slot("recovery", &rk.recipient().public_key())
+        .unwrap();
+    v.add_login_password_slot("login", PASSWORD, Argon2Params::INSECURE_TEST)
+        .unwrap();
     let login = v.body().resolve_alias(DEFAULT_ALIAS).unwrap().id;
     let attrs = BTreeMap::from([("service".to_string(), "example".to_string())]);
     v.body_mut().collection_mut(login).unwrap().upsert(

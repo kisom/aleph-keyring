@@ -18,7 +18,9 @@ pub use error::{Error, Result};
 pub use highwater::{HighWater, Mark, Standing};
 pub use kdf::{Argon2Params, derive_kek};
 pub use key::{Kek, KeyHandle, WrappedKey};
-pub use keyslot::{Argon2Kind, Argon2Slot, Fido2Slot, Keyslot, SlotKind, TpmAuth, TpmSlot};
+pub use keyslot::{
+    Argon2Slot, Fido2Slot, Keyslot, RecoverySlot, SlotEntry, SlotKind, TpmSlot, UnknownSlot,
+};
 pub use model::{Body, Collection, Item, SecretBytes};
 pub use recovery::RecoveryKey;
-pub use vault::{LockedVault, UnlockedVault};
+pub use vault::{LockedVault, Rotation, UnlockedVault};

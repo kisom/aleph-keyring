@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use aleph_core::model::DEFAULT_ALIAS;
-use aleph_core::{Argon2Kind, Argon2Params, Item, LockedVault, SecretBytes, UnlockedVault};
+use aleph_core::{Argon2Params, Item, LockedVault, RecoveryKey, SecretBytes, UnlockedVault};
 
 const MARKER: &[u8; 16] = b"\xa5ALEPH-MARKER!\x5a\x5a";
 
@@ -44,13 +44,11 @@ static ALLOC: ScanOnFree = ScanOnFree;
 #[test]
 fn serializing_and_unlocking_leave_no_secret_in_freed_memory() {
     let mut v = UnlockedVault::create().unwrap();
+    let rk = RecoveryKey::generate().unwrap();
+    v.add_recovery_slot("recovery", &rk.recipient().public_key())
+        .unwrap();
     let slot = v
-        .add_argon2_keyslot(
-            "p",
-            Argon2Kind::Passphrase,
-            b"pw",
-            Argon2Params::INSECURE_TEST,
-        )
+        .add_login_password_slot("p", b"pw", Argon2Params::INSECURE_TEST)
         .unwrap();
     let login = v.body().resolve_alias(DEFAULT_ALIAS).unwrap().id;
     // Enough items that the encoder's buffer must grow several times
@@ -75,7 +73,7 @@ fn serializing_and_unlocking_leave_no_secret_in_freed_memory() {
     let encode_hits = HITS.swap(0, Ordering::SeqCst);
     let unlocked = LockedVault::from_bytes(&bytes)
         .unwrap()
-        .unlock_argon2(slot, b"pw")
+        .unlock_login_password(slot, b"pw")
         .unwrap();
     let decode_hits = HITS.swap(0, Ordering::SeqCst);
     drop(unlocked);

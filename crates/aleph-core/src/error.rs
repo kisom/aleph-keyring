@@ -21,7 +21,7 @@ pub enum Error {
     #[error("no keyslot with id {0}")]
     NoSuchKeyslot(Uuid),
 
-    #[error("keyslot {0} is not a password-type (Argon2id) slot")]
+    #[error("keyslot {0} is not the right type for this unlock method")]
     WrongSlotType(Uuid),
 
     #[error("keyslot could not be unlocked (wrong secret or tampered slot)")]
@@ -33,8 +33,17 @@ pub enum Error {
     #[error("vault body failed authentication")]
     BodyTampered,
 
-    #[error("refusing to remove the last keyslot")]
-    LastKeyslot,
+    #[error("vault generation counter would overflow")]
+    GenerationOverflow,
+
+    #[error("the vault must keep at least one recovery slot")]
+    RecoveryRequired,
+
+    #[error("Argon2 parameters are below the enrollment floor")]
+    WeakParams,
+
+    #[error("only TPM and FIDO2 slots can be added with a raw KEK")]
+    NotAHardwareSlot,
 
     #[error("master key rotation needs a KEK for keyslot {0}")]
     MissingKek(Uuid),
