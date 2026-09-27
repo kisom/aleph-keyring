@@ -179,6 +179,20 @@ fn a_failed_write_does_not_advance_the_generation() {
     assert_eq!(v.mark(), before);
 }
 
+/// Removing a slot without rotation does not leave the previous file
+/// (which still holds that slot) in `.bak` either.
+#[test]
+fn the_backup_after_a_removal_keeping_mk_does_not_keep_the_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.aleph");
+    let (mut v, _, _, pw) = sample();
+    v.write(&path).unwrap();
+    v.remove_keyslot_keeping_mk(pw).unwrap();
+    v.write(&path).unwrap();
+    let bak = LockedVault::read(&path.with_file_name("vault.aleph.bak")).unwrap();
+    assert!(bak.keyslots().all(|s| s.id != pw));
+}
+
 /// After a rotation, the first write must not leave the pre-rotation file
 /// (which still holds the removed slot and the old MK) in `.bak`.
 #[test]

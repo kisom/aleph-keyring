@@ -428,6 +428,36 @@ fn removing_a_slot_rotates_so_it_cannot_open_later_files() {
     assert!(locked_after.unlock_login_password(pw, PASSWORD).is_ok());
 }
 
+/// A password slot can be removed without rotating MK (a login password
+/// change, when FIDO2 slots make a rotation impossible without the user):
+/// later files no longer hold it, MK is unchanged, and a recovery slot can
+/// never be removed this way.
+#[test]
+fn a_slot_can_be_removed_keeping_mk_but_never_the_recovery_slot() {
+    let (mut v, rk, rec, pw) = sample();
+    let mk_id = v.mark().mk_id;
+    v.remove_keyslot_keeping_mk(pw).unwrap();
+    assert_eq!(v.mark().mk_id, mk_id);
+    assert!(v.keyslots().all(|k| k.id != pw));
+    let locked = LockedVault::from_bytes(&v.to_bytes().unwrap()).unwrap();
+    assert!(matches!(
+        locked.unlock_login_password(pw, PASSWORD),
+        Err(Error::NoSuchKeyslot(_))
+    ));
+    assert_eq!(
+        first_secret(&locked.unlock_recovery(rec, &rk).unwrap()),
+        b"ghp_secret"
+    );
+    assert!(matches!(
+        v.remove_keyslot_keeping_mk(rec),
+        Err(Error::RecoveryRequired)
+    ));
+    assert!(matches!(
+        v.remove_keyslot_keeping_mk(Uuid::new_v4()),
+        Err(Error::NoSuchKeyslot(_))
+    ));
+}
+
 #[test]
 fn rotation_needs_correct_keks_for_every_non_recovery_slot_and_changes_nothing_on_error() {
     let (mut v, _, rec, pw) = sample();

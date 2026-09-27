@@ -325,8 +325,9 @@ pub struct UnlockedVault {
     vault_id: Uuid,
     /// The generation last read or written; the next write uses one more.
     generation: AtomicU64,
-    /// MK rotated since the last write: that write must not leave the
-    /// pre-rotation file (old MK, removed slots) behind as `.bak`.
+    /// MK rotated (or a slot was removed) since the last write: that write
+    /// must not leave the previous file (old MK, removed slots) behind as
+    /// `.bak`.
     rotated: AtomicBool,
     entries: Vec<SlotEntry>,
     key: KeyHandle,
@@ -456,6 +457,27 @@ impl UnlockedVault {
     /// TPM, FIDO2, and login-password slot (see `rotate_master`).
     pub fn remove_keyslot(&mut self, id: Uuid, keks: &[(Uuid, &Kek)]) -> Result<Rotation> {
         self.rotate_master(keks, &[id])
+    }
+
+    /// Remove a keyslot *without* rotating MK. Old copies of the file still
+    /// open with the removed credential, so this is only for replacing a
+    /// login password's slots when a rotation is impossible without the
+    /// user (FIDO2 slots need a touch), and the caller must have MK rotated
+    /// soon. The next write does not keep the previous file as `.bak`.
+    /// Recovery slots cannot be removed this way.
+    pub fn remove_keyslot_keeping_mk(&mut self, id: Uuid) -> Result<()> {
+        let at = self
+            .entries
+            .iter()
+            .position(|e| matches!(e, SlotEntry::Known(k) if k.id == id))
+            .ok_or(Error::NoSuchKeyslot(id))?;
+        if matches!(&self.entries[at], SlotEntry::Known(k) if matches!(k.kind, SlotKind::Recovery(_)))
+        {
+            return Err(Error::RecoveryRequired);
+        }
+        self.entries.remove(at);
+        self.rotated.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Replace MK and re-wrap every slot. Slots in `drop` are removed
