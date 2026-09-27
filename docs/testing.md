@@ -37,7 +37,8 @@ executable in a temporary copy of the unit.) Expect no output from
 ## Manual, before each release
 
 These need real hardware and a person. Record the result (pass/fail,
-hardware model, firmware) in the release notes.
+hardware model, firmware) in [hardware-log.md](hardware-log.md); release
+notes summarize it.
 
 ### FIDO2 security key
 
