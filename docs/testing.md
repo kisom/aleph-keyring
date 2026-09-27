@@ -16,12 +16,26 @@ Requirements:
 - **`tpm2-tools`**: the fixture uses `tpm2_dictionarylockout` to give
   swtpm realistic dictionary-attack parameters (tss-esapi 7.7 lacks
   `TPM2_DictionaryAttackParameters`).
-- **`tpm2-tss`** and **`libfido2`**: build-time libraries.
-- Arch: `pacman -S swtpm tpm2-tools tpm2-tss libfido2`.
-  Nix: `swtpm tpm2-tools tpm2-tss libfido2`.
+- **`tpm2-tss`**, **`libfido2`**, and **`pam`**: build-time libraries.
+- **`dbus`** (`dbus-daemon`) and **`libsecret`** (`secret-tool`): the
+  daemon and CLI tests run `alephd`'s interfaces on a private session bus
+  and drive them with the real libsecret client and the real `aleph`
+  binary. They never touch your session bus or keyring.
+- PAM is exercised for real through a private service directory
+  (`pam_start_confdir`, Linux-PAM 1.4+): `pam_unix` rejecting a wrong
+  password, and the shipped `packaging/pam/aleph-check`. Nothing is
+  installed and no root is needed.
+- Arch: `pacman -S swtpm tpm2-tools tpm2-tss libfido2 pam dbus libsecret`.
+  Nix: `swtpm tpm2-tools tpm2-tss libfido2 pam dbus libsecret`.
 
 FIDO2 logic is tested against `aleph_unlock::fido2::mock::MockKeys`; no
-test in the default run needs a security key.
+test in the default run needs a security key. Prompts are answered by
+scripted prompters (`aleph_daemon::testing`), and the CLI reads its answers
+from standard input under `ALEPH_NO_TTY=1`.
+
+`alephd`'s user unit is checked with
+`systemd-analyze verify --user packaging/systemd/alephd.service` (same
+`ExecStart` caveat as below).
 
 The systemd units in `packaging/systemd/` are checked with:
 
@@ -84,3 +98,32 @@ does (DynamicUser, the seccomp filter, threads). As root:
    `aleph status`.)
 4. Undo: `systemctl disable --now aleph-tpmd.socket aleph-tpmd.service`
    and remove the installed files.
+
+### alephd with real clients
+
+Needs a vault on a test account (or a spare user), since it takes over
+the Secret Service for the session. As root, install the PAM service
+once: `install -Dm644 packaging/pam/aleph-check /etc/pam.d/aleph-check`.
+Then, with gnome-keyring stopped (`systemctl --user stop
+gnome-keyring-daemon.service gnome-keyring-daemon.socket`):
+
+1. Run `target/debug/alephd` in one terminal and `target/debug/aleph setup`
+   in another; choose the TPM (or a key) and confirm the recovery key.
+2. `secret-tool store --label=t service aleph-check` (type a secret), then
+   `secret-tool lookup service aleph-check` prints it.
+3. `aleph lock`, then `secret-tool lookup service aleph-check`: it waits
+   (no graphical prompter yet). In the other terminal, `aleph unlock`: the
+   lookup then prints the secret.
+4. **Chromium:** start it with `--password-store=gnome-libsecret`, save a
+   site password, quit, `aleph lock`, start Chromium again, and
+   `aleph unlock` when it waits. Saved passwords must still be there
+   (Chromium did not create a new safe-storage key).
+5. **NetworkManager:** with `nmcli` and a Wi-Fi network whose password is
+   stored for the user ("Store the password only for this user"), lock,
+   reconnect, and unlock when asked: the connection must come up without
+   asking for the Wi-Fi password again.
+6. `aleph status` shows the keyslots; `journalctl --user` (or the
+   terminal) shows no secrets.
+
+Record the results, and the libsecret, Chromium, and NetworkManager
+versions, in `hardware-log.md`.

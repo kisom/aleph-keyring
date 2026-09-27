@@ -20,11 +20,15 @@ gnome-keyring's secrets store; libsecret applications work unmodified.
 | `aleph-tpm-proto` | Wire protocol between `alephd` and the TPM helper |
 | `aleph-tpmd` | The TPM helper service (the only process that talks to the TPM) |
 | `aleph-unlock` | TPM client and FIDO2 unlock methods that produce keyslot KEKs |
+| `aleph-prompt-proto` | Protocol between `alephd` and its prompters (GUI or terminal) |
+| `aleph-daemon` | `alephd`: the Secret Service and the `io.aleph.Admin1` interface |
+| `aleph-cli` | `aleph`: the command-line client |
 
 ## Development
 
-Tests need `swtpm`, `tpm2-tools`, `tpm2-tss` and `libfido2` (Arch:
-`pacman -S swtpm tpm2-tools tpm2-tss libfido2`). Hardware tests are opt-in;
+Tests need `swtpm`, `tpm2-tools`, `tpm2-tss`, `libfido2`, `pam`, `dbus`
+and `libsecret` (Arch: `pacman -S swtpm tpm2-tools tpm2-tss libfido2 pam
+dbus libsecret`). Hardware tests are opt-in;
 see [docs/testing.md](docs/testing.md).
 
 ~~~sh

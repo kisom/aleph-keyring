@@ -135,9 +135,10 @@ the TPM. The design keeps key custody separable for v2 (§10).
 | `aleph-tpm-proto` | lib | The `aleph-tpmd` wire protocol: request/response types and framing. | `serde`, `ciborium` |
 | `aleph-tpmd` | bin | TPM helper: seal and unseal per uid, SRK verification, rate limiting, `Status`. | `aleph-tpm-proto`, `tss-esapi` |
 | `aleph-unlock` | lib | Produces a KEK per hardware keyslot: the TPM client (talks to `aleph-tpmd`) and FIDO2 (`Authenticator` trait, `libfido2` backend, mock). | `aleph-core`, `aleph-tpm-proto`, `fido2-rs` |
-| `alephd` | bin | Secret Service and admin D-Bus interfaces, PAM socket, lock policy, prompter orchestration. | `aleph-core`, `aleph-unlock`, `zbus`, `tokio`, `tracing`, `tracing-journald` |
+| `aleph-prompt-proto` | lib | The prompter protocol (newline-delimited JSON) shared by `alephd`, the CLI's terminal prompter, and `aleph-gui`. | `serde`, `zeroize` |
+| `aleph-daemon` (bin `alephd`) | bin | Secret Service and admin D-Bus interfaces, PAM socket, lock policy, prompter orchestration. | `aleph-core`, `aleph-unlock`, `aleph-prompt-proto`, `zbus`, `tokio`, `tracing`, `tracing-journald`, libpam |
 | `pam_aleph` | cdylib | PAM module: forwards passwords to `alephd` after dropping to the user's uid. Minimal, no async runtime. | PAM FFI, std |
-| `aleph` | bin | CLI. | `zbus`, `clap` |
+| `aleph-cli` (bin `aleph`) | bin | CLI. | `aleph-prompt-proto`, `zbus`, `clap` |
 | `aleph-gui` | bin | egui manager and prompter. | `eframe`, `egui`, `zbus`, `notify`, Wayland clipboard crate |
 
 **Seam for privilege separation:** only `KeyHandle` touches MK. Callers
@@ -299,7 +300,8 @@ every slot is re-wrapped:
 - **on `aleph keyslot rotate-master`**
 
 Re-wrapping needs a KEK for every slot. The daemon never keeps
-passwords, so the KEKs come from these sources:
+passwords, so the KEKs come from these sources (each is checked to
+unwrap MK before it counts):
 
 - **The recovery slot:** re-wrapped to its public key, with no secret
   needed.
@@ -310,8 +312,15 @@ passwords, so the KEKs come from these sources:
 - **Each FIDO2 slot:** needs that key's touch. The prompter walks through
   them in turn.
 
-A slot that cannot be presented is removed, after the user confirms. A
-rotation never leaves a slot wrapping the old MK.
+A slot that cannot be presented is removed, after the user confirms: a
+FIDO2 key that is not presented, a TPM or login-password slot that
+rejects the password, or a stale TPM slot (which is not tried again). A
+TPM refusal that says nothing about the slot (`Busy`, `RateLimited`,
+`Exhausted`, helper unavailable) stops the rotation instead. TPM slots
+are only ever offered a password PAM accepted, newest slot first. A
+rotation never leaves a slot wrapping the old MK, and never leaves only
+the recovery slot. Reissuing the recovery key does everything that can
+fail before it shows the new key.
 
 ### Body
 
@@ -334,17 +343,46 @@ never answers a search with a false "no such item". Returning empty
 results would make some clients (Chromium's safe-storage key is the
 classic case) create a new key that orphans their existing data.
 
-- `SearchItems`, `GetSecrets`, `Item.GetSecret`, and every other read that
-  needs the body return `org.freedesktop.Secret.Error.IsLocked` while the
-  vault is locked. Clients then call `Unlock()`, which goes through the
-  normal `Prompt` flow with no reply timeout.
-- No method call ever blocks waiting for the user.
-- Plan 3 must verify this against real clients before it is final:
-  libsecret's `secret_password_lookup` with and without
-  `SECRET_SEARCH_UNLOCK`, Chromium's safe-storage lookup, and
-  NetworkManager. If a client treats `IsLocked` as "not found", the
-  fallback is an unlock-triggering placeholder in the `locked` list, and
-  that choice is recorded in §11.
+- **While locked, a search returns a placeholder.** `SearchItems` puts
+  one placeholder item (`/org/freedesktop/secrets/search/<n>`, always
+  `Locked`) in its `locked` list, and `Collection.SearchItems` returns it.
+  libsecret then calls `Unlock()` on it, and the prompt's result lists the
+  items the search really finds once the vault is open. The first design,
+  answering `IsLocked`, was tested against libsecret 0.21.7 in Plan 3:
+  `secret-tool lookup` reported an error and never unlocked, which a
+  client like Chromium could treat as "no key".
+- `GetSecrets`, `Item.GetSecret`, and every other read of the body return
+  `org.freedesktop.Secret.Error.IsLocked` while the vault is locked.
+- While locked, only the `default` alias exists, as a locked collection
+  (collection names are encrypted too). `ReadAlias("default")` returns
+  it; libsecret stores to it after unlocking it. Item and collection
+  objects exist only while unlocked: a client holding an item path across
+  a lock gets `UnknownObject`, and searches again.
+- A placeholder's query is captured when `Unlock` is called, so the
+  answer survives the placeholder being cleared. A `Lock` while already
+  locked changes nothing.
+- No method call ever blocks waiting for the user. `Unlock()` returns a
+  prompt with no reply timeout. If no prompter can start (no graphical
+  session), the prompt is not dismissed: it waits until the vault is
+  unlocked some other way (`aleph unlock`, PAM), then completes. At
+  most 8 prompts per client, and 128 in all, may wait; a prompt starts
+  once; while one unlock conversation runs, other unlock prompts wait for
+  it instead of opening more prompter windows (if it is cancelled, they
+  keep waiting for a later unlock). A client may hold 16 prompts.
+- **Sessions outlive locks.** A session holds only its transport key, and
+  nothing is readable through it while locked; libsecret keeps one session
+  for the life of each process, so closing sessions at lock would break
+  every long-lived client at each screen lock. A session is freed on
+  `Close`, when its client disconnects, or at exit; a client may hold 32.
+  A client's prompts are freed when it disconnects too.
+- A dismissed prompt carries an empty value of the type a completed one
+  would (`ao` for an unlock). libsecret checks the type even on
+  dismissal, and hangs on a mismatch.
+- Verified with `secret-tool` on a private bus (Plan 3 tests): store,
+  lookup, search, and clear; a locked lookup prompts once and returns the
+  secret; with no prompter it waits for an unlock elsewhere; cancelling
+  ends it without a secret. Chromium's safe-storage lookup and
+  NetworkManager are on the manual checklist (`docs/testing.md`).
 
 ### Memory hygiene
 
@@ -358,9 +396,13 @@ What is guaranteed:
   use, and decoded without intermediate copies. Plaintext secrets
   (`SecretBytes`) are zeroized on drop.
 - Children are started only via `posix_spawn`/`exec`
-  (`std::process::Command`), never a bare `fork`.
-- Locking zeroizes MK, derived keys, and the decrypted body, and closes all
-  Secret Service sessions.
+  (`std::process::Command`), never a bare `fork`. One exception is outside
+  aleph's code: checking a typed password, libpam's `pam_unix` forks and
+  execs `unix_chkpwd`. MK's page is `MADV_WIPEONFORK`, so the child never
+  sees it; the decrypted body is shared copy-on-write until the exec.
+- Locking zeroizes MK, derived keys, and the decrypted body. Secret
+  Service sessions stay open (§4 "Locked search"): they hold only
+  transport keys.
 
 What is not guaranteed: labels and attributes are ordinary strings and are
 not zeroized. zbus, libsecret, and the GUI make their own copies of
@@ -448,6 +490,21 @@ secrets in transit. `mlock` does not keep pages out of a hibernation image
     (at least 60 s), then `RateLimited`. One uid guessing without pause
     thus adds failures no faster than the TPM forgets them; it takes
     several uids to hold the reserve at its limit.
+  - **A typed password is checked with PAM first.** Before a password
+    typed into a prompt reaches the TPM, `alephd` checks it with the PAM
+    service `aleph-check` (`pam_unix` only, no faillock), so a typo never
+    spends the TPM's budget: on a TPM with a 7200 s recovery time, two
+    typos would otherwise block TPM unlock for hours. At most 5 wrong
+    typed passwords are accepted per minute. If PAM cannot check at all
+    (no `/etc/pam.d/aleph-check`, or an account `pam_unix` cannot verify),
+    the TPM slots are skipped rather than risked, while login-password
+    slots are still tried; TPM slots therefore need `pam_unix` accounts.
+    Passwords from `pam_aleph` were accepted by the login stack and skip
+    the check.
+  - **TPM slots are tried newest first.** Once one rejects a password PAM
+    accepted, it and every older TPM slot are marked stale without being
+    tried, so a changed password costs one failed attempt, not one per
+    slot.
   - After an `AuthFailed` or `WrongUser` failure, the daemon marks the
     slot `stale` and stops trying it automatically until the user
     re-enrolls it or explicitly retries it, so an outdated password does
@@ -642,17 +699,29 @@ Verified against a stock Omarchy install on 2026-09-26.
 
 ### Admin interface `io.aleph.Admin1`
 
-- On the session bus only.
-- Methods: `Status`, `Lock`, `Unlock`, `ListKeyslots`, `EnrollTpm`,
-  `EnrollFido2`, `RemoveKeyslot`, `RotateMaster`, `ReissueRecoveryKey`,
-  `GetConfig`, `SetConfig`, `ImportGnomeKeyring`, `ExportToGnomeKeyring`,
-  `Backup`, `Restore`.
+- On the session bus only: bus name `io.aleph.Keyring`, object
+  `/io/aleph/Admin`.
+- Methods: `Status` (JSON: vault present, locked, untrusted reason,
+  whether MK is `mlock`ed, TPM usability, keyslots with stale marks),
+  `Lock`, `Unlock`, `Create`, `EnrollTpm`, `EnrollFido2`,
+  `RemoveKeyslot`, `RotateMaster`, `ReissueRecoveryKey`, `RetryKeyslot`,
+  `GetConfig`, `SetConfig`, and (Plan 4) `ImportGnomeKeyring`,
+  `ExportToGnomeKeyring`, `Backup`, `Restore`.
+- **Methods that need the user take a prompter:** one end of a
+  socketpair, passed as a Unix fd, speaking the prompter protocol. The
+  CLI answers it in the terminal, `aleph-gui` in its windows. The call
+  returns once the request is accepted; the outcome arrives on the
+  prompter as `Done`, so no call waits for the user or runs into a bus
+  reply timeout.
+- A keyslot change that would leave only the recovery slot is refused:
+  routine unlock would then be impossible.
 - **Fresh re-authentication through the prompter** is required for every
   method that changes keyslots, configuration, or data custody:
   `Enroll*`, `RemoveKeyslot`, `RotateMaster`, `ReissueRecoveryKey`,
   `SetConfig`, `Backup`, `Restore`, and `Export*`. Re-authentication means
   proving an enrolled method: a FIDO2 touch, or the login password
-  checked through a TPM unseal.
+  (checked with PAM, then through a TPM unseal or the login-password
+  slot).
 - **"Reveal" in the GUI** also re-authenticates. That is a UX guard, not
   security, because any same-user process can call `GetSecrets`. This is
   documented.
@@ -680,16 +749,23 @@ idle_timeout = 0         # seconds without secret access; 0 = disabled
 
 ### Prompter orchestration
 
-- `alephd` spawns `aleph-gui prompt` with one end of a socketpair and
-  exchanges newline-delimited JSON messages.
+- For Secret Service prompts, `alephd` spawns `<prompt.program> prompt`
+  (default `aleph-gui`) with one end of a socketpair as `ALEPH_PROMPT_FD`
+  and exchanges newline-delimited JSON messages (`aleph-prompt-proto`).
+  Admin methods use the caller's own prompter instead (above).
 - **What the prompt shows:** the requesting operation and, where
   available, the calling process's name and pid, from D-Bus
   `GetConnectionUnixProcessID`. This is advisory, since it can be spoofed.
-- **Where the prompt runs:** it runs only as a child of `alephd`. A window
-  claiming `aleph-prompt` that `alephd` did not spawn gets nothing, because
-  secrets only ever travel over the socketpair.
-- With no Wayland display, it falls back to a terminal prompt via
-  `aleph unlock`, in the style of `systemd-ask-password`.
+- **Where the prompt runs:** a Secret Service prompt runs only as a
+  child of `alephd`. A window claiming `aleph-prompt` that `alephd` did
+  not spawn gets nothing, because secrets only ever travel over a
+  socketpair, never in D-Bus message bodies.
+- With no Wayland display, Secret Service prompts wait (§4), and
+  `aleph unlock` unlocks in the terminal, in the style of
+  `systemd-ask-password`. With `ALEPH_NO_TTY=1` its answers are lines of
+  standard input (scripts, tests).
+- The prompter settings are `prompt.program` and `prompt.timeout`
+  (seconds before an unanswered prompt ends) in `config.toml`.
 
 ### Logging
 
@@ -709,6 +785,7 @@ aleph keyslot add tpm                      # TPM + login password
 aleph keyslot add fido2 [--touch-only]
 aleph keyslot remove <slot-id>             # rotates MK
 aleph keyslot rotate-master
+aleph keyslot retry <slot-id>              # try a stale slot again
 aleph recovery reissue                     # new recovery key; old one stops working
 aleph get attr=val…                        # secret-tool compatible semantics
 aleph search attr=val…
@@ -723,7 +800,8 @@ aleph restore [--from-bak | --accept-rollback] [<path>]
 ```
 
 - Global flags: `--json`. Shell completions are generated for bash, zsh,
-  and fish.
+  and fish (`aleph completions <shell>`). Keyslot ids may be given as a
+  unique prefix, as `aleph status` shows them.
 - **`aleph setup`** is an interactive wizard:
   1. TPM status (§5)
   2. unlock method: TPM + login password (the default when a TPM is
@@ -732,6 +810,9 @@ aleph restore [--from-bak | --accept-rollback] [<path>]
   4. the recovery key, shown once and confirmed
   5. live import from gnome-keyring
   6. system changes (sudo)
+
+  Plan 3 implements steps 1, 2, and 4 (creating the vault) and says that
+  the rest is not available yet; Plan 4 adds 3, 5, and 6.
 - **Import** reads every collection and item through the Secret Service
   API while gnome-keyring still owns the bus name. That covers everything
   shown in Seahorse's Passwords view.
@@ -910,15 +991,19 @@ aleph restore [--from-bak | --accept-rollback] [<path>]
   `draft-connolly-cfrg-xwing-kem-06`. Plan 1b either adopts it, if it
   matches the published test vectors, or implements the combiner directly
   over `ml-kem` and `x25519-dalek`, pinned by those known-answer tests.
-- **`oo7`/`oo7-daemon`:** check its maturity before Plan 3. It could host
-  the Secret Service server instead of writing one from scratch.
+
 - **Persistent SRK:** check how common `0x81000001` is on Omarchy installs
   where `systemd-cryptenroll --tpm2` has been used (systemd creates it),
   and how often `ownerAuth` is set. Together these decide how often the
   AES-128 fallback is used.
-- **Locked search:** verify how clients react to `IsLocked` (§4) before
-  Plan 3 fixes the behaviour.
 
 **Resolved:**
 - FIDO2 bindings: `fido2-rs` (Plan 2).
 - The Omarchy PAM stack: §6, verified on 2026-09-26.
+- Locked search (Plan 3): a placeholder in the `locked` list, prompts that
+  wait for an unlock, typed empty results on dismissal (§4), verified
+  against libsecret 0.21.7.
+- `oo7-daemon` (Plan 3): not adopted. The server is written directly on
+  `zbus`, because aleph's locked behaviour (encrypted names and
+  attributes, placeholder searches, waiting prompts) needs control over
+  search and prompts. `oo7-daemon` was not evaluated in depth.
