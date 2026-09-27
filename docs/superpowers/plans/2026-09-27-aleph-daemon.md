@@ -51,6 +51,14 @@ Every task was prototyped, then replayed from this document on a fresh clone of 
   - **A client's sessions and waiting prompts are freed when it disconnects** (`NameOwnerChanged`); waiting prompts are capped (8 per client, 128 in all) and a prompt starts once.
   - Minors: vault writes and `Status` run on blocking threads; Argon2 for rotation runs outside the state lock; `ItemCreated` comes from the collection's own path and a replacing `CreateItem` sends `ItemChanged`; `CollectionCreated`/`Deleted` are sent; `prompt.timeout` is capped at a day (a huge value made every conversation panic); `prompt.program` changes apply to the next prompt; prompter messages and DH secrets use zeroizing buffers; the CLI closes its sessions, refuses `get` without attributes, retries a search that raced a lock, and never matches an unknown slot's nil id; the spec documents libpam's `unix_chkpwd` fork and that item objects vanish while locked.
   - Deferred: the terminal prompter cannot skip one absent FIDO2 key during a rotation (Ctrl-C cancels the whole operation); the GUI prompter (Plan 5) offers "skip".
+- **A second review changed these** (each with a regression test and a teeth check; the first review's untested claims now have tests too):
+  - **Sessions outlive locks.** A real lock had closed every session, and libsecret keeps one session per process, so every long-lived client (nm-applet, Evolution, keytar) failed after each lock until restarted (confirmed with a Python `gi.Secret` client). Sessions hold only transport keys; they go on `Close`, disconnect, or exit (32 per client).
+  - **Reissue shows the new recovery key last**, after everything that can fail (KEK gathering, the last-method check): the user never writes down a key that was not installed.
+  - **Waiting prompts are answered only while unlocked** (a lock racing `unlocked()` had completed them with an empty, "not found" result).
+  - **TPM slots only ever see a PAM-accepted password**, also in rotations (a login-password slot's password may be outdated); rotation also tries TPM slots newest first with the one-rejection rule, and ties within a second go to the later-added slot.
+  - **Prompts are registered with their owner** and freed on disconnect (started or not), checked against a disconnect that raced their creation, and finish exactly once; while one unlock conversation runs, other unlock prompts wait for it instead of each opening a prompter.
+  - **Wrong FIDO2 PINs: 3 per conversation** (each spends one of the key's lifetime retries).
+  - The CLI reports a search that raced a lock as an error, not "not found"; the spec no longer says locking closes sessions.
 - **Not in this plan:** `pam_aleph` and `pam.sock`, lock policy enforcement (suspend, screen lock, idle), setup's system changes and revert, import/export, backup/restore (all Plan 4); the GUI prompter (Plan 5). **Plan 4 must** guard `pam_aleph`'s socket writes against SIGPIPE (it runs inside another process), and its re-seal of a stale TPM slot must use the *old* password without the PAM check (knowingly spending one attempt).
 
 ## Global Constraints
@@ -70,11 +78,11 @@ Every task was prototyped, then replayed from this document on a fresh clone of 
 
 ## Review Focus
 
-1. **A client asking for a secret while the vault is locked** (Chromium at startup, `secret-tool lookup`) must neither get a false "not found" nor fail: it must wait for an unlock (prompter, `aleph unlock`) and then get the secret, even if something locks again meanwhile; cancelling ends it cleanly. → Task 5 `a_locked_lookup_prompts_once_and_finds_the_secret`, `without_a_prompter_a_locked_lookup_waits_for_an_unlock_elsewhere`, `a_redundant_lock_does_not_strand_a_waiting_lookup`, `cancelling_the_prompt_ends_the_lookup_empty_handed`, `storing_while_locked_unlocks_first`.
+1. **A client asking for a secret while the vault is locked** (Chromium at startup, `secret-tool lookup`) must neither get a false "not found" nor fail: it must wait for an unlock (prompter, `aleph unlock`) and then get the secret, even if something locks again meanwhile; cancelling ends it cleanly. → Task 5 `a_locked_lookup_prompts_once_and_finds_the_secret`, `without_a_prompter_a_locked_lookup_waits_for_an_unlock_elsewhere`, `a_redundant_lock_does_not_strand_a_waiting_lookup`, `a_session_survives_lock_and_unlock`, `a_placeholder_query_is_captured_when_unlock_is_called`, `waiting_prompts_are_not_answered_while_locked`, `cancelling_the_prompt_ends_the_lookup_empty_handed`, `storing_while_locked_unlocks_first`.
 2. **Typing the login password wrong** (even repeatedly) must never reach the TPM, and must be slowed, with the wait shown. → Task 4 `typos_never_reach_the_tpm`, `too_many_typos_are_refused_with_a_wait`; Task 3 `pam_rejects_a_wrong_password`, `the_shipped_service_file_checks_passwords`.
-3. **A password changed outside aleph** must mark the TPM slots stale for one failed attempt in total, while refusals that say nothing about a slot (`Exhausted`, `RateLimited`, `Busy`) must not. → Task 4 `a_slot_that_rejects_the_current_password_goes_stale`, `stale_tpm_slots_cost_one_failure_and_rotation_skips_them`, `an_exhausted_tpm_does_not_make_the_slot_stale`.
+3. **A password changed outside aleph** must mark the TPM slots stale for one failed attempt in total, while refusals that say nothing about a slot (`Exhausted`, `RateLimited`, `Busy`) must not. → Task 4 `a_slot_that_rejects_the_current_password_goes_stale`, `stale_tpm_slots_cost_one_failure_and_rotation_skips_them`, `the_newest_tpm_slot_is_tried_first`, `a_rotation_offers_the_tpm_only_a_pam_accepted_password`, `an_exhausted_tpm_does_not_make_the_slot_stale`.
 4. **Removing a keyslot, rotating, or reissuing the recovery key while a key is absent or the TPM is busy** must not silently drop a slot, must stop on a transient TPM refusal, and must never leave only the recovery key. → Task 4 `removing_a_slot_rotates_and_drops_absent_keys_only_on_confirmation`, `a_busy_tpm_stops_a_rotation_instead_of_dropping_the_slot`, `reissue_never_leaves_only_the_recovery_key`, `the_last_unlock_method_cannot_be_removed`, `the_last_recovery_slot_cannot_be_removed`.
-5. **A slow, silent, or exhausted prompter, a long FIDO2 wait, or many clients** must not stall other callers or grow without bound: reads and `Status` answer at once, conversations end, sessions and waiting prompts are freed. → Task 4 `reads_do_not_wait_for_a_prompt`, `status_does_not_wait_while_a_key_is_awaited`, `too_many_typos_are_refused_with_a_wait`; Task 5 `sessions_are_freed_when_their_client_leaves`, `waiting_prompts_are_capped_and_dropped_with_their_client`; Task 7 `end_of_input_cancels_instead_of_looping`.
+5. **A slow, silent, or exhausted prompter, a long FIDO2 wait, or many clients** must not stall other callers or grow without bound: reads and `Status` answer at once, conversations end, sessions and waiting prompts are freed. → Task 4 `reads_do_not_wait_for_a_prompt`, `status_does_not_wait_while_a_key_is_awaited`, `too_many_typos_are_refused_with_a_wait`; Task 5 `sessions_are_freed_when_their_client_leaves`, `waiting_prompts_are_capped_and_dropped_with_their_client`, `a_prompt_runs_once`; Task 4 `wrong_pins_end_the_conversation_after_three`; Task 7 `end_of_input_cancels_instead_of_looping`.
 
 ## File Structure
 
@@ -540,8 +548,8 @@ Expected (one entry per test binary, in cargo's order): ok. 59 passed | ok. 1 pa
 
 Make each change below, run its test and see it FAIL (a hang counts: stop it after a few minutes), then undo the change, `touch` the file, and see the test pass again:
 
-- **retry_after counts down** (`crates/aleph-tpmd/src/limiter.rs`): replace `window.saturating_sub(now.duration_since(f[0]))` with `Duration::ZERO`. Test: `cargo test -p aleph-tpmd --lib retry_after_counts_down`.
-- **present finds the slot's key** (`crates/aleph-unlock/src/fido2/mod.rs`): replace `Ok(true) => return Ok(true),` with `Ok(true) => {}`. Test: `cargo test -p aleph-unlock --test fido2 present_finds`.
+- **retry_after counts down** (`crates/aleph-tpmd/src/limiter.rs`), test `cargo test -p aleph-tpmd --lib retry_after_counts_down`: replace `window.saturating_sub(now.duration_since(f[0]))` with `Duration::ZERO`.
+- **present finds the slot's key** (`crates/aleph-unlock/src/fido2/mod.rs`), test `cargo test -p aleph-unlock --test fido2 present_finds`: replace `Ok(true) => return Ok(true),` with `Ok(true) => {}`.
 
 - [ ] **Step 6: Commit**
 
@@ -2266,7 +2274,7 @@ Expected (one entry per test binary, in cargo's order): ok. 14 passed.
 
 Make each change below, run its test and see it FAIL (a hang counts: stop it after a few minutes), then undo the change, `touch` the file, and see the test pass again:
 
-- **missing PAM service is not a wrong password** (`crates/aleph-daemon/src/password.rs`): replace `if !dir.join(PAM_SERVICE).exists() {` with `if false {`. Test: `cargo test -p aleph-daemon --lib a_missing_service_is_unavailable`.
+- **missing PAM service is not a wrong password** (`crates/aleph-daemon/src/password.rs`), test `cargo test -p aleph-daemon --lib a_missing_service_is_unavailable`: replace `if !dir.join(PAM_SERVICE).exists() {` with `if false {`.
 
 - [ ] **Step 6: Commit**
 
@@ -2586,7 +2594,10 @@ fn an_exhausted_tpm_does_not_make_the_slot_stale() {
     let p = Interactive::new(vec![password(PW)]);
     assert!(k.unlock(&mut p.channel(), None).is_err());
     let errors = asks(&p.sent());
-    assert_eq!(errors[1].1, Some(600), "{errors:?}");
+    assert!(
+        errors.iter().any(|(_, wait)| *wait == Some(600)),
+        "{errors:?}"
+    );
     assert!(!k.status().unwrap().keyslots.iter().any(|s| s.stale));
 }
 
@@ -2607,7 +2618,7 @@ fn a_fido2_keyring_unlocks_with_the_pin_and_retries_a_wrong_one() {
             _ => None,
         })
         .collect();
-    assert_eq!(pins, [None, Some("wrong PIN".into())]);
+    assert_eq!(pins, [None, Some("wrong PIN (2 more tries here)".into())]);
     assert!(
         p.sent()
             .iter()
@@ -2884,10 +2895,14 @@ fn a_busy_tpm_stops_a_rotation_instead_of_dropping_the_slot() {
         Err(Error::Unlock(aleph_unlock::Error::TpmBusy))
     ));
     assert_eq!(k.status().unwrap().keyslots, before);
+    let sent = p.sent();
+    assert!(!sent.iter().any(|m| matches!(m, ToPrompter::Confirm { .. })));
+    // Review I-B: the new recovery key is never shown for a reissue that
+    // then fails.
     assert!(
-        !p.sent()
+        !sent
             .iter()
-            .any(|m| matches!(m, ToPrompter::Confirm { .. }))
+            .any(|m| matches!(m, ToPrompter::ShowRecoveryKey { .. }))
     );
 }
 
@@ -3067,6 +3082,100 @@ fn a_tpm_slot_is_sealed_only_with_the_current_login_password() {
         Err(Error::Invalid(_))
     ));
     assert_eq!(k.status().unwrap().keyslots.len(), 2);
+}
+
+/// Review minors 3 and 4: TPM slots are tried newest first, and within
+/// one second the later-added slot counts as newer: the current slot opens
+/// the vault without spending an attempt on the outdated one.
+#[test]
+fn the_newest_tpm_slot_is_tried_first() {
+    let env = env();
+    let login = Accepting::new(PW);
+    let k = keyring_with(
+        &env,
+        Box::new(TpmClient::new(env.socket.clone())),
+        MockKeys::one(MockAuthenticator::with_pin(PIN)),
+        Box::new(login.clone()),
+    );
+    create_with_password(&k);
+    k.enroll_fido2(
+        &mut Interactive::new(vec![password(PW), pin(PIN)]).channel(),
+        false,
+    )
+    .unwrap();
+    // The password changes; a new TPM slot is sealed with it (same second).
+    login.set("new");
+    let p = Interactive::new(vec![FromPrompter::Fido2 {}, pin(PIN), password("new")]);
+    k.enroll_tpm(&mut p.channel()).unwrap();
+    k.lock();
+    k.unlock(&mut Interactive::new(vec![password("new")]).channel(), None)
+        .unwrap();
+    assert_eq!(env.sw.tpm().status().unwrap().failed_tries, 0);
+    assert!(!k.status().unwrap().keyslots.iter().any(|s| s.stale));
+}
+
+/// Review minor 2: a rotation never offers the TPM a password PAM has not
+/// accepted (here PAM cannot check at all, so it stops instead).
+#[test]
+fn a_rotation_offers_the_tpm_only_a_pam_accepted_password() {
+    let env = env();
+    let k = keyring_with(
+        &env,
+        Box::new(NoTpm),
+        MockKeys::default(),
+        Box::new(Fixed(|p| p == PW)),
+    );
+    create_with_password(&k);
+    drop(k);
+    let k = keyring(&env, MockKeys::default());
+    k.unlock(&mut Interactive::new(vec![password(PW)]).channel(), None)
+        .unwrap();
+    k.enroll_tpm(&mut Interactive::new(vec![password(PW)]).channel())
+        .unwrap();
+    drop(k);
+    let k = keyring_with(
+        &env,
+        Box::new(TpmClient::new(env.socket.clone())),
+        MockKeys::default(),
+        Box::new(Unavailable),
+    );
+    k.unlock(&mut Interactive::new(vec![password(PW)]).channel(), None)
+        .unwrap();
+    let before = k.status().unwrap().keyslots;
+    let p = Interactive::new(vec![password(PW)]);
+    assert!(matches!(
+        k.rotate_master(&mut p.channel()),
+        Err(Error::PasswordCheckUnavailable)
+    ));
+    assert_eq!(k.status().unwrap().keyslots, before);
+}
+
+/// Review minor 10: wrong FIDO2 PINs have a small budget per conversation,
+/// so typos cannot burn the key's lifetime PIN retries.
+#[test]
+fn wrong_pins_end_the_conversation_after_three() {
+    let env = env();
+    let k = keyring(&env, MockKeys::one(MockAuthenticator::with_pin(PIN)));
+    k.create(
+        &mut Interactive::new(vec![pin(PIN)]).channel(),
+        Method::Fido2,
+    )
+    .unwrap();
+    k.lock();
+    let p = Interactive::new(vec![
+        FromPrompter::Fido2 {},
+        pin("000000"),
+        pin("000000"),
+        pin("000000"),
+        pin(PIN),
+    ]);
+    assert!(k.unlock(&mut p.channel(), None).is_err());
+    let asked = p
+        .sent()
+        .iter()
+        .filter(|m| matches!(m, ToPrompter::Fido2Pin { .. }))
+        .count();
+    assert_eq!(asked, 3);
 }
 
 #[test]
@@ -3463,6 +3572,9 @@ pub struct Status {
 
 /// Answers a conversation accepts before giving up.
 const MAX_ATTEMPTS: usize = 10;
+/// Wrong FIDO2 PINs a conversation accepts (as CTAP allows per power
+/// cycle); every wrong PIN spends one of the key's lifetime retries.
+const PIN_ATTEMPTS: usize = 3;
 
 /// KEKs gathered for a rotation, by slot.
 type Keks = Vec<(Uuid, Kek)>;
@@ -3470,8 +3582,12 @@ type Keks = Vec<(Uuid, Kek)>;
 /// What a successful re-authentication proved, kept only for the
 /// operation that asked for it.
 pub struct Proof {
-    /// The (PAM-checked) login password, if that was the method.
+    /// The password that opened the vault, if that was the method (it may
+    /// be outdated if it opened a login-password slot without PAM).
     password: Option<Zeroizing<String>>,
+    /// The current login password (PAM accepted it): the only one ever
+    /// offered to the TPM.
+    login: Option<Zeroizing<String>>,
     /// The FIDO2 slot touched, and its KEK.
     fido2: Option<(Uuid, Kek)>,
 }
@@ -3785,8 +3901,10 @@ impl Keyring {
             // likely sealed with the current password. Once one rejects it,
             // the older ones are stale too; they are marked without
             // spending more of the TPM's dictionary-attack budget.
-            let mut tpm_slots = tpm_slots;
-            tpm_slots.sort_by_key(|k| std::cmp::Reverse(k.created));
+            // (Ties, within a second: the later-added slot is newer.)
+            let mut tpm_slots: Vec<(usize, &Keyslot)> = tpm_slots.into_iter().enumerate().collect();
+            tpm_slots.sort_by_key(|(i, k)| std::cmp::Reverse((k.created, *i)));
+            let tpm_slots: Vec<&Keyslot> = tpm_slots.into_iter().map(|(_, k)| k).collect();
             for (i, k) in tpm_slots.iter().enumerate() {
                 let SlotKind::Tpm(slot) = &k.kind else {
                     unreachable!()
@@ -3862,6 +3980,7 @@ impl Keyring {
             .join(" or ");
         let (id, label, slot) = self.wait_for_key(chan, &mut hw, &slots, &names)?;
         let mut error = None;
+        let mut wrong_pins = 0;
         loop {
             let pin = if slot.pin_required {
                 match chan.ask(&ToPrompter::Fido2Pin {
@@ -3884,7 +4003,14 @@ impl Keyring {
                     });
                 }
                 Err(aleph_unlock::Error::Fido2PinInvalid) if slot.pin_required => {
-                    error = Some("wrong PIN".into());
+                    wrong_pins += 1;
+                    if wrong_pins >= PIN_ATTEMPTS {
+                        return Err(aleph_unlock::Error::Fido2PinInvalid.into());
+                    }
+                    error = Some(format!(
+                        "wrong PIN ({} more tries here)",
+                        PIN_ATTEMPTS - wrong_pins
+                    ));
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -3983,7 +4109,11 @@ impl Keyring {
                         (None, Some(kek)) => Some((opened.slot, kek)),
                         _ => None,
                     };
-                    return Ok(Proof { password, fido2 });
+                    return Ok(Proof {
+                        password,
+                        login: None,
+                        fido2,
+                    });
                 }
                 Err(e @ (Error::Cancelled | Error::Prompt(_) | Error::TooManyAttempts { .. })) => {
                     return Err(e);
@@ -4061,19 +4191,31 @@ impl Keyring {
                 &mk_id,
             )
         };
+        // TPM slots newest first (ties: the later-added), after the rest.
+        let (tpm, rest): (Vec<_>, Vec<_>) = slots
+            .iter()
+            .enumerate()
+            .partition(|(_, k)| matches!(k.kind, SlotKind::Tpm(_)));
+        let mut tpm = tpm;
+        tpm.sort_by_key(|(i, k)| std::cmp::Reverse((k.created, *i)));
+        let ordered: Vec<&Keyslot> = rest.into_iter().chain(tpm).map(|(_, k)| k).collect();
+        // Once one TPM slot rejects the current password, the older ones
+        // are stale too: mark them without trying.
+        let mut tpm_rejected = false;
         let mut keks = Vec::new();
         // Slots that cannot be re-wrapped, and why.
         let mut missing: Vec<(Uuid, String, &str)> = Vec::new();
-        for k in &slots {
+        for k in ordered {
             match &k.kind {
                 SlotKind::Recovery(_) => {}
                 // A stale slot is not tried again (it would spend one of the
                 // TPM's dictionary-attack attempts to fail).
-                SlotKind::Tpm(_) if lock(&self.inner).state.is_stale(k.id) => {
+                SlotKind::Tpm(_) if tpm_rejected || lock(&self.inner).state.is_stale(k.id) => {
+                    lock(&self.inner).state.mark_stale(k.id)?;
                     missing.push((k.id, k.label.clone(), "stale"));
                 }
                 SlotKind::Tpm(slot) => {
-                    let password = self.proof_password(chan, proof)?;
+                    let password = self.tpm_password(chan, proof)?;
                     match lock(&self.hw).tpm.unseal(slot, password.as_bytes()) {
                         Ok(kek) if proves(k, &kek) => keks.push((k.id, kek)),
                         Ok(_) => missing.push((k.id, k.label.clone(), "does not open the vault")),
@@ -4081,6 +4223,7 @@ impl Keyring {
                             aleph_unlock::Error::TpmAuthFailed | aleph_unlock::Error::TpmWrongUser,
                         ) => {
                             lock(&self.inner).state.mark_stale(k.id)?;
+                            tpm_rejected = true;
                             missing.push((k.id, k.label.clone(), "rejects your password"));
                         }
                         // Busy, rate-limited, exhausted, unreachable: says
@@ -4148,6 +4291,24 @@ impl Keyring {
             .filter(|k| !drops.contains(&k.id))
             .any(|k| !matches!(k.kind, SlotKind::Recovery(_)));
         if left { Ok(()) } else { Err(Error::LastMethod) }
+    }
+
+    /// The password to offer TPM slots: one PAM accepts, never merely the
+    /// one that opened the vault (it may be outdated, and each TPM
+    /// rejection spends one of the TPM's dictionary-attack attempts).
+    fn tpm_password<'a>(&self, chan: &mut Channel, proof: &'a mut Proof) -> Result<&'a str> {
+        if proof.login.is_none() {
+            let accepted = match &proof.password {
+                Some(pw) => lock(&self.hw).password.check(pw)?,
+                None => false,
+            };
+            proof.login = Some(if accepted {
+                proof.password.clone().expect("checked above")
+            } else {
+                self.ask_password(chan)?
+            });
+        }
+        Ok(proof.login.as_deref().expect("just set"))
     }
 
     fn proof_password<'a>(&self, chan: &mut Channel, proof: &'a mut Proof) -> Result<&'a str> {
@@ -4245,6 +4406,7 @@ impl Keyring {
         };
         let mut pin: Option<Secret> = None;
         let mut error = None;
+        let mut wrong_pins = 0;
         loop {
             if let Some(e) = error.take() {
                 pin = match chan.ask(&ToPrompter::Fido2Pin {
@@ -4263,7 +4425,16 @@ impl Keyring {
                 Err(aleph_unlock::Error::Fido2PinRequired) => {
                     error = Some("enter the key's PIN".into())
                 }
-                Err(aleph_unlock::Error::Fido2PinInvalid) => error = Some("wrong PIN".into()),
+                Err(aleph_unlock::Error::Fido2PinInvalid) => {
+                    wrong_pins += 1;
+                    if wrong_pins >= PIN_ATTEMPTS {
+                        return Err(aleph_unlock::Error::Fido2PinInvalid.into());
+                    }
+                    error = Some(format!(
+                        "wrong PIN ({} more tries here)",
+                        PIN_ATTEMPTS - wrong_pins
+                    ));
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -4357,10 +4528,12 @@ impl Keyring {
                     .map(|k| k.id)
                     .collect()
             };
-            let key = RecoveryKey::generate()?;
-            show_recovery_key(chan, &key)?;
+            // Everything that can fail comes before the new key is shown:
+            // the user must never write down a key that was not installed.
             let (keks, drops) = self.rotation_keks(chan, &mut proof, &old)?;
             self.keeps_a_method(&drops)?;
+            let key = RecoveryKey::generate()?;
+            show_recovery_key(chan, &key)?;
             let refs: Vec<(Uuid, &Kek)> = keks.iter().map(|(id, k)| (*id, k)).collect();
             self.modify_vault(|v| {
                 v.add_recovery_slot("recovery", &key.recipient().public_key())?;
@@ -4810,65 +4983,168 @@ impl Launcher for InteractiveLauncher {
 - [ ] **Step 4: Run the tests, clippy, and fmt**
 
 Run: `cargo test -q -p aleph-daemon && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
-Expected (one entry per test binary, in cargo's order): ok. 18 passed | ok. 21 passed.
+Expected (one entry per test binary, in cargo's order): ok. 18 passed | ok. 24 passed.
 
 - [ ] **Step 5: Confirm the tests have teeth**
 
 Make each change below, run its test and see it FAIL (a hang counts: stop it after a few minutes), then undo the change, `touch` the file, and see the test pass again:
 
-- **PAM check before the TPM** (`crates/aleph-daemon/src/keyring.rs`): replace `Ok(false) => {
-                    lock(&self.inner).typed.record_failure(now);
-                    return Err(Error::WrongPassword);
-                }` with `Ok(false) => {}`. Test: `cargo test -p aleph-daemon --test keyring typos_never_reach_the_tpm`.
-- **typed attempts limited** (`crates/aleph-daemon/src/keyring.rs`): replace `if typed && let Some(wait) = inner.typed.blocked(now) {` with `if false && typed && let Some(wait) = inner.typed.blocked(now) {`. Test: `cargo test -p aleph-daemon --test keyring too_many_typos`.
-- **only AuthFailed/WrongUser mark stale** (`crates/aleph-daemon/src/keyring.rs`): replace `Err(aleph_unlock::Error::TpmAuthFailed | aleph_unlock::Error::TpmWrongUser) => {` with `Err(_) => {`. Test: `cargo test -p aleph-daemon --test keyring an_exhausted_tpm_does_not_make_the_slot_stale`.
-- **a rejecting slot is marked stale** (`crates/aleph-daemon/src/keyring.rs`): replace `inner.state.mark_stale(older.id)?;` with `let _ = older;`. Test: `cargo test -p aleph-daemon --test keyring a_slot_that_rejects_the_current_password`.
-- **stale slots are not offered** (`crates/aleph-daemon/src/keyring.rs`): replace `SlotKind::Tpm(_) if !inner.state.is_stale(k.id) => password = true,` with `SlotKind::Tpm(_) => password = true,`. Test: `cargo test -p aleph-daemon --test keyring a_slot_that_rejects_the_current_password`.
-- **absent slots dropped only on confirmation** (`crates/aleph-daemon/src/keyring.rs`): replace `if reply != (FromPrompter::Confirm { yes: true }) {` with `if false {`. Test: `cargo test -p aleph-daemon --test keyring removing_a_slot_rotates`.
-- **the last unlock method stays** (`crates/aleph-daemon/src/keyring.rs`): replace `self.keeps_a_method(drop)?;` with `(nothing)`; replace `let (keks, drops) = self.rotation_keks(chan, proof, drop)?;
-        self.keeps_a_method(&drops)?;` with `let (keks, drops) = self.rotation_keks(chan, proof, drop)?;`. Test: `cargo test -p aleph-daemon --test keyring the_last_unlock_method`.
-- **a failed write restores the body** (`crates/aleph-daemon/src/keyring.rs`): replace `*vault.body_mut() = snapshot;` with `let _ = snapshot;`. Test: `cargo test -p aleph-daemon --test keyring a_failed_write_restores_the_body`.
-- **an untrusted file refuses writes** (`crates/aleph-daemon/src/keyring.rs`): replace `if let Some(reason) = untrusted {` with `if let Some(reason) = untrusted.filter(|_| false) {`. Test: `cargo test -p aleph-daemon --test keyring a_rolled_back_file_is_read_only`.
-- **status never waits for the hardware** (`crates/aleph-daemon/src/keyring.rs`): replace `let tpm = self.hw.try_lock().ok().map(|hw| hw.tpm.usable());` with `let tpm = Some(lock(&self.hw).tpm.usable());`. Test: `cargo test -p aleph-daemon --test keyring status_does_not_wait`.
-- **recovery confirmation checked** (`crates/aleph-daemon/src/keyring.rs`): replace `if normalize(typed[0].expose()) == groups[check[0] - 1]` with `if true || normalize(typed[0].expose()) == groups[check[0] - 1]`. Test: `cargo test -p aleph-daemon --lib a_wrong_recovery_confirmation`.
-- **reissue keeps an unlock method** (`crates/aleph-daemon/src/keyring.rs`): replace `show_recovery_key(chan, &key)?;
-            let (keks, drops) = self.rotation_keks(chan, &mut proof, &old)?;
-            self.keeps_a_method(&drops)?;` with `show_recovery_key(chan, &key)?;
-            let (keks, drops) = self.rotation_keks(chan, &mut proof, &old)?;`. Test: `cargo test -p aleph-daemon --test keyring reissue_never_leaves_only_the_recovery_key`.
-- **a busy TPM stops a rotation** (`crates/aleph-daemon/src/keyring.rs`): replace `// nothing about the slot. Stop rather than offer to
-                        // drop a slot that works.
-                        Err(e) => return Err(e.into()),` with `Err(_) => missing.push((k.id, k.label.clone(), "unavailable")),`. Test: `cargo test -p aleph-daemon --test keyring a_busy_tpm_stops_a_rotation`.
-- **TooManyAttempts ends the conversation** (`crates/aleph-daemon/src/keyring.rs`): replace `Err(e @ (Error::Cancelled | Error::Prompt(_) | Error::TooManyAttempts { .. })) => {
-                    return Err(e);
-                }
-                Err(e) => {
-                    retry_after = retry_after_of(&e);
-                    error = Some(e.to_string());
-                }
-            }
-        }
-        Err(Error::Invalid("too many attempts".into()))
-    }
+- **PAM check before the TPM** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test keyring typos_never_reach_the_tpm`:
 
-    /// Try `password`` with `Err(e @ (Error::Cancelled | Error::Prompt(_))) => {
-                    return Err(e);
-                }
-                Err(e) => {
-                    retry_after = retry_after_of(&e);
-                    error = Some(e.to_string());
-                }
-            }
-        }
-        Err(Error::Invalid("too many attempts".into()))
-    }
+  replace
 
-    /// Try `password``. Test: `cargo test -p aleph-daemon --test keyring too_many_typos`.
-- **one failed attempt for stale TPM slots** (`crates/aleph-daemon/src/keyring.rs`): replace `last = Some(Error::Stale(k.label.clone()));
-                        break;` with `last = Some(Error::Stale(k.label.clone()));`. Test: `cargo test -p aleph-daemon --test keyring stale_tpm_slots_cost_one_failure`.
-- **rotation skips stale TPM slots** (`crates/aleph-daemon/src/keyring.rs`): replace `SlotKind::Tpm(_) if lock(&self.inner).state.is_stale(k.id) =>` with `SlotKind::Tpm(_) if false =>`. Test: `cargo test -p aleph-daemon --test keyring stale_tpm_slots_cost_one_failure`.
-- **without PAM, login-password slots still work** (`crates/aleph-daemon/src/keyring.rs`): replace `use_tpm = false;
-                    last = Some(e);` with `return Err(e);`. Test: `cargo test -p aleph-daemon --test keyring without_pam_a_login_password_slot`.
-- **TPM sealed only with the current login password** (`crates/aleph-daemon/src/keyring.rs`): replace `if !hw.password.check(&password)? {` with `if false {`. Test: `cargo test -p aleph-daemon --test keyring a_tpm_slot_is_sealed_only_with_the_current`.
+  ```rust
+  Ok(false) => {
+      lock(&self.inner).typed.record_failure(now);
+      return Err(Error::WrongPassword);
+  }
+  ```
+
+  with
+
+  ```rust
+  Ok(false) => {}
+  ```
+
+- **typed attempts limited** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test keyring too_many_typos`: replace `if typed && let Some(wait) = inner.typed.blocked(now) {` with `if false && typed && let Some(wait) = inner.typed.blocked(now) {`.
+- **only AuthFailed/WrongUser mark stale** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test keyring an_exhausted_tpm_does_not_make_the_slot_stale`:
+
+  replace
+
+  ```rust
+  // password it was sealed with is not this one.
+  Err(aleph_unlock::Error::TpmAuthFailed | aleph_unlock::Error::TpmWrongUser) => {
+  ```
+
+  with
+
+  ```rust
+  // password it was sealed with is not this one.
+  Err(_) => {
+  ```
+
+- **a rejecting slot is marked stale** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test keyring a_slot_that_rejects_the_current_password`: replace `inner.state.mark_stale(older.id)?;` with `let _ = older;`.
+- **stale slots are not offered** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test keyring a_slot_that_rejects_the_current_password`: replace `SlotKind::Tpm(_) if !inner.state.is_stale(k.id) => password = true,` with `SlotKind::Tpm(_) => password = true,`.
+- **absent slots dropped only on confirmation** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test keyring removing_a_slot_rotates`: replace `if reply != (FromPrompter::Confirm { yes: true }) {` with `if false {`.
+- **the last unlock method stays** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test keyring the_last_unlock_method`: replace `self.keeps_a_method(drop)?;` with `(nothing)`.
+
+  replace
+
+  ```rust
+  let (keks, drops) = self.rotation_keks(chan, proof, drop)?;
+  self.keeps_a_method(&drops)?;
+  ```
+
+  with
+
+  ```rust
+  let (keks, drops) = self.rotation_keks(chan, proof, drop)?;
+  ```
+
+- **a failed write restores the body** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test keyring a_failed_write_restores_the_body`: replace `*vault.body_mut() = snapshot;` with `let _ = snapshot;`.
+- **an untrusted file refuses writes** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test keyring a_rolled_back_file_is_read_only`: replace `if let Some(reason) = untrusted {` with `if let Some(reason) = untrusted.filter(|_| false) {`.
+- **status never waits for the hardware** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test keyring status_does_not_wait`: replace `let tpm = self.hw.try_lock().ok().map(|hw| hw.tpm.usable());` with `let tpm = Some(lock(&self.hw).tpm.usable());`.
+- **recovery confirmation checked** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --lib a_wrong_recovery_confirmation`: replace `if normalize(typed[0].expose()) == groups[check[0] - 1]` with `if true || normalize(typed[0].expose()) == groups[check[0] - 1]`.
+- **the new recovery key is shown last** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test keyring a_busy_tpm_stops_a_rotation`: replace `let (keks, drops) = self.rotation_keks(chan, &mut proof, &old)?;` with `show_recovery_key(chan, &RecoveryKey::generate()?)?;
+            let (keks, drops) = self.rotation_keks(chan, &mut proof, &old)?;`.
+- **newest TPM slot first, ties to the later-added** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test keyring the_newest_tpm_slot_is_tried_first`: replace `tpm_slots.sort_by_key(|(i, k)| std::cmp::Reverse((k.created, *i)));` with `tpm_slots.sort_by_key(|(_, k)| std::cmp::Reverse(k.created));`.
+- **TPM offered only a PAM-accepted password** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test keyring a_rotation_offers_the_tpm_only`: replace `Some(pw) => lock(&self.hw).password.check(pw)?,` with `Some(_) => true,`.
+- **wrong PINs capped per conversation** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test keyring wrong_pins_end_the_conversation`:
+
+  replace
+
+  ```rust
+  Err(aleph_unlock::Error::Fido2PinInvalid) if slot.pin_required => {
+  wrong_pins += 1;
+  if wrong_pins >= PIN_ATTEMPTS {
+  ```
+
+  with
+
+  ```rust
+  Err(aleph_unlock::Error::Fido2PinInvalid) if slot.pin_required => {
+  wrong_pins += 1;
+  if false {
+  ```
+
+- **reissue keeps an unlock method** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test keyring reissue_never_leaves_only_the_recovery_key`:
+
+  replace
+
+  ```rust
+  let (keks, drops) = self.rotation_keks(chan, &mut proof, &old)?;
+  self.keeps_a_method(&drops)?;
+  ```
+
+  with
+
+  ```rust
+  let (keks, drops) = self.rotation_keks(chan, &mut proof, &old)?;
+  ```
+
+- **a busy TPM stops a rotation** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test keyring a_busy_tpm_stops_a_rotation`:
+
+  replace
+
+  ```rust
+  // drop a slot that works.
+  Err(e) => return Err(e.into())
+  ```
+
+  with
+
+  ```rust
+  // drop a slot that works.
+  Err(_) => missing.push((k.id, k.label.clone(), "unavailable"))
+  ```
+
+- **TooManyAttempts ends the conversation** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test keyring too_many_typos`:
+
+  replace
+
+  ```rust
+  // Waiting is not something to retry at once.
+  Err(e @ (Error::Cancelled | Error::Prompt(_) | Error::TooManyAttempts { .. })) => {
+  ```
+
+  with
+
+  ```rust
+  Err(e @ (Error::Cancelled | Error::Prompt(_))) => {
+  ```
+
+- **one failed attempt for stale TPM slots** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test keyring stale_tpm_slots_cost_one_failure`:
+
+  replace
+
+  ```rust
+  last = Some(Error::Stale(k.label.clone()));
+  break;
+  ```
+
+  with
+
+  ```rust
+  last = Some(Error::Stale(k.label.clone()));
+  ```
+
+- **rotation skips stale TPM slots** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test keyring stale_tpm_slots_cost_one_failure`: replace `SlotKind::Tpm(_) if tpm_rejected || lock(&self.inner).state.is_stale(k.id) =>` with `SlotKind::Tpm(_) if tpm_rejected =>`.
+- **without PAM, login-password slots still work** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test keyring without_pam_a_login_password_slot`:
+
+  replace
+
+  ```rust
+  use_tpm = false;
+  last = Some(e);
+  ```
+
+  with
+
+  ```rust
+  return Err(e);
+  ```
+
+- **TPM sealed only with the current login password** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test keyring a_tpm_slot_is_sealed_only_with_the_current`: replace `if !hw.password.check(&password)? {` with `if false {`.
 
 - [ ] **Step 6: Commit**
 
@@ -4881,7 +5157,7 @@ git commit -m "feat(daemon): prompter channel and keyring engine" -m "Co-Authore
 
 **Interfaces:**
 - Consumes: Task 4.
-- Produces: `secret::session::{{Session, SessionError, PLAIN, DH}}`; `secret::service::{{SecretService {{ new, serve, sync, lock, unlocked, modify, forget_client, session_count, waiting_count }}, collection_path, item_path, alias_path, SERVICE_PATH, SecretError}}`; `testing::{{Bus, bus()}}`
+- Produces: `secret::session::{{Session, SessionError, PLAIN, DH}}`; `secret::service::{{SecretService {{ new, serve, sync, lock (keeps sessions), unlocked, modify, forget_client, session_count, waiting_count }}, collection_path, item_path, alias_path, SERVICE_PATH, SecretError}}`; `testing::{{Bus, bus()}}`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -5379,6 +5655,189 @@ async fn waiting_prompts_are_capped_and_dropped_with_their_client() {
         s.svc.waiting_count()
     );
 }
+
+use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
+
+async fn client(s: &Served) -> zbus::Connection {
+    zbus::connection::Builder::address(s.address.as_str())
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+}
+
+async fn service(c: &zbus::Connection) -> zbus::Proxy<'static> {
+    zbus::Proxy::new(
+        c,
+        "org.freedesktop.secrets",
+        "/org/freedesktop/secrets",
+        "org.freedesktop.Secret.Service",
+    )
+    .await
+    .unwrap()
+}
+
+async fn unlock_elsewhere(s: &Served) {
+    let keyring = s.svc.keyring.clone();
+    tokio::task::spawn_blocking(move || {
+        keyring.unlock(&mut Interactive::new(vec![password(PW)]).channel(), None)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    s.svc.unlocked().await.unwrap();
+}
+
+/// Review I-A: a lock keeps sessions, so a long-lived client (libsecret
+/// keeps one session per process) still reads secrets after lock and
+/// unlock.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_survives_lock_and_unlock() {
+    let s = served(vec![]).await;
+    secret_tool(&s, &["store", "--label=T", "service", "x"], Some("pw")).await;
+    let c = client(&s).await;
+    let svc = service(&c).await;
+    let (_, session): (OwnedValue, OwnedObjectPath) = svc
+        .call("OpenSession", &("plain", zbus::zvariant::Value::from("")))
+        .await
+        .unwrap();
+    s.svc.lock().await.unwrap();
+    unlock_elsewhere(&s).await;
+    let attrs: std::collections::HashMap<&str, &str> = [("service", "x")].into();
+    let (found, _): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) =
+        svc.call("SearchItems", &(attrs,)).await.unwrap();
+    let item = zbus::Proxy::new(
+        &c,
+        "org.freedesktop.secrets",
+        found[0].clone(),
+        "org.freedesktop.Secret.Item",
+    )
+    .await
+    .unwrap();
+    let (secret,): ((OwnedObjectPath, Vec<u8>, Vec<u8>, String),) =
+        item.call("GetSecret", &(session,)).await.unwrap();
+    assert_eq!(secret.2, b"pw");
+}
+
+/// Review minor 1: `unlocked()` while (again) locked answers nobody with
+/// an empty result: waiting prompts keep waiting.
+#[tokio::test(flavor = "multi_thread")]
+async fn waiting_prompts_are_not_answered_while_locked() {
+    let s = served(vec![]).await;
+    s.svc.lock().await.unwrap();
+    let c = client(&s).await;
+    let (_, prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) = service(&c)
+        .await
+        .call(
+            "Unlock",
+            &(vec![
+                ObjectPath::try_from("/org/freedesktop/secrets/aliases/default").unwrap(),
+            ],),
+        )
+        .await
+        .unwrap();
+    let p = zbus::Proxy::new(
+        &c,
+        "org.freedesktop.secrets",
+        prompt,
+        "org.freedesktop.Secret.Prompt",
+    )
+    .await
+    .unwrap();
+    p.call_method("Prompt", &("",)).await.unwrap();
+    assert!(wait_until(|| s.svc.waiting_count() == 1).await);
+    s.svc.unlocked().await.unwrap();
+    assert_eq!(s.svc.waiting_count(), 1);
+}
+
+/// Review I1 (captured query): the answer to a locked search survives its
+/// placeholder being evicted between `Unlock` and the prompt; an unknown
+/// search path is never echoed back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_placeholder_query_is_captured_when_unlock_is_called() {
+    use futures_util::StreamExt;
+    let s = served(vec![vec![password(PW)]]).await;
+    secret_tool(&s, &["store", "--label=T", "service", "x"], Some("pw")).await;
+    s.svc.lock().await.unwrap();
+    let c = client(&s).await;
+    let svc = service(&c).await;
+    let attrs: std::collections::HashMap<&str, &str> = [("service", "x")].into();
+    let (_, locked): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) =
+        svc.call("SearchItems", &(attrs.clone(),)).await.unwrap();
+    let (_, prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) =
+        svc.call("Unlock", &(locked,)).await.unwrap();
+    // Evict the placeholder (more than 256 newer searches).
+    let other: std::collections::HashMap<&str, &str> = [("service", "y")].into();
+    for _ in 0..260 {
+        let _: (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) =
+            svc.call("SearchItems", &(other.clone(),)).await.unwrap();
+    }
+    let p = zbus::Proxy::new(
+        &c,
+        "org.freedesktop.secrets",
+        prompt,
+        "org.freedesktop.Secret.Prompt",
+    )
+    .await
+    .unwrap();
+    let mut completed = p.receive_signal("Completed").await.unwrap();
+    p.call_method("Prompt", &("",)).await.unwrap();
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(10), completed.next())
+        .await
+        .unwrap()
+        .unwrap();
+    let (dismissed, result): (bool, OwnedValue) = msg.body().deserialize().unwrap();
+    assert!(!dismissed);
+    let items: Vec<OwnedObjectPath> = result.try_into().unwrap();
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert!(items[0].as_str().contains("/collection/"));
+    // Unlocked now: an unknown search path yields nothing, not itself.
+    let (unlocked, _): (Vec<OwnedObjectPath>, OwnedObjectPath) = svc
+        .call(
+            "Unlock",
+            &(vec![
+                ObjectPath::try_from("/org/freedesktop/secrets/search/q999999").unwrap(),
+            ],),
+        )
+        .await
+        .unwrap();
+    assert!(unlocked.is_empty());
+}
+
+/// Review I4: `Prompt()` runs once; a repeated call does not start a
+/// second prompter.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prompt_runs_once() {
+    let s = served(vec![
+        vec![FromPrompter::Cancel {}],
+        vec![FromPrompter::Cancel {}],
+    ])
+    .await;
+    s.svc.lock().await.unwrap();
+    let c = client(&s).await;
+    let (_, prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) = service(&c)
+        .await
+        .call(
+            "Unlock",
+            &(vec![
+                ObjectPath::try_from("/org/freedesktop/secrets/aliases/default").unwrap(),
+            ],),
+        )
+        .await
+        .unwrap();
+    let p = zbus::Proxy::new(
+        &c,
+        "org.freedesktop.secrets",
+        prompt,
+        "org.freedesktop.Secret.Prompt",
+    )
+    .await
+    .unwrap();
+    p.call_method("Prompt", &("",)).await.unwrap();
+    let _ = p.call_method("Prompt", &("",)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(launched(&s), 1);
+}
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -5704,6 +6163,9 @@ struct Waiting {
     targets: Vec<Target>,
 }
 
+/// Sessions one client may hold open at once.
+const MAX_SESSIONS_PER_CLIENT: usize = 32;
+
 /// Waiting unlock prompts allowed per client, and in all.
 const MAX_WAITING_PER_CLIENT: usize = 8;
 const MAX_WAITING: usize = 128;
@@ -5722,6 +6184,10 @@ pub struct SecretService {
     /// Unlock prompts waiting for an unlock from elsewhere, with the
     /// client that started each.
     waiting: Mutex<Vec<Waiting>>,
+    /// Every live prompt object and the client that asked for it.
+    prompts: Mutex<HashMap<OwnedObjectPath, Option<String>>>,
+    /// An unlock conversation is running.
+    unlock_running: std::sync::atomic::AtomicBool,
     conn: std::sync::OnceLock<Connection>,
 }
 
@@ -5735,6 +6201,8 @@ impl SecretService {
             served: tokio::sync::Mutex::default(),
             searches: Mutex::default(),
             waiting: Mutex::default(),
+            prompts: Mutex::default(),
+            unlock_running: Default::default(),
             conn: std::sync::OnceLock::new(),
         })
     }
@@ -5869,14 +6337,20 @@ impl SecretService {
                 .remove::<SessionObj, _>(p.as_ref())
                 .await;
         }
+        self.waiting
+            .lock()
+            .unwrap()
+            .retain(|w| w.client.as_deref() != Some(client));
         let prompts: Vec<OwnedObjectPath> = {
-            let mut waiting = self.waiting.lock().unwrap();
-            let gone = waiting
+            let mut all = self.prompts.lock().unwrap();
+            let gone: Vec<_> = all
                 .iter()
-                .filter(|w| w.client.as_deref() == Some(client))
-                .map(|w| w.prompt.clone())
+                .filter(|(_, owner)| owner.as_deref() == Some(client))
+                .map(|(p, _)| p.clone())
                 .collect();
-            waiting.retain(|w| w.client.as_deref() != Some(client));
+            for p in &gone {
+                all.remove(p);
+            }
             gone
         };
         for p in prompts {
@@ -5910,7 +6384,7 @@ impl SecretService {
             .unwrap_or_else(|e| Err(Error::Invalid(e.to_string())))
     }
 
-    /// Lock: zeroize everything and close every session (§4).
+    /// Lock: drop MK and the decrypted body (§4).
     pub async fn lock(self: &Arc<Self>) -> zbus::Result<()> {
         // Already locked: nothing to do. In particular a second `Lock` must
         // not close the sessions of clients waiting for an unlock, or drop
@@ -5918,21 +6392,12 @@ impl SecretService {
         if self.keyring.is_locked() {
             return Ok(());
         }
+        // Sessions stay open: they hold only transport keys, nothing is
+        // readable through them while locked, and libsecret clients keep
+        // theirs for the life of the process (closing them would break
+        // every long-lived client at each screen lock). They are freed on
+        // `Close`, when their client disconnects, and at exit.
         self.keyring.lock();
-        let paths: Vec<_> = self
-            .sessions
-            .lock()
-            .unwrap()
-            .drain()
-            .map(|(p, _)| p)
-            .collect();
-        for p in paths {
-            let _ = self
-                .conn()
-                .object_server()
-                .remove::<SessionObj, _>(p.as_ref())
-                .await;
-        }
         let searches: Vec<_> = self
             .searches
             .lock()
@@ -5958,8 +6423,11 @@ impl SecretService {
         self.announce_all().await?;
         let waiting: Vec<_> = self.waiting.lock().unwrap().drain(..).collect();
         for w in waiting {
-            let value = self.unlocked_value(&w.targets);
-            finish(self, &w.prompt, value, empty_paths()).await;
+            match self.unlocked_value(&w.targets) {
+                Some(value) => finish(self, &w.prompt, Some(value), empty_paths()).await,
+                // Locked again meanwhile: keep waiting, never answer empty.
+                None => self.waiting.lock().unwrap().push(w),
+            }
         }
         Ok(())
     }
@@ -6017,16 +6485,16 @@ impl SecretService {
     /// The unlocked objects `targets` stand for, once the vault is open.
     /// A search path that is no longer known is dropped, never echoed back
     /// (a client would take it for an item).
-    fn resolve_unlocked(&self, targets: &[Target]) -> Vec<OwnedObjectPath> {
+    /// `None` if the vault is locked (it cannot be answered yet).
+    fn resolve_unlocked(&self, targets: &[Target]) -> Option<Vec<OwnedObjectPath>> {
+        if self.keyring.is_locked() {
+            return None;
+        }
         let mut out: Vec<OwnedObjectPath> = Vec::new();
         for t in targets {
             match t {
                 Target::Search(query) => {
-                    out.extend(
-                        self.keyring
-                            .read(|b| matching(b, query))
-                            .unwrap_or_default(),
-                    );
+                    out.extend(self.keyring.read(|b| matching(b, query)).ok()?)
                 }
                 Target::Path(p) if p.as_str().starts_with(SEARCH_PREFIX) => {}
                 Target::Path(p) => out.push(p.clone()),
@@ -6035,11 +6503,11 @@ impl SecretService {
         }
         let mut seen = HashSet::new();
         out.retain(|p| seen.insert(p.clone()));
-        out
+        Some(out)
     }
 
     fn unlocked_value(&self, targets: &[Target]) -> Option<OwnedValue> {
-        OwnedValue::try_from(Value::from(self.resolve_unlocked(targets))).ok()
+        OwnedValue::try_from(Value::from(self.resolve_unlocked(targets)?)).ok()
     }
 
     /// Tell clients every collection changed (after lock or unlock).
@@ -6102,8 +6570,16 @@ impl SecretService {
     }
 
     /// Create a prompt object for `action` and return its path.
-    async fn prompt(self: &Arc<Self>, action: Action) -> Result<OwnedObjectPath> {
+    async fn prompt(
+        self: &Arc<Self>,
+        action: Action,
+        owner: Option<String>,
+    ) -> Result<OwnedObjectPath> {
         let p = path(format!("{SERVICE_PATH}/prompt/p{}", self.next_id()));
+        self.prompts
+            .lock()
+            .unwrap()
+            .insert(p.clone(), owner.clone());
         self.conn()
             .object_server()
             .at(
@@ -6116,28 +6592,53 @@ impl SecretService {
                 },
             )
             .await?;
+        self.gone_already(owner.as_deref()).await;
         Ok(p)
+    }
+
+    /// If `client` disconnected while we were creating something for it
+    /// (its `NameOwnerChanged` already handled), free what it left.
+    async fn gone_already(self: &Arc<Self>, client: Option<&str>) {
+        let Some(client) = client else { return };
+        let Ok(dbus) = zbus::fdo::DBusProxy::new(self.conn()).await else {
+            return;
+        };
+        let Ok(name) = zbus::names::BusName::try_from(client.to_string()) else {
+            return;
+        };
+        if !dbus.name_has_owner(name).await.unwrap_or(true) {
+            self.forget_client(client).await;
+        }
     }
 
     /// Run `action` through the prompter (blocking; call from a blocking
     /// task).
     fn run(self: &Arc<Self>, action: &Action, caller: Option<Caller>) -> Outcome {
+        if let Action::Unlock(targets) = action {
+            // Unlocked meanwhile: answer without a prompter.
+            if let Some(v) = self.unlocked_value(targets) {
+                return Outcome::Done(v);
+            }
+            // One unlock conversation at a time: the others wait for it
+            // (and complete when it unlocks), rather than each opening a
+            // prompter window.
+            if self.unlock_running.swap(true, Ordering::SeqCst) {
+                return Outcome::Wait;
+            }
+            let outcome = self.run_unlock(targets, caller);
+            self.unlock_running.store(false, Ordering::SeqCst);
+            return outcome;
+        }
         let mut chan = match self.launcher.launch() {
             Ok(chan) => chan,
             Err(e) => {
+                // (Unlocks never get here: see `run_unlock`, which waits.)
                 tracing::info!("no prompter: {e}");
-                return match action {
-                    Action::Unlock(_) => Outcome::Wait,
-                    _ => Outcome::Dismissed,
-                };
+                return Outcome::Dismissed;
             }
         };
         let value = match action {
-            Action::Unlock(objects) => self
-                .keyring
-                .unlock(&mut chan, caller)
-                .ok()
-                .and_then(|()| self.unlocked_value(objects)),
+            Action::Unlock(_) => unreachable!("handled above"),
             Action::CreateCollection { label, alias } => {
                 let confirmed = confirm(
                     &mut chan,
@@ -6191,6 +6692,25 @@ impl SecretService {
         match value {
             Some(v) => Outcome::Done(v),
             None => Outcome::Dismissed,
+        }
+    }
+}
+
+impl SecretService {
+    fn run_unlock(self: &Arc<Self>, targets: &[Target], caller: Option<Caller>) -> Outcome {
+        let mut chan = match self.launcher.launch() {
+            Ok(chan) => chan,
+            Err(e) => {
+                tracing::info!("no prompter: {e}");
+                return Outcome::Wait;
+            }
+        };
+        match self.keyring.unlock(&mut chan, caller) {
+            Ok(()) => match self.unlocked_value(targets) {
+                Some(v) => Outcome::Done(v),
+                None => Outcome::Wait,
+            },
+            Err(_) => Outcome::Dismissed,
         }
     }
 }
@@ -6312,11 +6832,19 @@ impl ServiceObj {
         })?;
         let p = path(format!("{SERVICE_PATH}/session/s{}", self.svc.next_id()));
         let client = hdr.sender().map(|s| s.to_string());
-        self.svc
-            .sessions
-            .lock()
-            .unwrap()
-            .insert(p.clone(), (session, client));
+        {
+            let mut sessions = self.svc.sessions.lock().unwrap();
+            let mine = sessions
+                .values()
+                .filter(|(_, owner)| *owner == client)
+                .count();
+            if mine >= MAX_SESSIONS_PER_CLIENT {
+                return Err(SecretError::ZBus(zbus::Error::Failure(
+                    "too many open sessions for this client".into(),
+                )));
+            }
+            sessions.insert(p.clone(), (session, client.clone()));
+        }
         self.svc
             .conn()
             .object_server()
@@ -6328,6 +6856,7 @@ impl ServiceObj {
                 },
             )
             .await?;
+        self.svc.gone_already(client.as_deref()).await;
         let output = if algorithm == crate::secret::session::PLAIN {
             OwnedValue::from(zbus::zvariant::Str::from(""))
         } else {
@@ -6340,6 +6869,7 @@ impl ServiceObj {
         &self,
         properties: HashMap<String, OwnedValue>,
         alias: String,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
     ) -> Result<(OwnedObjectPath, OwnedObjectPath)> {
         let existing = self
             .svc
@@ -6353,9 +6883,10 @@ impl ServiceObj {
             .get(LABEL)
             .and_then(|v| String::try_from(v.try_clone().ok()?).ok())
             .unwrap_or_default();
+        let owner = hdr.sender().map(|s| s.to_string());
         let prompt = self
             .svc
-            .prompt(Action::CreateCollection { label, alias })
+            .prompt(Action::CreateCollection { label, alias }, owner)
             .await?;
         Ok((root(), prompt))
     }
@@ -6374,12 +6905,17 @@ impl ServiceObj {
     async fn unlock(
         &self,
         objects: Vec<OwnedObjectPath>,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath)> {
         let targets = self.svc.targets(objects);
-        if !self.svc.keyring.is_locked() {
-            return Ok((self.svc.resolve_unlocked(&targets), root()));
+        if let Some(unlocked) = self.svc.resolve_unlocked(&targets) {
+            return Ok((unlocked, root()));
         }
-        Ok((Vec::new(), self.svc.prompt(Action::Unlock(targets)).await?))
+        let owner = hdr.sender().map(|s| s.to_string());
+        Ok((
+            Vec::new(),
+            self.svc.prompt(Action::Unlock(targets), owner).await?,
+        ))
     }
 
     async fn lock(
@@ -6508,9 +7044,13 @@ impl CollectionObj {
 
 #[interface(name = "org.freedesktop.Secret.Collection")]
 impl CollectionObj {
-    async fn delete(&self) -> Result<OwnedObjectPath> {
+    async fn delete(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+    ) -> Result<OwnedObjectPath> {
         let id = self.id()?;
-        self.svc.prompt(Action::DeleteCollection(id)).await
+        let owner = hdr.sender().map(|s| s.to_string());
+        self.svc.prompt(Action::DeleteCollection(id), owner).await
     }
 
     async fn search_items(
@@ -6903,6 +7443,7 @@ impl PromptObj {
                         finish(&svc, &p, None, empty).await;
                         return;
                     }
+                    svc.gone_already(client.as_deref()).await;
                     // Unlocked meanwhile? Then complete now.
                     if !svc.keyring.is_locked() {
                         let _ = svc.unlocked().await;
@@ -6955,6 +7496,10 @@ async fn finish(
     result: Option<OwnedValue>,
     empty: OwnedValue,
 ) {
+    // Exactly once: a prompt dismissed while it runs is already finished.
+    if svc.prompts.lock().unwrap().remove(p).is_none() {
+        return;
+    }
     if let Ok(emitter) = SignalEmitter::new(svc.conn(), p.as_ref()) {
         let (dismissed, value) = match result {
             Some(v) => (false, Value::from(v)),
@@ -7307,21 +7852,53 @@ pub fn bus() -> Bus {
 - [ ] **Step 4: Run the tests, clippy, and fmt**
 
 Run: `cargo test -q -p aleph-daemon && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
-Expected (one entry per test binary, in cargo's order): ok. 20 passed | ok. 21 passed | ok. 8 passed.
+Expected (one entry per test binary, in cargo's order): ok. 20 passed | ok. 24 passed | ok. 12 passed.
 
 - [ ] **Step 5: Confirm the tests have teeth**
 
 Make each change below, run its test and see it FAIL (a hang counts: stop it after a few minutes), then undo the change, `touch` the file, and see the test pass again:
 
-- **locked search returns a placeholder** (`crates/aleph-daemon/src/secret/service.rs`): replace `Err(Error::Locked) => Ok((Vec::new(), vec![self.svc.placeholder(attributes).await?])),` with `Err(Error::Locked) => Err(Error::Locked.into()),`. Test: `cargo test -p aleph-daemon --test secret_service a_locked_lookup_prompts_once`.
-- **no prompter: wait, not dismiss** (`crates/aleph-daemon/src/secret/service.rs`): replace `Action::Unlock(_) => Outcome::Wait,` with `Action::Unlock(_) => Outcome::Dismissed,`. Test: `cargo test -p aleph-daemon --test secret_service without_a_prompter`.
-- **dismissal carries a typed empty result** (`crates/aleph-daemon/src/secret/service.rs`): replace `Action::Unlock(_) => empty_paths(),` with `Action::Unlock(_) => OwnedValue::from(zbus::zvariant::Str::from("")),`. Test: `cargo test -p aleph-daemon --test secret_service cancelling_the_prompt`.
-- **a redundant lock changes nothing** (`crates/aleph-daemon/src/secret/service.rs`): replace `if self.keyring.is_locked() {
-            return Ok(());
-        }
-        self.keyring.lock();` with `self.keyring.lock();`. Test: `cargo test -p aleph-daemon --test secret_service a_redundant_lock_does_not_strand`.
-- **sessions freed on disconnect** (`crates/aleph-daemon/src/secret/service.rs`): replace `if !name.starts_with(':') || args.new_owner().is_some() {` with `if true {`. Test: `cargo test -p aleph-daemon --test secret_service sessions_are_freed`.
-- **waiting prompts capped** (`crates/aleph-daemon/src/secret/service.rs`): replace `let ok = mine < MAX_WAITING_PER_CLIENT && waiting.len() < MAX_WAITING;` with `let ok = mine < usize::MAX;`. Test: `cargo test -p aleph-daemon --test secret_service waiting_prompts_are_capped`.
+- **locked search returns a placeholder** (`crates/aleph-daemon/src/secret/service.rs`), test `cargo test -p aleph-daemon --test secret_service a_locked_lookup_prompts_once`: replace `Err(Error::Locked) => Ok((Vec::new(), vec![self.svc.placeholder(attributes).await?])),` with `Err(Error::Locked) => Err(Error::Locked.into()),`.
+- **no prompter: wait, not dismiss** (`crates/aleph-daemon/src/secret/service.rs`), test `cargo test -p aleph-daemon --test secret_service without_a_prompter`:
+
+  replace
+
+  ```rust
+  tracing::info!("no prompter: {e}");
+  return Outcome::Wait;
+  ```
+
+  with
+
+  ```rust
+  tracing::info!("no prompter: {e}");
+  return Outcome::Dismissed;
+  ```
+
+- **dismissal carries a typed empty result** (`crates/aleph-daemon/src/secret/service.rs`), test `cargo test -p aleph-daemon --test secret_service cancelling_the_prompt`: replace `Action::Unlock(_) => empty_paths(),` with `Action::Unlock(_) => OwnedValue::from(zbus::zvariant::Str::from("")),`.
+- **sessions outlive locks** (`crates/aleph-daemon/src/secret/service.rs`), test `cargo test -p aleph-daemon --test secret_service a_session_survives_lock_and_unlock`:
+
+  replace
+
+  ```rust
+  self.keyring.lock();
+  let searches
+  ```
+
+  with
+
+  ```rust
+  self.keyring.lock();
+  self.sessions.lock().unwrap().clear();
+  let searches
+  ```
+
+- **no empty answers while locked** (`crates/aleph-daemon/src/secret/service.rs`), test `cargo test -p aleph-daemon --test secret_service waiting_prompts_are_not_answered_while_locked`: replace `None => self.waiting.lock().unwrap().push(w)` with `None => finish(self, &w.prompt, None, empty_paths()).await`.
+- **placeholder query captured at Unlock** (`crates/aleph-daemon/src/secret/service.rs`), test `cargo test -p aleph-daemon --test secret_service a_placeholder_query_is_captured`: replace `Some((_, query)) => Target::Search(query.clone()),` with `Some(_) => Target::Path(o),`.
+- **unknown search paths dropped** (`crates/aleph-daemon/src/secret/service.rs`), test `cargo test -p aleph-daemon --test secret_service a_placeholder_query_is_captured`: replace `Target::Path(p) if p.as_str().starts_with(SEARCH_PREFIX) => {}` with `(nothing)`.
+- **a prompt runs once** (`crates/aleph-daemon/src/secret/service.rs`), test `cargo test -p aleph-daemon --test secret_service a_prompt_runs_once`: replace `if self.started.swap(true, Ordering::SeqCst) {` with `if false && self.started.swap(true, Ordering::SeqCst) {`.
+- **sessions freed on disconnect** (`crates/aleph-daemon/src/secret/service.rs`), test `cargo test -p aleph-daemon --test secret_service sessions_are_freed`: replace `if !name.starts_with(':') || args.new_owner().is_some() {` with `if true {`.
+- **waiting prompts capped** (`crates/aleph-daemon/src/secret/service.rs`), test `cargo test -p aleph-daemon --test secret_service waiting_prompts_are_capped`: replace `let ok = mine < MAX_WAITING_PER_CLIENT && waiting.len() < MAX_WAITING;` with `let ok = mine < usize::MAX;`.
 
 - [ ] **Step 6: Commit**
 
@@ -8480,13 +9057,13 @@ SystemdService=alephd.service
 - [ ] **Step 4: Run the tests, clippy, and fmt**
 
 Run: `cargo test -q -p aleph-daemon && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
-Expected (one entry per test binary, in cargo's order): ok. 20 passed | ok. 3 passed | ok. 21 passed | ok. 2 passed | ok. 8 passed.
+Expected (one entry per test binary, in cargo's order): ok. 20 passed | ok. 3 passed | ok. 24 passed | ok. 2 passed | ok. 12 passed.
 
 - [ ] **Step 5: Confirm the tests have teeth**
 
 Make each change below, run its test and see it FAIL (a hang counts: stop it after a few minutes), then undo the change, `touch` the file, and see the test pass again:
 
-- **reauth before config changes** (`crates/aleph-daemon/src/keyring.rs`): replace `self.reauth(chan, operation)?;` with `(nothing)`. Test: `cargo test -p aleph-daemon --test admin setting_config_reauthenticates`.
+- **reauth before config changes** (`crates/aleph-daemon/src/keyring.rs`), test `cargo test -p aleph-daemon --test admin setting_config_reauthenticates`: replace `self.reauth(chan, operation)?;` with `(nothing)`.
 
 - [ ] **Step 6: Commit**
 
@@ -9460,6 +10037,7 @@ impl Client {
 
     pub async fn search(&self, attributes: &HashMap<String, String>) -> Result<Vec<ItemInfo>> {
         let mut unlocked = Vec::new();
+        let mut still_locked = false;
         // Twice at most: if the keyring was locked again between the
         // unlock and the search, the search answers with a placeholder in
         // `locked`, which must not read as "nothing found".
@@ -9472,9 +10050,13 @@ impl Client {
                 .await
                 .map_err(err)?;
             unlocked = found;
-            if locked.is_empty() {
+            still_locked = !locked.is_empty();
+            if !still_locked {
                 break;
             }
+        }
+        if still_locked {
+            return Err("the keyring was locked again during the search; try again".into());
         }
         let mut items = Vec::new();
         for path in unlocked {
@@ -9792,10 +10374,23 @@ Expected (one entry per test binary, in cargo's order): ok. 8 passed.
 
 Make each change below, run its test and see it FAIL (a hang counts: stop it after a few minutes), then undo the change, `touch` the file, and see the test pass again:
 
-- **CLI prompter never holds the stdin lock** (`crates/aleph-cli/src/prompter.rs`): replace `Self { scripted }` with `{ std::mem::forget(std::io::stdin().lock()); Self { scripted } }`. Test: `cargo test -p aleph-cli --test cli setup_creates`.
-- **end of input cancels** (`crates/aleph-cli/src/prompter.rs`): replace `Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                Some(FromPrompter::Cancel {})
-            }` with `(nothing)`. Test: `cargo test -p aleph-cli --test cli end_of_input_cancels`.
+- **CLI prompter never holds the stdin lock** (`crates/aleph-cli/src/prompter.rs`), test `cargo test -p aleph-cli --test cli setup_creates`: replace `Self { scripted }` with `{ std::mem::forget(std::io::stdin().lock()); Self { scripted } }`.
+- **end of input cancels** (`crates/aleph-cli/src/prompter.rs`), test `cargo test -p aleph-cli --test cli end_of_input_cancels`:
+
+  replace
+
+  ```rust
+  Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+      Some(FromPrompter::Cancel {})
+  }
+  ```
+
+  with
+
+  ```rust
+  // (nothing)
+  ```
+
 
 - [ ] **Step 6: Commit**
 
@@ -9839,7 +10434,7 @@ Apply this patch with `git apply` (save it as `/tmp/t8-docs.patch`):
  
  - **The recovery slot:** re-wrapped to its public key, with no secret
    needed.
-@@ -310,8 +312,13 @@
+@@ -310,8 +312,15 @@
  - **Each FIDO2 slot:** needs that key's touch. The prompter walks through
    them in turn.
  
@@ -9849,13 +10444,15 @@ Apply this patch with `git apply` (save it as `/tmp/t8-docs.patch`):
 +FIDO2 key that is not presented, a TPM or login-password slot that
 +rejects the password, or a stale TPM slot (which is not tried again). A
 +TPM refusal that says nothing about the slot (`Busy`, `RateLimited`,
-+`Exhausted`, helper unavailable) stops the rotation instead. A rotation
-+never leaves a slot wrapping the old MK, and never leaves only the
-+recovery slot.
++`Exhausted`, helper unavailable) stops the rotation instead. TPM slots
++are only ever offered a password PAM accepted, newest slot first. A
++rotation never leaves a slot wrapping the old MK, and never leaves only
++the recovery slot. Reissuing the recovery key does everything that can
++fail before it shows the new key.
  
  ### Body
  
-@@ -334,17 +341,39 @@
+@@ -334,17 +343,45 @@
  results would make some clients (Chromium's safe-storage key is the
  classic case) create a new key that orphans their existing data.
  
@@ -9891,10 +10488,16 @@ Apply this patch with `git apply` (save it as `/tmp/t8-docs.patch`):
 +- No method call ever blocks waiting for the user. `Unlock()` returns a
 +  prompt with no reply timeout. If no prompter can start (no graphical
 +  session), the prompt is not dismissed: it waits until the vault is
-+    unlocked some other way (`aleph unlock`, PAM), then completes. At
++  unlocked some other way (`aleph unlock`, PAM), then completes. At
 +  most 8 prompts per client, and 128 in all, may wait; a prompt starts
-+  once. A client's sessions (with their keys) and waiting prompts are
-+  freed when it disconnects.
++  once; while one unlock conversation runs, other unlock prompts wait for
++  it instead of opening more prompter windows.
++- **Sessions outlive locks.** A session holds only its transport key, and
++  nothing is readable through it while locked; libsecret keeps one session
++  for the life of each process, so closing sessions at lock would break
++  every long-lived client at each screen lock. A session is freed on
++  `Close`, when its client disconnects, or at exit; a client may hold 32.
++  A client's prompts are freed when it disconnects too.
 +- A dismissed prompt carries an empty value of the type a completed one
 +  would (`ao` for an unlock). libsecret checks the type even on
 +  dismissal, and hangs on a mismatch.
@@ -9906,27 +10509,32 @@ Apply this patch with `git apply` (save it as `/tmp/t8-docs.patch`):
  
  ### Memory hygiene
  
-@@ -358,7 +387,10 @@
+@@ -358,9 +395,13 @@
    use, and decoded without intermediate copies. Plaintext secrets
    (`SecretBytes`) are zeroized on drop.
  - Children are started only via `posix_spawn`/`exec`
 -  (`std::process::Command`), never a bare `fork`.
+-- Locking zeroizes MK, derived keys, and the decrypted body, and closes all
+-  Secret Service sessions.
 +  (`std::process::Command`), never a bare `fork`. One exception is outside
 +  aleph's code: checking a typed password, libpam's `pam_unix` forks and
 +  execs `unix_chkpwd`. MK's page is `MADV_WIPEONFORK`, so the child never
 +  sees it; the decrypted body is shared copy-on-write until the exec.
- - Locking zeroizes MK, derived keys, and the decrypted body, and closes all
-   Secret Service sessions.
++- Locking zeroizes MK, derived keys, and the decrypted body. Secret
++  Service sessions stay open (§4 "Locked search"): they hold only
++  transport keys.
  
-@@ -448,6 +480,21 @@
+ What is not guaranteed: labels and attributes are ordinary strings and are
+ not zeroized. zbus, libsecret, and the GUI make their own copies of
+@@ -448,6 +489,21 @@
      (at least 60 s), then `RateLimited`. One uid guessing without pause
      thus adds failures no faster than the TPM forgets them; it takes
      several uids to hold the reserve at its limit.
-+    - **A typed password is checked with PAM first.** Before a password
++  - **A typed password is checked with PAM first.** Before a password
 +    typed into a prompt reaches the TPM, `alephd` checks it with the PAM
 +    service `aleph-check` (`pam_unix` only, no faillock), so a typo never
 +    spends the TPM's budget: on a TPM with a 7200 s recovery time, two
-+        typos would otherwise block TPM unlock for hours. At most 5 wrong
++    typos would otherwise block TPM unlock for hours. At most 5 wrong
 +    typed passwords are accepted per minute. If PAM cannot check at all
 +    (no `/etc/pam.d/aleph-check`, or an account `pam_unix` cannot verify),
 +    the TPM slots are skipped rather than risked, while login-password
@@ -9940,7 +10548,7 @@ Apply this patch with `git apply` (save it as `/tmp/t8-docs.patch`):
    - After an `AuthFailed` or `WrongUser` failure, the daemon marks the
      slot `stale` and stops trying it automatically until the user
      re-enrolls it or explicitly retries it, so an outdated password does
-@@ -642,17 +689,29 @@
+@@ -642,17 +698,29 @@
  
  ### Admin interface `io.aleph.Admin1`
  
@@ -9976,7 +10584,7 @@ Apply this patch with `git apply` (save it as `/tmp/t8-docs.patch`):
  - **"Reveal" in the GUI** also re-authenticates. That is a UX guard, not
    security, because any same-user process can call `GetSecrets`. This is
    documented.
-@@ -680,16 +739,23 @@
+@@ -680,16 +748,23 @@
  
  ### Prompter orchestration
  
@@ -10007,7 +10615,7 @@ Apply this patch with `git apply` (save it as `/tmp/t8-docs.patch`):
  
  ### Logging
  
-@@ -709,6 +775,7 @@
+@@ -709,6 +784,7 @@
  aleph keyslot add fido2 [--touch-only]
  aleph keyslot remove <slot-id>             # rotates MK
  aleph keyslot rotate-master
@@ -10015,7 +10623,7 @@ Apply this patch with `git apply` (save it as `/tmp/t8-docs.patch`):
  aleph recovery reissue                     # new recovery key; old one stops working
  aleph get attr=val…                        # secret-tool compatible semantics
  aleph search attr=val…
-@@ -723,7 +790,8 @@
+@@ -723,7 +799,8 @@
  ```
  
  - Global flags: `--json`. Shell completions are generated for bash, zsh,
@@ -10025,7 +10633,7 @@ Apply this patch with `git apply` (save it as `/tmp/t8-docs.patch`):
  - **`aleph setup`** is an interactive wizard:
    1. TPM status (§5)
    2. unlock method: TPM + login password (the default when a TPM is
-@@ -732,6 +800,9 @@
+@@ -732,6 +809,9 @@
    4. the recovery key, shown once and confirmed
    5. live import from gnome-keyring
    6. system changes (sudo)
@@ -10035,7 +10643,7 @@ Apply this patch with `git apply` (save it as `/tmp/t8-docs.patch`):
  - **Import** reads every collection and item through the Secret Service
    API while gnome-keyring still owns the bus name. That covers everything
    shown in Seahorse's Passwords view.
-@@ -910,15 +981,19 @@
+@@ -910,15 +990,19 @@
    `draft-connolly-cfrg-xwing-kem-06`. Plan 1b either adopts it, if it
    matches the published test vectors, or implements the combiner directly
    over `ml-kem` and `x25519-dalek`, pinned by those known-answer tests.
@@ -10150,7 +10758,7 @@ Apply this patch with `git apply` (save it as `/tmp/t8-docs.patch`):
 - [ ] **Step 2: Run the tests, clippy, and fmt**
 
 Run: `cargo test -q && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
-Expected (one entry per test binary, in cargo's order): ok. 8 passed | ok. 59 passed | ok. 1 passed | ok. 27 passed | ok. 10 passed | ok. 1 passed | ok. 20 passed | ok. 3 passed | ok. 21 passed | ok. 2 passed | ok. 8 passed | ok. 1 passed | ok. 6 passed | ok. 5 passed | ok. 21 passed | ok. 5 passed | ok. 1 passed | ok. 23 passed | ok. 8 passed.
+Expected (one entry per test binary, in cargo's order): ok. 8 passed | ok. 59 passed | ok. 1 passed | ok. 27 passed | ok. 10 passed | ok. 1 passed | ok. 20 passed | ok. 3 passed | ok. 24 passed | ok. 2 passed | ok. 12 passed | ok. 1 passed | ok. 6 passed | ok. 5 passed | ok. 21 passed | ok. 5 passed | ok. 1 passed | ok. 23 passed | ok. 8 passed.
 
 - [ ] **Step 3: Commit**
 
