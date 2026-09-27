@@ -1459,6 +1459,7 @@ Apply this patch with `git apply` (save it as `/tmp/t3-tests.patch`):
 -    assert_eq!(s.tpm, None);
      assert!(waiting.join().unwrap().is_err());
  }
+ 
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
