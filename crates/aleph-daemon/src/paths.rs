@@ -71,6 +71,17 @@ impl Paths {
         self.state_dir.join("slots.json")
     }
 
+    /// The previous version of the vault, kept by every write (§4).
+    pub fn bak(&self) -> PathBuf {
+        self.data_dir.join("vault.aleph.bak")
+    }
+
+    /// The id of the vault this machine expects at the path (recorded at
+    /// create and restore; a different vault there is not trusted).
+    pub fn expected_vault(&self) -> PathBuf {
+        self.state_dir.join("vault-id")
+    }
+
     /// Where `pam_aleph` hands over the login password (§6).
     pub fn pam_socket(&self) -> PathBuf {
         self.runtime_dir.join("pam.sock")
