@@ -374,6 +374,63 @@ fn a_waiting_prompter_is_released_when_the_vault_unlocks_elsewhere() {
     );
 }
 
+/// A FIDO2 unlock waiting for its key to be plugged in is released by a
+/// login password too, and the prompter is not asked again.
+#[test]
+fn a_key_wait_is_released_when_the_vault_unlocks_elsewhere() {
+    use std::io::{BufRead, BufReader, Write};
+    let env = env();
+    let k = keyring(&env, MockKeys::one(MockAuthenticator::with_pin(PIN)));
+    create_with_password(&k);
+    k.enroll_fido2(
+        &mut Interactive::new(vec![password(PW), pin(PIN)]).channel(),
+        false,
+    )
+    .unwrap();
+    drop(k);
+    // The key is unplugged; the wait outlasts the login-password unlock.
+    let mut k = keyring(&env, MockKeys::default());
+    k.key_wait = std::time::Duration::from_secs(30);
+    let k = Arc::new(k);
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut chan =
+        aleph_daemon::prompt::Channel::new(ours, std::time::Duration::from_secs(60)).unwrap();
+    let (inserting, wait_inserting) = std::sync::mpsc::channel();
+    // A prompter that always chooses the key, and counts the questions.
+    let prompter = std::thread::spawn(move || {
+        let mut reader = BufReader::new(theirs.try_clone().unwrap());
+        let mut writer = theirs;
+        let mut line = String::new();
+        let mut asks = 0;
+        while reader.read_line(&mut line).unwrap() > 0 {
+            let msg: ToPrompter = serde_json::from_str(&line).unwrap();
+            line.clear();
+            match msg {
+                ToPrompter::Ask { .. } => {
+                    asks += 1;
+                    let mut out = serde_json::to_vec(&FromPrompter::Fido2 {}).unwrap();
+                    out.push(b'\n');
+                    let _ = writer.write_all(&out);
+                }
+                ToPrompter::InsertKey { .. } => {
+                    let _ = inserting.send(());
+                }
+                ToPrompter::Done { .. } => break,
+                _ => {}
+            }
+        }
+        asks
+    });
+    let conversation = {
+        let k = k.clone();
+        std::thread::spawn(move || k.unlock(&mut chan, None))
+    };
+    wait_inserting.recv().unwrap();
+    k.unlock_with_login_password(PW).unwrap();
+    conversation.join().unwrap().unwrap();
+    assert_eq!(prompter.join().unwrap(), 1);
+}
+
 /// The system going to sleep: nothing is unlocked until it has resumed
 /// (an open finishing just after the pre-sleep lock must not leave the
 /// vault unlocked through the sleep).
