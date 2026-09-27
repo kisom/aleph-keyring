@@ -103,9 +103,20 @@ impl TpmClient {
         stream
             .set_write_timeout(Some(TIMEOUT))
             .map_err(|e| unavailable(&e))?;
-        write_frame(&mut stream, request).map_err(|e| unavailable(&e))?;
-        read_frame(&mut stream).map_err(|e| unavailable(&e))
+        exchange(stream, request)
     }
+}
+
+/// Send `request` and read the reply.
+fn exchange(mut stream: UnixStream, request: &Request) -> Result<Response> {
+    let unavailable = |e: &dyn std::fmt::Display| Error::TpmUnavailable(e.to_string());
+    if let Err(e) = write_frame(&mut stream, request) {
+        // The helper may refuse at once (Busy, NotPermitted) and close
+        // before reading the request, so the write fails (EPIPE). Its reply
+        // is already in our receive buffer: read that first.
+        return read_frame(&mut stream).map_err(|_| unavailable(&e));
+    }
+    read_frame(&mut stream).map_err(|e| unavailable(&e))
 }
 
 fn to_kek(secret: &Secret) -> Result<Kek> {
@@ -148,5 +159,28 @@ fn unexpected(response: Response) -> Error {
             Failure::Tpm(m) => Error::Tpm(m),
         },
         other => Error::Tpm(format!("unexpected reply from aleph-tpmd: {other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aleph_tpm_proto::Secret;
+
+    /// A helper that refuses and closes before reading the request: our
+    /// write fails, but its reply is still read (under load this read as
+    /// "helper unreachable" instead of `Busy`, which the caller retries).
+    #[test]
+    fn a_refusal_sent_before_our_request_is_still_read() {
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        write_frame(&mut theirs, &Response::Failed(Failure::Busy)).unwrap();
+        drop(theirs);
+        let request = Request::Seal {
+            secret: Secret(b"pw".to_vec()),
+        };
+        assert_eq!(
+            exchange(ours, &request).unwrap(),
+            Response::Failed(Failure::Busy)
+        );
     }
 }
