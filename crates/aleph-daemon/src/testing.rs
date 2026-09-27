@@ -97,6 +97,10 @@ impl Tpm for NoTpm {
     fn usable(&self) -> bool {
         false
     }
+
+    fn usable_now(&self) -> Option<bool> {
+        Some(false)
+    }
 }
 
 /// A TPM whose unseals succeed `ok` times, then fail with `then()`
@@ -127,6 +131,10 @@ impl Tpm for FlakyTpm {
 
     fn usable(&self) -> bool {
         true
+    }
+
+    fn usable_now(&self) -> Option<bool> {
+        Some(true)
     }
 }
 

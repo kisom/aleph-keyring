@@ -34,6 +34,9 @@ pub trait Tpm: Send {
     fn unseal(&self, slot: &TpmSlot, password: &[u8]) -> aleph_unlock::Result<Kek>;
     /// Whether new TPM slots can be sealed here.
     fn usable(&self) -> bool;
+    /// The same, asked once without waiting out a busy helper (for
+    /// `Status`); `None` if it cannot tell right now.
+    fn usable_now(&self) -> Option<bool>;
 }
 
 impl Tpm for aleph_unlock::TpmClient {
@@ -47,6 +50,14 @@ impl Tpm for aleph_unlock::TpmClient {
 
     fn usable(&self) -> bool {
         self.status().is_ok_and(|s| s.parent != Parent::Unavailable)
+    }
+
+    fn usable_now(&self) -> Option<bool> {
+        match self.status_now() {
+            Ok(s) => Some(s.parent != Parent::Unavailable),
+            Err(aleph_unlock::Error::TpmBusy) => None,
+            Err(_) => Some(false),
+        }
     }
 }
 
@@ -87,6 +98,8 @@ const MAX_ATTEMPTS: usize = 10;
 /// Wrong FIDO2 PINs a conversation accepts (as CTAP allows per power
 /// cycle); every wrong PIN spends one of the key's lifetime retries.
 const PIN_ATTEMPTS: usize = 3;
+/// Tries at a login-password slot's own password during a rotation.
+const SLOT_PASSWORD_ATTEMPTS: usize = 3;
 
 /// KEKs gathered for a rotation, by slot.
 type Keks = Vec<(Uuid, Kek)>;
@@ -167,8 +180,9 @@ impl Keyring {
     pub fn status(&self) -> Result<Status> {
         // Try, never wait: the hardware may be held by a prompt (a FIDO2
         // touch can take a while), and taking `hw` after `inner` would
-        // invert the lock order.
-        let tpm = self.hw.try_lock().ok().map(|hw| hw.tpm.usable());
+        // invert the lock order. The TPM helper is asked once, not waited
+        // out while busy.
+        let tpm = self.hw.try_lock().ok().and_then(|hw| hw.tpm.usable_now());
         let inner = lock(&self.inner);
         let slot = |k: &Keyslot| SlotInfo {
             id: k.id,
@@ -290,22 +304,67 @@ impl Keyring {
         methods
     }
 
+    /// Start a conversation on `chan`, or refuse at once (telling the
+    /// prompter) if another is running: waiting would leave this one
+    /// silent for minutes, holding a thread.
+    fn begin(&self, chan: &mut Channel) -> Result<MutexGuard<'_, ()>> {
+        match self.ops.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(e)) => Ok(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                chan.done(false, Some(Error::Busy.to_string()));
+                Err(Error::Busy)
+            }
+        }
+    }
+
     /// Unlock through the prompter.
     pub fn unlock(&self, chan: &mut Channel, caller: Option<Caller>) -> Result<()> {
+        let _op = self.begin(chan)?;
+        converse(chan, |chan| self.unlock_conversation(chan, caller))
+    }
+
+    /// Unlock through a prompter that `launch` starts only once no other
+    /// conversation is running (a prompter window must not open onto a
+    /// queue), and only if still locked by then. `Ok(false)` if no
+    /// prompter could start. (For Secret Service prompts, which wait their
+    /// turn rather than fail.)
+    pub fn unlock_prompting(
+        &self,
+        launch: impl FnOnce() -> Result<Channel>,
+        caller: Option<Caller>,
+    ) -> Result<bool> {
         let _op = lock(&self.ops);
-        converse(chan, |chan| {
-            chan.send(&ToPrompter::Begin {
-                purpose: Purpose::Unlock,
-                operation: "Unlock the keyring".into(),
-                caller,
-            })?;
-            if !self.is_locked() {
-                return Ok(None);
+        if !self.is_locked() {
+            return Ok(true);
+        }
+        let mut chan = match launch() {
+            Ok(chan) => chan,
+            Err(e) => {
+                tracing::info!("no prompter: {e}");
+                return Ok(false);
             }
-            let locked = lock(&self.inner).store.read()?;
-            let opened = self.choose_and_open(chan, &locked)?;
-            self.install(opened.vault)
-        })
+        };
+        converse(&mut chan, |chan| self.unlock_conversation(chan, caller))?;
+        Ok(true)
+    }
+
+    fn unlock_conversation(
+        &self,
+        chan: &mut Channel,
+        caller: Option<Caller>,
+    ) -> Result<Option<String>> {
+        chan.send(&ToPrompter::Begin {
+            purpose: Purpose::Unlock,
+            operation: "Unlock the keyring".into(),
+            caller,
+        })?;
+        if !self.is_locked() {
+            return Ok(None);
+        }
+        let locked = lock(&self.inner).store.read()?;
+        let opened = self.choose_and_open(chan, &locked)?;
+        self.install(opened.vault)
     }
 
     /// Unlock with a password the login stack already accepted (from
@@ -351,6 +410,7 @@ impl Keyring {
                 Err(
                     e @ (Error::Cancelled
                     | Error::Prompt(_)
+                    | Error::KeyTimeout
                     | Error::TooManyAttempts { .. }
                     | Error::Unlock(aleph_unlock::Error::Fido2PinInvalid)),
                 ) => {
@@ -398,15 +458,19 @@ impl Keyring {
         let hw = lock(&self.hw);
         let mut last = None;
         let mut use_tpm = !tpm_slots.is_empty();
+        // PAM vouched for it: a slot refusing it is then not a typo.
+        let mut accepted = false;
         if typed && use_tpm {
             match hw.password.check(password) {
-                Ok(true) => {}
+                Ok(true) => accepted = true,
+                // Not the current login password: keep it from the TPM (it
+                // may be a typo), but a login-password slot may still hold
+                // it (from before an outside change) and checks it itself.
                 Ok(false) => {
-                    lock(&self.inner).typed.record_failure(now);
-                    return Err(Error::WrongPassword);
+                    use_tpm = false;
+                    last = Some(Error::WrongPassword);
                 }
-                // PAM cannot check it: keep it away from the TPM (it may be
-                // a typo), but login-password slots check it themselves.
+                // PAM cannot check it: likewise.
                 Err(e) => {
                     use_tpm = false;
                     last = Some(e);
@@ -458,14 +522,14 @@ impl Keyring {
                         kek: None,
                     });
                 }
-                Err(aleph_core::Error::UnwrapFailed) => {
-                    if typed {
-                        lock(&self.inner).typed.record_failure(now);
-                    }
-                    last = Some(Error::WrongPassword);
-                }
+                Err(aleph_core::Error::UnwrapFailed) => last = Some(Error::WrongPassword),
                 Err(e) => last = Some(e.into()),
             }
+        }
+        // One typed attempt counts once against the typing limit, however
+        // many slots refused it, and not at all if PAM vouched for it.
+        if typed && !accepted && matches!(last, Some(Error::WrongPassword)) {
+            lock(&self.inner).typed.record_failure(now);
         }
         Err(last.unwrap_or(Error::NoMethodWorked(None)))
     }
@@ -559,7 +623,7 @@ impl Keyring {
                 return Err(Error::Cancelled);
             }
             if Instant::now() >= deadline {
-                return Err(Error::Prompt("timed out waiting for a security key".into()));
+                return Err(Error::KeyTimeout);
             }
             std::thread::sleep(Duration::from_millis(250));
         }
@@ -635,6 +699,7 @@ impl Keyring {
                 Err(
                     e @ (Error::Cancelled
                     | Error::Prompt(_)
+                    | Error::KeyTimeout
                     | Error::TooManyAttempts { .. }
                     | Error::Unlock(aleph_unlock::Error::Fido2PinInvalid)),
                 ) => {
@@ -755,14 +820,9 @@ impl Keyring {
                     }
                 }
                 SlotKind::LoginPassword(params) => {
-                    let password = self.proof_password(chan, proof)?;
-                    // Argon2 outside any lock: it takes a while.
-                    let kek =
-                        aleph_core::derive_kek(password.as_bytes(), &params.salt, &params.params)?;
-                    if proves(k, &kek) {
-                        keks.push((k.id, kek));
-                    } else {
-                        missing.push((k.id, k.label.clone(), "rejects your password"));
+                    match self.login_slot_kek(chan, proof, k, params, &proves)? {
+                        Some(kek) => keks.push((k.id, kek)),
+                        None => missing.push((k.id, k.label.clone(), "rejects your password")),
                     }
                 }
                 SlotKind::Fido2(_) => match proof.fido2.take() {
@@ -772,8 +832,10 @@ impl Keyring {
                         let current = lock(&self.inner).store.read()?;
                         match self.open_with_fido2(chan, &current, Some(k.id)) {
                             Ok(opened) => keks.push((k.id, opened.kek.expect("fido2 kek"))),
-                            // Cancelling one key's wait means "skip it".
-                            Err(Error::Cancelled) => {
+                            // Cancelling one key's wait means "skip it", and
+                            // so does a wait that runs out (the key is not
+                            // here); the user confirms the removal below.
+                            Err(Error::Cancelled | Error::KeyTimeout) => {
                                 missing.push((k.id, k.label.clone(), "key not presented"))
                             }
                             Err(e) => return Err(e),
@@ -801,6 +863,59 @@ impl Keyring {
             drops.extend(missing.iter().map(|(id, _, _)| *id));
         }
         Ok((keks, drops))
+    }
+
+    /// A login-password slot's KEK for a rotation. The slot checks the
+    /// password itself (no PAM: it may hold a password from before an
+    /// outside change, and PAM may be missing): the passwords already given
+    /// are tried first, then the user is asked for this slot's password a
+    /// few times. `None` if none of them opens it.
+    fn login_slot_kek(
+        &self,
+        chan: &mut Channel,
+        proof: &mut Proof,
+        k: &Keyslot,
+        params: &aleph_core::Argon2Slot,
+        proves: &dyn Fn(&Keyslot, &Kek) -> bool,
+    ) -> Result<Option<Kek>> {
+        // Argon2 outside any lock: it takes a while.
+        let derive = |pw: &str| aleph_core::derive_kek(pw.as_bytes(), &params.salt, &params.params);
+        let known: Vec<Zeroizing<String>> = [&proof.password, &proof.login]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        for pw in &known {
+            let kek = derive(pw)?;
+            if proves(k, &kek) {
+                return Ok(Some(kek));
+            }
+        }
+        let mut error = Some(format!("enter the password for keyslot '{}'", k.label));
+        for _ in 0..SLOT_PASSWORD_ATTEMPTS {
+            let now = Instant::now();
+            if let Some(wait) = lock(&self.inner).typed.blocked(now) {
+                return Err(Error::TooManyAttempts { retry_after: wait });
+            }
+            let reply = chan.ask(&ToPrompter::Ask {
+                methods: vec![Method::Password],
+                error: error.take(),
+                retry_after: None,
+            })?;
+            let FromPrompter::Password { password } = reply else {
+                return Err(Error::Prompt(format!("unexpected reply {reply:?}")));
+            };
+            let kek = derive(password.expose())?;
+            if proves(k, &kek) {
+                if proof.password.is_none() {
+                    proof.password = Some(Zeroizing::new(password.expose().to_string()));
+                }
+                return Ok(Some(kek));
+            }
+            lock(&self.inner).typed.record_failure(now);
+            error = Some(format!("wrong password for keyslot '{}'", k.label));
+        }
+        Ok(None)
     }
 
     /// Refuse a change that would leave only the recovery key: routine
@@ -855,7 +970,7 @@ impl Keyring {
 
     /// Create the vault with a recovery slot and one unlock method.
     pub fn create(&self, chan: &mut Channel, method: Method) -> Result<()> {
-        let _op = lock(&self.ops);
+        let _op = self.begin(chan)?;
         converse(chan, |chan| {
             if lock(&self.inner).store.exists() {
                 return Err(Error::VaultExists);
@@ -917,7 +1032,7 @@ impl Keyring {
                 return Err(Error::Cancelled);
             }
             if Instant::now() >= deadline {
-                return Err(Error::Prompt("timed out waiting for a security key".into()));
+                return Err(Error::KeyTimeout);
             }
             std::thread::sleep(Duration::from_millis(250));
         }
@@ -963,7 +1078,7 @@ impl Keyring {
     }
 
     pub fn enroll_tpm(&self, chan: &mut Channel) -> Result<()> {
-        let _op = lock(&self.ops);
+        let _op = self.begin(chan)?;
         converse(chan, |chan| {
             let mut proof = self.reauth(chan, "Add a TPM keyslot")?;
             let password = self.proof_password(chan, &mut proof)?.to_string();
@@ -990,7 +1105,7 @@ impl Keyring {
     }
 
     pub fn enroll_fido2(&self, chan: &mut Channel, touch_only: bool) -> Result<()> {
-        let _op = lock(&self.ops);
+        let _op = self.begin(chan)?;
         converse(chan, |chan| {
             self.reauth(chan, "Add a security key")?;
             let (kek, slot) = self.enroll_key(chan, touch_only)?;
@@ -1003,7 +1118,7 @@ impl Keyring {
 
     /// Remove a keyslot, rotating MK (§4).
     pub fn remove_keyslot(&self, chan: &mut Channel, id: Uuid) -> Result<()> {
-        let _op = lock(&self.ops);
+        let _op = self.begin(chan)?;
         converse(chan, |chan| {
             let label = {
                 let inner = lock(&self.inner);
@@ -1029,7 +1144,7 @@ impl Keyring {
     }
 
     pub fn rotate_master(&self, chan: &mut Channel) -> Result<()> {
-        let _op = lock(&self.ops);
+        let _op = self.begin(chan)?;
         converse(chan, |chan| {
             let mut proof = self.reauth(chan, "Rotate the master key")?;
             self.rotate(chan, &mut proof, &[])?;
@@ -1039,7 +1154,7 @@ impl Keyring {
 
     /// Replace the recovery key: the old one stops working (§5).
     pub fn reissue_recovery(&self, chan: &mut Channel) -> Result<()> {
-        let _op = lock(&self.ops);
+        let _op = self.begin(chan)?;
         converse(chan, |chan| {
             let mut proof = self.reauth(chan, "Issue a new recovery key")?;
             let old: Vec<Uuid> = {
@@ -1057,10 +1172,13 @@ impl Keyring {
             let key = RecoveryKey::generate()?;
             show_recovery_key(chan, &key)?;
             let refs: Vec<(Uuid, &Kek)> = keks.iter().map(|(id, k)| (*id, k)).collect();
+            // Still possible (the vault locked meanwhile, a failed write):
+            // then the user must know the key they wrote down is useless.
             self.modify_vault(|v| {
                 v.add_recovery_slot("recovery", &key.recipient().public_key())?;
                 Ok(v.rotate_master(&refs, &drops)?)
-            })?;
+            })
+            .map_err(|e| Error::RecoveryNotInstalled(Box::new(e)))?;
             Ok(Some(
                 "New recovery key issued; the old one no longer works.".into(),
             ))
@@ -1080,7 +1198,7 @@ impl Keyring {
         operation: &str,
         f: impl FnOnce() -> Result<Option<String>>,
     ) -> Result<()> {
-        let _op = lock(&self.ops);
+        let _op = self.begin(chan)?;
         converse(chan, |chan| {
             self.reauth(chan, operation)?;
             f()

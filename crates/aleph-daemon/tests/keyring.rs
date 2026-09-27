@@ -779,6 +779,234 @@ fn a_rotation_keeps_the_current_tpm_slot() {
     assert_eq!(env.sw.tpm().status().unwrap().failed_tries, 1);
 }
 
+/// Final-review minor 1: a key that is simply not plugged in during a
+/// rotation (the wait times out; nobody pressed "skip") counts as "not
+/// presented", like a skip: the user is asked to confirm dropping it,
+/// instead of the whole rotation failing.
+#[test]
+fn an_absent_key_that_times_out_is_offered_for_removal() {
+    let env = env();
+    let k = keyring(&env, MockKeys::one(MockAuthenticator::with_pin(PIN)));
+    create_with_password(&k);
+    k.enroll_fido2(
+        &mut Interactive::new(vec![password(PW), pin(PIN)]).channel(),
+        false,
+    )
+    .unwrap();
+    drop(k);
+    let k = keyring(&env, MockKeys::default());
+    k.unlock(&mut Interactive::new(vec![password(PW)]).channel(), None)
+        .unwrap();
+    // No reply to "insert your key": the wait runs out.
+    let p = Interactive::new(vec![password(PW), FromPrompter::Confirm { yes: true }]);
+    k.rotate_master(&mut p.channel()).unwrap();
+    let confirm = p
+        .sent()
+        .iter()
+        .find_map(|m| match m {
+            ToPrompter::Confirm { text } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(confirm.contains("not presented"), "{confirm}");
+    let kinds: Vec<String> = k
+        .status()
+        .unwrap()
+        .keyslots
+        .into_iter()
+        .map(|s| s.kind)
+        .collect();
+    assert_eq!(kinds, ["recovery", "tpm"]);
+}
+
+/// A vault with a login-password slot and a TPM slot, the login password
+/// (as PAM sees it) then changed to "new".
+fn login_password_and_tpm_after_a_password_change(env: &Env) -> Keyring {
+    let k = keyring_with(
+        env,
+        Box::new(NoTpm),
+        MockKeys::default(),
+        Box::new(Fixed(|p| p == PW)),
+    );
+    create_with_password(&k);
+    drop(k);
+    let k = keyring(env, MockKeys::default());
+    k.unlock(&mut Interactive::new(vec![password(PW)]).channel(), None)
+        .unwrap();
+    k.enroll_tpm(&mut Interactive::new(vec![password(PW)]).channel())
+        .unwrap();
+    drop(k);
+    keyring_with(
+        env,
+        Box::new(TpmClient::new(env.socket.clone())),
+        MockKeys::default(),
+        Box::new(Fixed(|p| p == "new")),
+    )
+}
+
+/// Final-review minor 3: a password PAM rejects is kept from the TPM, but
+/// a login-password slot still checks it itself (it may hold the password
+/// from before an outside change).
+#[test]
+fn a_pam_rejected_password_still_opens_a_login_password_slot() {
+    let env = env();
+    let k = login_password_and_tpm_after_a_password_change(&env);
+    k.unlock(&mut Interactive::new(vec![password(PW)]).channel(), None)
+        .unwrap();
+    assert_eq!(env.sw.tpm().status().unwrap().failed_tries, 0);
+}
+
+/// Each typed attempt counts once against the typing limit, however many
+/// slots it was tried on: four typos, then the right password, still opens.
+#[test]
+fn a_typo_counts_once_however_many_slots_it_fails() {
+    let env = env();
+    let k = login_password_and_tpm_after_a_password_change(&env);
+    let mut replies: Vec<_> = (0..4).map(|_| password("typo")).collect();
+    replies.push(password(PW));
+    k.unlock(&mut Interactive::new(replies).channel(), None)
+        .unwrap();
+}
+
+/// Final-review minor 4: a rotation re-wraps a login-password slot with
+/// that slot's own password, checked by the slot, not by PAM (which may be
+/// missing, or know only a newer password).
+#[test]
+fn a_rotation_checks_a_login_password_slot_itself() {
+    /// PAM that works until `gone` is set (the service file removed).
+    #[derive(Clone, Default)]
+    struct Vanishing(Arc<std::sync::atomic::AtomicBool>);
+    impl aleph_daemon::password::PasswordCheck for Vanishing {
+        fn check(&self, pw: &str) -> aleph_daemon::Result<bool> {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Error::PasswordCheckUnavailable);
+            }
+            Ok(pw == PW)
+        }
+    }
+    let env = env();
+    let pam = Vanishing::default();
+    let k = keyring_with(
+        &env,
+        Box::new(NoTpm),
+        MockKeys::one(MockAuthenticator::with_pin(PIN)),
+        Box::new(pam.clone()),
+    );
+    create_with_password(&k);
+    k.enroll_fido2(
+        &mut Interactive::new(vec![password(PW), pin(PIN)]).channel(),
+        false,
+    )
+    .unwrap();
+    pam.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    let before = k.status().unwrap().keyslots.len();
+    // Proved by the key; then a wrong password for the slot, then the right one.
+    let p = Interactive::new(vec![
+        FromPrompter::Fido2 {},
+        pin(PIN),
+        password("wrong"),
+        password(PW),
+    ]);
+    k.rotate_master(&mut p.channel()).unwrap();
+    assert_eq!(k.status().unwrap().keyslots.len(), before);
+    k.lock();
+    k.unlock(&mut Interactive::new(vec![password(PW)]).channel(), None)
+        .unwrap();
+}
+
+/// Final-review minor 5: if installing the new recovery key fails after it
+/// was shown, the user is told the key they wrote down was not installed.
+#[test]
+fn a_failed_reissue_says_the_shown_key_was_not_installed() {
+    let env = env();
+    let k = keyring(&env, MockKeys::default());
+    create_with_password(&k);
+    let vault = env.paths.vault();
+    std::fs::rename(&vault, vault.with_extension("moved")).unwrap();
+    std::os::unix::fs::symlink(vault.with_extension("moved"), &vault).unwrap();
+    let p = Interactive::new(vec![password(PW)]);
+    assert!(k.reissue_recovery(&mut p.channel()).is_err());
+    let sent = p.sent();
+    assert!(
+        sent.iter()
+            .any(|m| matches!(m, ToPrompter::ShowRecoveryKey { .. }))
+    );
+    assert!(
+        matches!(
+            sent.last(),
+            Some(ToPrompter::Done { ok: false, message: Some(m) })
+                if m.contains("not installed") && m.contains("previous recovery key")
+        ),
+        "{:?}",
+        sent.last()
+    );
+}
+
+/// Final-review minor 2: while one conversation runs, another is refused
+/// at once (and told why) instead of queueing silently behind it.
+#[test]
+fn a_second_conversation_is_refused_while_one_runs() {
+    let env = env();
+    let k = Arc::new(keyring(&env, MockKeys::default()));
+    create_with_password(&k);
+    k.lock();
+    let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut silent =
+        aleph_daemon::prompt::Channel::new(ours, std::time::Duration::from_secs(3)).unwrap();
+    let running = {
+        let k = k.clone();
+        std::thread::spawn(move || k.unlock(&mut silent, None))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let t = std::time::Instant::now();
+    let p = Interactive::new(vec![password(PW)]);
+    assert!(matches!(k.unlock(&mut p.channel(), None), Err(Error::Busy)));
+    assert!(t.elapsed() < std::time::Duration::from_millis(500));
+    assert!(matches!(
+        p.sent().last(),
+        Some(ToPrompter::Done { ok: false, message: Some(m) }) if m.contains("in progress")
+    ));
+    assert!(running.join().unwrap().is_err());
+}
+
+/// Final-review minor 9: `status` never waits out a busy TPM helper (the
+/// full usability check retries for seconds); it asks once.
+#[test]
+fn status_does_not_wait_out_a_busy_tpm() {
+    /// A TPM whose patient check is slow (a busy helper, retried).
+    struct Slow;
+    impl aleph_daemon::keyring::Tpm for Slow {
+        fn seal(&self, _: &[u8]) -> aleph_unlock::Result<(aleph_core::Kek, aleph_core::TpmSlot)> {
+            Err(aleph_unlock::Error::TpmBusy)
+        }
+        fn unseal(
+            &self,
+            _: &aleph_core::TpmSlot,
+            _: &[u8],
+        ) -> aleph_unlock::Result<aleph_core::Kek> {
+            Err(aleph_unlock::Error::TpmBusy)
+        }
+        fn usable(&self) -> bool {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            false
+        }
+        fn usable_now(&self) -> Option<bool> {
+            None
+        }
+    }
+    let env = env();
+    let k = keyring_with(
+        &env,
+        Box::new(Slow),
+        MockKeys::default(),
+        Box::new(Fixed(|p| p == PW)),
+    );
+    let t = std::time::Instant::now();
+    let s = k.status().unwrap();
+    assert!(t.elapsed() < std::time::Duration::from_millis(500));
+    assert_eq!(s.tpm, None);
+}
+
 #[test]
 fn creating_twice_is_refused() {
     let env = env();

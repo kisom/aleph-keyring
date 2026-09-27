@@ -396,7 +396,11 @@ What is guaranteed:
   use, and decoded without intermediate copies. Plaintext secrets
   (`SecretBytes`) are zeroized on drop.
 - Children are started only via `posix_spawn`/`exec`
-  (`std::process::Command`), never a bare `fork`. One exception is outside
+  (`std::process::Command`), never a bare `fork`. A prompter is the one
+  child that inherits a descriptor: it is started with `fork`/`exec`, and
+  between the two the child only clears close-on-exec on its socket, so
+  the socket is never inheritable in the daemon itself (where another
+  thread's child could pick it up). One exception is outside
   aleph's code: checking a typed password, libpam's `pam_unix` forks and
   execs `unix_chkpwd`. MK's page is `MADV_WIPEONFORK`, so the child never
   sees it; the decrypted body is shared copy-on-write until the exec.
@@ -406,7 +410,10 @@ What is guaranteed:
 
 What is not guaranteed: labels and attributes are ordinary strings and are
 not zeroized. zbus, libsecret, and the GUI make their own copies of
-secrets in transit. `mlock` does not keep pages out of a hibernation image
+secrets in transit. Prompter answers are read into a fixed-size buffer
+that is wiped as it is consumed, but when a password or PIN contains a
+JSON escape, serde_json decodes it through a scratch buffer that is freed
+without being zeroized. `mlock` does not keep pages out of a hibernation image
 (§6 locks before hibernate). Swap should be encrypted or zram-only, and
 `aleph setup` warns if it is neither.
 

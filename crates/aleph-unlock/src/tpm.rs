@@ -81,6 +81,15 @@ impl TpmClient {
         }
     }
 
+    /// TPM state, asked once: `TpmBusy` at once if the helper is busy
+    /// (for status displays, which must not wait).
+    pub fn status_now(&self) -> Result<Status> {
+        match self.call_once(&Request::Status {})? {
+            Response::Status(s) => Ok(s),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// One request, retried while the helper says `Busy`.
     fn call(&self, request: &Request) -> Result<Response> {
         let deadline = std::time::Instant::now() + BUSY_RETRY;

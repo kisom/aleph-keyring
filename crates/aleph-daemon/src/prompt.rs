@@ -10,12 +10,13 @@
 //! side: the [`Channel`] it talks through and the [`Launcher`]s that start
 //! prompters.
 
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant};
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Error, Result};
 
@@ -24,8 +25,12 @@ pub use aleph_prompt_proto::*;
 /// The daemon's end of a prompter conversation. Blocking; every read is
 /// bounded by the prompt timeout.
 pub struct Channel {
-    reader: BufReader<UnixStream>,
-    writer: UnixStream,
+    stream: UnixStream,
+    /// Received bytes not yet parsed (answers carry passwords and PINs).
+    /// Allocated once at its full size and never grown, so no reallocation
+    /// leaves plaintext behind; consumed bytes are wiped, and the rest on
+    /// drop.
+    buf: Zeroizing<Vec<u8>>,
     timeout: Duration,
 }
 
@@ -38,8 +43,9 @@ impl Channel {
         stream.set_nonblocking(false)?;
         stream.set_write_timeout(Some(timeout))?;
         Ok(Self {
-            reader: BufReader::new(stream.try_clone()?),
-            writer: stream,
+            stream,
+            // A full line and its newline.
+            buf: Zeroizing::new(Vec::with_capacity(MAX_LINE + 1)),
             timeout,
         })
     }
@@ -53,7 +59,7 @@ impl Channel {
         let mut line =
             Zeroizing::new(serde_json::to_vec(msg).map_err(|e| Error::Prompt(e.to_string()))?);
         line.push(b'\n');
-        self.writer
+        (&self.stream)
             .write_all(&line)
             .map_err(|e| Error::Prompt(format!("prompter went away: {e}")))?;
         Ok(())
@@ -87,37 +93,49 @@ impl Channel {
 
     fn recv(&mut self, wait: Option<Duration>) -> Result<Option<FromPrompter>> {
         let deadline = wait.map(|w| Instant::now() + w);
-        let mut line = Zeroizing::new(Vec::new());
         loop {
+            if let Some(i) = self.buf.iter().position(|&b| b == b'\n') {
+                let parsed = serde_json::from_slice(&self.buf[..i]);
+                self.consume(i + 1);
+                // Never quote the message: the bad value may be a secret.
+                return parsed.map(Some).map_err(|e| {
+                    Error::Prompt(format!(
+                        "bad prompter message ({:?} error at column {})",
+                        e.classify(),
+                        e.column()
+                    ))
+                });
+            }
+            if self.buf.len() > MAX_LINE {
+                return Err(Error::Prompt("prompter message too long".into()));
+            }
             let remaining = deadline.map(|d| d.saturating_duration_since(Instant::now()));
             if remaining.is_some_and(|r| r.is_zero()) {
                 return Ok(None);
             }
-            self.reader.get_ref().set_read_timeout(remaining)?;
-            let buf = match self.reader.fill_buf() {
-                Ok([]) => return Err(Error::Prompt("the prompter closed".into())),
-                Ok(buf) => buf,
+            self.stream.set_read_timeout(remaining)?;
+            let start = self.buf.len();
+            // Within capacity: no reallocation.
+            self.buf.resize(MAX_LINE + 1, 0);
+            let read = (&self.stream).read(&mut self.buf[start..]);
+            self.buf.truncate(start + *read.as_ref().unwrap_or(&0));
+            match read {
+                Ok(0) => return Err(Error::Prompt("the prompter closed".into())),
+                Ok(_) => {}
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                     return Ok(None);
                 }
                 Err(e) => return Err(Error::Prompt(e.to_string())),
-            };
-            let (chunk, end) = match buf.iter().position(|&b| b == b'\n') {
-                Some(i) => (&buf[..i], Some(i + 1)),
-                None => (buf, None),
-            };
-            if line.len() + chunk.len() > MAX_LINE {
-                return Err(Error::Prompt("prompter message too long".into()));
-            }
-            line.extend_from_slice(chunk);
-            let used = end.unwrap_or(chunk.len());
-            self.reader.consume(used);
-            if end.is_some() {
-                return serde_json::from_slice(&line)
-                    .map(Some)
-                    .map_err(|e| Error::Prompt(format!("bad prompter message: {e}")));
             }
         }
+    }
+
+    /// Drop the first `n` bytes of `buf`, wiping every copy.
+    fn consume(&mut self, n: usize) {
+        let len = self.buf.len();
+        self.buf.copy_within(n.., 0);
+        self.buf[len - n..].zeroize();
+        self.buf.truncate(len - n);
     }
 }
 
@@ -127,8 +145,8 @@ pub trait Launcher: Send + Sync {
 }
 
 /// Runs `<program> prompt` with its end of a socketpair as
-/// `ALEPH_PROMPT_FD` (spawned via `std::process::Command`, i.e.
-/// posix_spawn/exec, never a bare fork).
+/// `ALEPH_PROMPT_FD` (via `std::process::Command`: fork and exec, with only
+/// an `fcntl` between them, never a bare fork).
 pub struct ProgramLauncher {
     /// Read at each launch, so `prompt.program` and `prompt.timeout`
     /// changes apply to the next prompt without a restart.
@@ -140,14 +158,9 @@ impl Launcher for ProgramLauncher {
         if std::env::var_os("WAYLAND_DISPLAY").is_none() {
             return Err(Error::NoPrompter);
         }
+        // Both ends close-on-exec.
         let (ours, theirs) = UnixStream::pair()?;
-        // The child's end must survive exec; ours must not.
         let fd = theirs.as_raw_fd();
-        // SAFETY: fcntl on a descriptor we own.
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFD);
-            libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
-        }
         let (program, timeout) = {
             let c = self.config.lock().unwrap_or_else(|e| e.into_inner());
             (
@@ -155,10 +168,25 @@ impl Launcher for ProgramLauncher {
                 Duration::from_secs(c.prompt.timeout),
             )
         };
-        let child = std::process::Command::new(&program)
-            .arg("prompt")
-            .env("ALEPH_PROMPT_FD", fd.to_string())
-            .spawn();
+        let mut command = std::process::Command::new(&program);
+        command.arg("prompt").env("ALEPH_PROMPT_FD", fd.to_string());
+        // The child's end must survive the exec, but become inheritable
+        // only in the child: cleared here in the daemon, a child another
+        // thread spawns meanwhile (a second prompter, PAM's helper) would
+        // inherit it too, and this prompter exiting would then never read
+        // as the end of its conversation.
+        // SAFETY: runs in the forked child just before exec; fcntl is
+        // async-signal-safe and touches only the descriptor we pass.
+        unsafe {
+            command.pre_exec(move || {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn();
         drop(theirs);
         match child {
             Ok(child) => {
@@ -267,6 +295,57 @@ mod tests {
         let reply = ch.ask(&ToPrompter::Confirm { text: "ok?".into() }).unwrap();
         assert_eq!(reply, FromPrompter::Confirm { yes: true });
         peer.join().unwrap();
+    }
+
+    /// Answers arriving together are read one at a time, in order.
+    #[test]
+    fn answers_arriving_together_are_read_in_order() {
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        let mut ch = Channel::new(ours, Duration::from_secs(5)).unwrap();
+        theirs
+            .write_all(
+                b"{\"type\":\"confirm\",\"yes\":true}\n{\"type\":\"confirm\",\"yes\":false}\n",
+            )
+            .unwrap();
+        let q = ToPrompter::Confirm { text: "?".into() };
+        assert_eq!(ch.ask(&q).unwrap(), FromPrompter::Confirm { yes: true });
+        assert_eq!(ch.ask(&q).unwrap(), FromPrompter::Confirm { yes: false });
+    }
+
+    #[test]
+    fn an_over_long_answer_is_refused() {
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        let mut ch = Channel::new(ours, Duration::from_secs(5)).unwrap();
+        let writer = std::thread::spawn(move || {
+            let _ = theirs.write_all(&vec![b'x'; MAX_LINE + 10]);
+            theirs
+        });
+        let err = ch
+            .ask(&ToPrompter::Confirm { text: "?".into() })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("too long"), "{err}");
+        drop(writer.join());
+    }
+
+    /// A malformed answer is refused without quoting it: the error is
+    /// logged, and the bad value may be a PIN sent with the wrong type.
+    #[test]
+    fn a_malformed_answer_is_not_quoted_in_the_error() {
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        let mut ch = Channel::new(ours, Duration::from_secs(5)).unwrap();
+        theirs
+            .write_all(b"{\"type\":\"pin\",\"pin\":918273}\n")
+            .unwrap();
+        let err = ch
+            .ask(&ToPrompter::Fido2Pin {
+                key: "k".into(),
+                error: None,
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("918273"), "{err}");
+        assert!(err.contains("bad prompter message"), "{err}");
     }
 
     /// A prompter that stops reading cannot block the daemon forever (it

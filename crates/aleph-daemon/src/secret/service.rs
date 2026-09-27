@@ -730,18 +730,17 @@ impl SecretService {
 
 impl SecretService {
     fn run_unlock(self: &Arc<Self>, targets: &[Target], caller: Option<Caller>) -> Outcome {
-        let mut chan = match self.launcher.launch() {
-            Ok(chan) => chan,
-            Err(e) => {
-                tracing::info!("no prompter: {e}");
-                return Outcome::Wait;
-            }
-        };
-        match self.keyring.unlock(&mut chan, caller) {
-            Ok(()) => match self.unlocked_value(targets) {
+        // The prompter starts only once any admin conversation is over.
+        match self
+            .keyring
+            .unlock_prompting(|| self.launcher.launch(), caller)
+        {
+            Ok(true) => match self.unlocked_value(targets) {
                 Some(v) => Outcome::Done(v),
                 None => Outcome::Wait,
             },
+            // No prompter: wait for an unlock from elsewhere.
+            Ok(false) => Outcome::Wait,
             Err(_) => Outcome::Dismissed,
         }
     }

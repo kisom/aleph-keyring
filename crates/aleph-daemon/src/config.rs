@@ -86,6 +86,22 @@ impl Config {
         }
     }
 
+    /// For startup: the file's configuration, or the defaults and a
+    /// warning if it cannot be used. A bad setting must not keep the
+    /// keyring from starting.
+    pub fn load_or_default(path: &Path) -> (Self, Option<String>) {
+        match Self::load(path) {
+            Ok(c) => (c, None),
+            Err(e) => (
+                Self::default(),
+                Some(format!(
+                    "ignoring {}: {e}; using the defaults",
+                    path.display()
+                )),
+            ),
+        }
+    }
+
     /// Write atomically (temp file, then rename), creating the directory.
     pub fn save(&self, path: &Path) -> Result<()> {
         let dir = path
@@ -185,5 +201,22 @@ mod tests {
         assert!(Config::load(&path).is_err());
         std::fs::write(&path, "[prompt]\ntimeout = 18446744073709551615\n").unwrap();
         assert!(Config::load(&path).is_err());
+    }
+
+    /// Final-review minor 8: at startup a broken file means the defaults
+    /// and a warning naming the file, never a daemon that will not start
+    /// (every Secret Service client would lose its keyring).
+    #[test]
+    fn at_startup_a_broken_file_falls_back_to_the_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(&path, "[lock]\non_suspnd = false\n").unwrap();
+        let (c, warning) = Config::load_or_default(&path);
+        assert_eq!(c, Config::default());
+        let warning = warning.unwrap();
+        assert!(warning.contains("c.toml"), "{warning}");
+        std::fs::write(&path, "[lock]\nidle_timeout = 60\n").unwrap();
+        let (c, warning) = Config::load_or_default(&path);
+        assert_eq!((c.lock.idle_timeout, warning), (60, None));
     }
 }

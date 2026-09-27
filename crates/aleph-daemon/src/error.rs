@@ -40,7 +40,7 @@ pub enum Error {
     TooManyAttempts { retry_after: Duration },
 
     #[error(
-        "cannot check passwords: /etc/pam.d/aleph-check is missing (`aleph setup` installs it)"
+        "cannot check passwords: /etc/pam.d/aleph-check is missing (install it from aleph's packaging/pam/aleph-check)"
     )]
     PasswordCheckUnavailable,
 
@@ -56,11 +56,22 @@ pub enum Error {
     #[error("the prompter failed: {0}")]
     Prompt(String),
 
+    #[error("timed out waiting for a security key")]
+    KeyTimeout,
+
+    #[error("another operation is in progress; finish or cancel it first")]
+    Busy,
+
+    #[error(
+        "the recovery key just shown was not installed ({0}); discard it: your previous recovery key still works"
+    )]
+    RecoveryNotInstalled(Box<Error>),
+
     #[error("no prompter is available (no graphical session?); run `aleph unlock` in a terminal")]
     NoPrompter,
 
     #[error(
-        "the vault file was {0}; writes are refused until you confirm it (`aleph restore --accept-rollback`)"
+        "the vault file was {0}; it stays read-only until the change is accepted, which this version cannot do yet (if you have the newer vault file, put it back)"
     )]
     Untrusted(&'static str),
 
@@ -104,5 +115,16 @@ mod tests {
             assert!(!advice.contains("re-enroll it with"), "{advice}");
             assert!(!advice.contains("keyslot retry"), "{advice}");
         }
+    }
+
+    /// Final-review minor 11: advice names only what exists now (`aleph
+    /// restore` does not yet, and `aleph setup` only creates the vault).
+    #[test]
+    fn advice_names_only_what_exists() {
+        let rollback = Error::Untrusted("rolled back to an older version").to_string();
+        assert!(!rollback.contains("aleph restore"), "{rollback}");
+        let pam = Error::PasswordCheckUnavailable.to_string();
+        assert!(!pam.contains("aleph setup"), "{pam}");
+        assert!(pam.contains("packaging/pam/aleph-check"), "{pam}");
     }
 }

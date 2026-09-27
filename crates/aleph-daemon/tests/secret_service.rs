@@ -665,6 +665,48 @@ async fn joined_unlock_prompts_end_when_the_conversation_is_dismissed() {
     assert_eq!(held(&holding), 1);
 }
 
+/// Final-review minor 11: while an admin conversation runs (here an
+/// `aleph unlock` whose user has not answered), a Secret Service unlock
+/// does not open a prompter window onto the queue; it starts one once the
+/// admin conversation is over.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_prompter_opens_while_an_admin_conversation_runs() {
+    let (s, holding) = served_holding().await;
+    s.svc.lock().await.unwrap();
+    let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut silent =
+        aleph_daemon::prompt::Channel::new(ours, std::time::Duration::from_secs(2)).unwrap();
+    let keyring = s.svc.keyring.clone();
+    let admin = std::thread::spawn(move || keyring.unlock(&mut silent, None));
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let c = client(&s).await;
+    let (_, prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) = service(&c)
+        .await
+        .call(
+            "Unlock",
+            &(vec![
+                ObjectPath::try_from("/org/freedesktop/secrets/aliases/default").unwrap(),
+            ],),
+        )
+        .await
+        .unwrap();
+    let p = zbus::Proxy::new(
+        &c,
+        "org.freedesktop.secrets",
+        prompt,
+        "org.freedesktop.Secret.Prompt",
+    )
+    .await
+    .unwrap();
+    p.call_method("Prompt", &("",)).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(held(&holding), 0);
+    // The admin conversation times out; then the prompter starts.
+    assert!(admin.join().unwrap().is_err());
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(held(&holding), 1);
+}
+
 /// A prompt dismissed while its conversation runs completes once: the
 /// conversation ending later sends nothing more.
 #[tokio::test(flavor = "multi_thread")]

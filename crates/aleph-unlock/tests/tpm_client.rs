@@ -122,6 +122,21 @@ fn the_client_retries_while_the_helper_is_busy() {
     assert!(h.client.status().is_ok());
 }
 
+/// `status_now` asks once: while the helper is busy it says so at once
+/// instead of waiting the helper out (for `aleph status`).
+#[test]
+fn status_now_does_not_wait_out_a_busy_helper() {
+    use std::io::Write;
+    let h = helper();
+    assert!(h.client.status_now().is_ok());
+    let mut hog = std::os::unix::net::UnixStream::connect(&h.path).unwrap();
+    hog.write_all(&100u32.to_be_bytes()).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let t = std::time::Instant::now();
+    assert!(matches!(h.client.status_now(), Err(Error::TpmBusy)));
+    assert!(t.elapsed() < std::time::Duration::from_millis(500));
+}
+
 #[test]
 fn an_empty_password_is_refused_locally() {
     let h = helper();

@@ -32,7 +32,10 @@ fn init_logging() {
 
 async fn run() -> Result<(), String> {
     let paths = Paths::from_env().map_err(|e| e.to_string())?;
-    let config = Config::load(&paths.config_file).map_err(|e| e.to_string())?;
+    let (config, warning) = Config::load_or_default(&paths.config_file);
+    if let Some(warning) = warning {
+        tracing::warn!("{warning}");
+    }
     let backends = Backends {
         tpm: Box::new(TpmClient::from_env()),
         keys: Box::new(Libfido2Keys::new()),
