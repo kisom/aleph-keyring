@@ -29,6 +29,25 @@ who broke it; each attack became a test that failed first:
 The reviewer found no deadlocks, and confirmed the question order in
 `recover` and `--from-bak` sound with these fixes.
 
+A third reviewer verified the four fixes correct and complete (and found
+no TOCTOU: every proof is made on the bytes later installed), and raised
+one question, ruled here:
+- **Rewriting the high-water record while the daemon runs** (putting back
+  an old mark, or an old `.pending` intent) makes an older vault read as
+  current, and skips the proof. **Out of scope, as the spec says of the
+  mark** ("not tamper-proof against an attacker who can also write
+  `$XDG_STATE_HOME`"): a same-user process can restart `alephd` at will
+  (`systemctl --user restart`), so an in-memory copy of the mark would
+  only move the same attack past a restart. The TPM NV counter on the v2
+  roadmap is the fix. For the same reason, `seen_vault` (fix 3) only
+  raises the bar for a careless deletion; it is not a boundary.
+- Deferred minors: re-authentication for `SetConfig` against an
+  untrusted (planted, self-unlocked) vault passes with its own method
+  (the attacker can edit the config file directly anyway); during a
+  pending rotation, a `.bak` one write behind still holds the old
+  login-password slot, so `--from-bak` accepts the old login password
+  (which the threat model does not give the attacker).
+
 The TPM test flake: the harness's swtpm children inherited other tests'
 live TPM connections for their lifetime (seen with `ss`); they now start
 with every inherited descriptor close-on-exec. A rarer busy-helper

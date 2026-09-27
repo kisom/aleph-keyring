@@ -914,8 +914,19 @@ fn a_rollback_is_not_accepted_with_a_removed_key() {
     k.unlock(&mut Interactive::new(vec![password(PW)]).channel(), None)
         .unwrap();
     assert!(k.status().unwrap().untrusted.is_some());
-    let p = Interactive::new(vec![FromPrompter::Fido2 {}, pin(PIN), yes()]);
+    // The removed key passes re-authentication (it is this old copy's),
+    // then a login password PAM rejects: nothing is accepted.
+    let p = Interactive::new(vec![
+        FromPrompter::Fido2 {},
+        pin(PIN),
+        password("wrong"),
+        FromPrompter::Cancel {},
+    ]);
     assert!(k.accept_rollback(&mut p.channel()).is_err());
+    assert!(p.sent().iter().any(|m| matches!(
+        m,
+        ToPrompter::Ask { methods, error: Some(_), .. } if methods == &[Method::Password]
+    )));
     assert!(k.status().unwrap().untrusted.is_some());
 }
 
