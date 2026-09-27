@@ -213,3 +213,45 @@ fn the_backup_after_a_rotation_does_not_keep_the_removed_slot() {
         before
     );
 }
+
+/// Once the new vault is renamed into place the write has happened: a later
+/// failure (here, re-creating `.bak` after a rotation) must not turn into an
+/// error that leaves the vault's mark behind the file on disk.
+#[test]
+fn a_failure_after_the_vault_is_in_place_still_reports_the_written_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.aleph");
+    let (mut v, _, _, pw) = sample();
+    let kek = aleph_core::Kek::generate().unwrap();
+    let fido = v
+        .add_keyslot(
+            "yubikey",
+            aleph_core::SlotKind::Fido2(aleph_core::Fido2Slot {
+                credential_id: vec![1; 16],
+                salt: [2; 32],
+                uv_required: true,
+                pin_required: true,
+            }),
+            &kek,
+        )
+        .unwrap();
+    v.write(&path).unwrap();
+    let pw_kek = v.login_password_kek(pw, PASSWORD).unwrap();
+    v.remove_keyslot(fido, &[(pw, &pw_kek)]).unwrap();
+    // Make the post-commit `.bak` re-creation impossible.
+    std::fs::create_dir(path.with_file_name("vault.aleph.bak.tmp")).unwrap();
+    std::fs::write(path.with_file_name("vault.aleph.bak.tmp").join("x"), b"x").unwrap();
+    let written = v.write(&path).unwrap();
+    let on_disk = LockedVault::read(&path).unwrap().mark();
+    assert_eq!(written, on_disk);
+    assert_eq!(v.mark(), on_disk);
+    // And the pre-rotation file is not left behind as `.bak`.
+    let bak = path.with_file_name("vault.aleph.bak");
+    assert!(
+        !bak.exists()
+            || LockedVault::read(&bak)
+                .unwrap()
+                .keyslots()
+                .all(|s| s.id != fido)
+    );
+}

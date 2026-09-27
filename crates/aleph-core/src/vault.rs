@@ -38,7 +38,7 @@ use zeroize::Zeroizing;
 
 use crate::crypto::{self, MAC_LEN, NONCE_LEN};
 use crate::error::{Error, Result};
-use crate::highwater::Mark;
+use crate::highwater::{HighWater, Mark};
 use crate::kdf::{self, Argon2Params};
 use crate::key::{Kek, KeyHandle};
 use crate::keyslot::{Argon2Slot, Keyslot, RecoverySlot, SlotEntry, SlotKind, UnknownSlot};
@@ -556,7 +556,10 @@ impl UnlockedVault {
 
     /// A copy for `aleph backup`: the current generation with only the
     /// recovery slot(s), so a leaked backup exposes no login-password
-    /// slot to offline guessing.
+    /// slot to offline guessing. It carries the live file's mark (same
+    /// generation and MK), so swapped in for the live file it reads as
+    /// `Current`: restore it with `aleph restore`, which rotates MK, never
+    /// by copying it over the vault.
     pub fn to_backup_bytes(&self) -> Result<Vec<u8>> {
         let recovery: Vec<SlotEntry> = self
             .entries
@@ -626,25 +629,59 @@ impl UnlockedVault {
     /// - Creates the parent directory (0700), tightens an existing one that
     ///   is group- or world-accessible, and refuses to replace a symlink.
     pub fn write(&self, path: &Path) -> Result<Mark> {
+        self.write_inner(path, None)
+    }
+
+    /// `write`, recording the result in `highwater`: the intended mark is
+    /// noted before the rename and recorded after it, so the daemon's own
+    /// writes (including rotations) never read as `Rekeyed`, even if the
+    /// process stops in between (the file is then `Pending`). This is what
+    /// the daemon uses.
+    ///
+    /// Once the vault has been renamed into place the write has happened:
+    /// if recording then fails, the pending intent still identifies the
+    /// file, so this returns the written mark rather than an error.
+    pub fn write_recorded(&self, path: &Path, highwater: &HighWater) -> Result<Mark> {
+        self.write_inner(path, Some(highwater))
+    }
+
+    fn write_inner(&self, path: &Path, highwater: Option<&HighWater>) -> Result<Mark> {
         let rotated = self.rotated.load(Ordering::SeqCst);
-        let mut written = 0;
+        let mk_id = self.key.id();
+        let written = std::cell::Cell::new(0);
         write_atomic(
             path,
             || {
-                written = self.next_generation()?;
-                self.serialize(&self.entries, written)
+                written.set(self.next_generation()?);
+                let bytes = self.serialize(&self.entries, written.get())?;
+                if let Some(hw) = highwater {
+                    hw.intend(&Mark {
+                        vault_id: self.vault_id,
+                        generation: written.get(),
+                        mk_id,
+                    })?;
+                }
+                Ok(bytes)
             },
             rotated,
+            // The commit point: runs right after the vault rename, still
+            // under the lock, so concurrent writers see a consistent counter.
+            || {
+                self.generation.fetch_max(written.get(), Ordering::SeqCst);
+                if rotated {
+                    self.rotated.store(false, Ordering::SeqCst);
+                }
+            },
         )?;
-        self.generation.fetch_max(written, Ordering::SeqCst);
-        if rotated {
-            self.rotated.store(false, Ordering::SeqCst);
-        }
-        Ok(Mark {
+        let mark = Mark {
             vault_id: self.vault_id,
-            generation: written,
-            mk_id: self.key.id(),
-        })
+            generation: written.get(),
+            mk_id,
+        };
+        if let Some(hw) = highwater {
+            let _ = hw.record(&mark); // on failure the pending intent remains
+        }
+        Ok(mark)
     }
 }
 
@@ -680,14 +717,24 @@ fn write_file_synced(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Replace `path` atomically with the bytes `make` produces. `make` runs
-/// while `<path>.lock` is held, so what it reads (e.g. the next generation)
-/// cannot interleave with another writer. With `replace_backup`, `.bak`
-/// becomes a copy of the new file instead of the previous one.
+/// Replace `path` atomically with the bytes `make` produces, then run
+/// `commit`. Both run while `<path>.lock` is held, so what they read and
+/// update (e.g. the generation) cannot interleave with another writer.
+///
+/// The rename of the vault is the commit point. Everything that can fail
+/// happens before it (and then nothing has changed); what follows it
+/// (re-creating `.bak`, the directory fsync) is best-effort, because the
+/// write has already happened and must not be reported as failed.
+///
+/// With `replace_backup` (the first write after a rotation), the old
+/// `.bak` is removed before the rename and re-created from the new file
+/// after it, so the pre-rotation file never survives as `.bak`, even across
+/// a crash.
 fn write_atomic(
     path: &Path,
     make: impl FnOnce() -> Result<Vec<u8>>,
     replace_backup: bool,
+    commit: impl FnOnce(),
 ) -> Result<()> {
     let dir = path
         .parent()
@@ -721,18 +768,23 @@ fn write_atomic(
     let bytes = make()?;
     let bak_tmp = sibling(path, ".bak.tmp")?;
     let bak = sibling(path, ".bak")?;
-    if path.exists() && !replace_backup {
+    if replace_backup {
+        match fs::remove_file(&bak) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+    } else if path.exists() {
         write_file_synced(&bak_tmp, &fs::read(path)?)?;
         fs::rename(&bak_tmp, &bak)?;
     }
     let tmp = sibling(path, ".tmp")?;
     write_file_synced(&tmp, &bytes)?;
     fs::rename(&tmp, path)?;
+    commit();
     if replace_backup {
-        write_file_synced(&bak_tmp, &bytes)?;
-        fs::rename(&bak_tmp, &bak)?;
+        let _ = write_file_synced(&bak_tmp, &bytes).and_then(|()| Ok(fs::rename(&bak_tmp, &bak)?));
     }
-    File::open(dir)?.sync_all()?;
+    let _ = File::open(dir).and_then(|d| d.sync_all());
     Ok(())
 }
 

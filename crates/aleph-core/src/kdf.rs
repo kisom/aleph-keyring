@@ -16,6 +16,7 @@ pub const SALT_LEN: usize = 16;
 /// Argon2id cost parameters, stored in each keyslot so they can change
 /// per slot and over time without a format change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Argon2Params {
     /// Memory cost in KiB.
     pub m_kib: u32,

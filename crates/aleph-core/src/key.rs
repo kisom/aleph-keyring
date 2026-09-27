@@ -154,13 +154,6 @@ impl KeyHandle {
             .is_some_and(|pt| pt.len() == KEY_LEN && id_of(&pt) == *expected_id)
     }
 
-    /// Whether `kek` opens `wrapped`, without mapping a page for the
-    /// result: for checks that discard the key.
-    pub fn unwraps(kek: &Kek, wrapped: &WrappedKey, aad: &[u8]) -> bool {
-        crypto::open(kek.expose(), &wrapped.nonce, aad, &wrapped.ciphertext)
-            .is_some_and(|pt| pt.len() == KEY_LEN)
-    }
-
     /// Recover the master key from a keyslot.
     pub fn unwrap(kek: &Kek, wrapped: &WrappedKey, aad: &[u8]) -> Result<Self> {
         let pt = crypto::open(kek.expose(), &wrapped.nonce, aad, &wrapped.ciphertext)
@@ -285,16 +278,22 @@ mod tests {
     }
 
     #[test]
-    fn unwraps_agrees_with_unwrap() {
+    fn unwraps_to_agrees_with_unwrap() {
         let mk = KeyHandle::generate().unwrap();
         let kek = Kek::generate().unwrap();
         let wrapped = mk.wrap(&kek, b"slot-aad").unwrap();
-        assert!(KeyHandle::unwraps(&kek, &wrapped, b"slot-aad"));
-        assert!(!KeyHandle::unwraps(&kek, &wrapped, b"other-aad"));
-        assert!(!KeyHandle::unwraps(
+        let back = KeyHandle::unwrap(&kek, &wrapped, b"slot-aad").unwrap();
+        assert!(KeyHandle::unwraps_to(
+            &kek,
+            &wrapped,
+            b"slot-aad",
+            &back.id()
+        ));
+        assert!(!KeyHandle::unwraps_to(
             &Kek::generate().unwrap(),
             &wrapped,
-            b"slot-aad"
+            b"slot-aad",
+            &mk.id()
         ));
     }
 

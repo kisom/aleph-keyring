@@ -293,8 +293,55 @@ fn a_replayed_old_mk_with_a_forged_higher_generation_is_rekeyed() {
     let found = LockedVault::from_bytes(&forged).unwrap();
     assert!(found.mark().generation > v.mark().generation);
     assert_eq!(hw.check(&found.mark()).unwrap(), Standing::Rekeyed);
-    assert_eq!(hw.raise(&found.mark()).unwrap(), Standing::Rekeyed);
+    // Even an authenticated replay (it unlocks with the old credential)
+    // cannot raise the mark to the old MK.
+    let replayed = found.unlock(rogue, &rogue_kek).unwrap();
+    assert_eq!(hw.raise(&replayed).unwrap(), Standing::Rekeyed);
     assert_eq!(hw.check(&v.mark()).unwrap(), Standing::Current);
+}
+
+/// `raise` only takes an unlocked (authenticated) vault: an unauthenticated
+/// file claiming the real vault id, the public mk_id, and a huge generation
+/// must not be able to move the mark. (`check` on it is fine.)
+#[test]
+fn only_an_unlocked_vault_can_raise_the_high_water_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.aleph");
+    let hw = HighWater::new(dir.path().join("state"));
+    let (v, _, _, pw) = sample();
+    hw.record(&v.write(&path).unwrap()).unwrap();
+    let edited = edit_header(&std::fs::read(&path).unwrap(), |h| {
+        *field(h, "generation") = Value::Integer(u64::MAX.into());
+    });
+    let forged = LockedVault::from_bytes(&edited).unwrap();
+    assert_eq!(hw.check(&forged.mark()).unwrap(), Standing::Newer);
+    assert!(forged.unlock_login_password(pw, PASSWORD).is_err());
+    // The only way to raise is with a vault that actually unlocked.
+    let real = LockedVault::read(&path)
+        .unwrap()
+        .unlock_login_password(pw, PASSWORD)
+        .unwrap();
+    assert_eq!(hw.raise(&real).unwrap(), Standing::Current);
+    assert_eq!(hw.check(&v.mark()).unwrap(), Standing::Current);
+}
+
+/// `write_recorded` records the mark it wrote, including after a rotation,
+/// so the daemon's own rotation never looks like `Rekeyed`.
+#[test]
+fn write_recorded_keeps_own_rotations_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.aleph");
+    let hw = HighWater::new(dir.path().join("state"));
+    let (mut v, _, _, pw) = sample();
+    let kek = Kek::generate().unwrap();
+    let fido = v.add_keyslot("yubikey", fido2_kind(), &kek).unwrap();
+    v.write_recorded(&path, &hw).unwrap();
+    let pw_kek = v.login_password_kek(pw, PASSWORD).unwrap();
+    v.remove_keyslot(fido, &[(pw, &pw_kek)]).unwrap();
+    let m = v.write_recorded(&path, &hw).unwrap();
+    let on_disk = LockedVault::read(&path).unwrap().mark();
+    assert_eq!(on_disk, m);
+    assert_eq!(hw.check(&on_disk).unwrap(), Standing::Current);
 }
 
 #[test]

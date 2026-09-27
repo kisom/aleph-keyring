@@ -158,8 +158,14 @@ holds every decrypted secret. Separation protects MK, not the secrets.
   2. rename it over `vault.aleph`
   3. `fsync` the directory
 
-  The previous version is kept as `vault.aleph.bak`. Writers hold an
-  exclusive `flock` on `vault.aleph.lock` for the whole sequence.
+  The previous version is kept as `vault.aleph.bak`, except on the first
+  write after a rotation: then the old `.bak` is removed before the rename
+  and re-created from the new file, so the pre-rotation file (old MK,
+  removed slots) never survives as a backup. Writers hold an exclusive
+  `flock` on `vault.aleph.lock` for the whole sequence. The rename of
+  `vault.aleph` is the commit point: everything that can fail happens
+  before it, and what follows (re-creating `.bak`, the directory fsync) is
+  best-effort, so a completed write is never reported as failed.
 - `alephd` holds a second lock, `vault.aleph.daemon`, for its whole
   lifetime. A second daemon, or a CLI trying to write directly, refuses to
   run. All writes go through the running daemon.
@@ -212,9 +218,15 @@ On unlock:
   other than this daemon, or someone holding an old MK is replaying it
   under a forged generation (`Rekeyed`). Same handling.
 
-Only the daemon's own writes move the mark to a new MK: `write` returns
-the `Mark` it put on disk, and the daemon records exactly that. Marks of
-files it reads are only ever raised within the same MK.
+Only the daemon's own writes move the mark to a new MK. The daemon writes
+with `write_recorded`, which notes the intended mark before the rename
+(`highwater-<vault_id>.pending`) and records it after. A file matching the
+pending intent (a crash or error between rename and record) is `Pending`,
+not `Rekeyed`, and is then recorded. Marks of files the daemon reads are
+raised only through `HighWater::raise`, which takes an unlocked (hence
+authenticated) vault, and only within the same MK; an unauthenticated
+header can be checked but never raises the mark. The store is guarded by a
+per-vault lock (`highwater-<vault_id>.lock`).
 
 This defends against a sync peer or a restored backup silently undoing a
 rotation. It is not tamper-proof against an attacker who can also write

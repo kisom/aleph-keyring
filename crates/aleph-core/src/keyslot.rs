@@ -318,6 +318,40 @@ mod tests {
             SlotEntry::decode(&encode_value(&v)),
             Err(Error::Malformed(_))
         ));
+
+        // And inside nested parameter structs: a future derivation parameter
+        // (say a pepper id) must not be silently dropped on rewrite.
+        let lp = Keyslot {
+            kind: SlotKind::LoginPassword(Argon2Slot {
+                salt: [0; SALT_LEN],
+                params: Argon2Params::INSECURE_TEST,
+            }),
+            ..recovery_slot()
+        };
+        let raw = SlotEntry::Known(lp).encode().unwrap();
+        let mut v: Value = ciborium::from_reader(raw.as_slice()).unwrap();
+        let kind = v
+            .as_map_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|(k, _)| k.as_text() == Some("kind"))
+            .unwrap();
+        let params = kind
+            .1
+            .as_map_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|(k, _)| k.as_text() == Some("params"))
+            .unwrap();
+        params
+            .1
+            .as_map_mut()
+            .unwrap()
+            .push((Value::Text("pepper_id".into()), Value::Integer(7.into())));
+        assert!(matches!(
+            SlotEntry::decode(&encode_value(&v)),
+            Err(Error::Malformed(_))
+        ));
     }
 
     #[test]
