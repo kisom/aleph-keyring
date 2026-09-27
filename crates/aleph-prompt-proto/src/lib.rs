@@ -48,6 +48,9 @@ pub enum Purpose {
     Reauth,
     /// Create the vault.
     Create,
+    /// Recover the vault with the recovery key (`aleph restore`, the GUI's
+    /// "Recover…"): the only conversation that asks for it.
+    Recover,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +108,16 @@ pub enum ToPrompter {
     /// Reply `Confirm`.
     Confirm {
         text: String,
+        /// The answer Enter gives (the GUI's focused button): yes only
+        /// where declining is the riskier choice.
+        #[serde(default)]
+        default: bool,
+    },
+    /// The recovery key, in a recovery conversation only (reply
+    /// `RecoveryKey`). Keeping the root credential off routine prompts
+    /// makes fake prompts less useful for phishing (spec §5).
+    RecoveryKey {
+        error: Option<String>,
     },
     /// Show the new recovery key once; reply `RecoveryCheck` with the
     /// groups at the 1-based positions in `check`.
@@ -125,6 +138,7 @@ impl ToPrompter {
             self,
             Self::Ask { .. }
                 | Self::OldPassword { .. }
+                | Self::RecoveryKey { .. }
                 | Self::Fido2Pin { .. }
                 | Self::Confirm { .. }
                 | Self::ShowRecoveryKey { .. }
@@ -140,6 +154,7 @@ pub enum FromPrompter {
     Pin { pin: Secret },
     Confirm { yes: bool },
     RecoveryCheck { groups: [Secret; 2] },
+    RecoveryKey { key: Secret },
     Cancel {},
 }
 
@@ -169,6 +184,21 @@ mod tests {
         let p: FromPrompter =
             serde_json::from_str(r#"{"type":"password","password":"hunter2"}"#).unwrap();
         assert!(!format!("{p:?}").contains("hunter2"));
+    }
+
+    /// The recovery-key question and answer: fixed wire forms, the key
+    /// never printed.
+    #[test]
+    fn the_recovery_key_travels_as_a_secret() {
+        let q = ToPrompter::RecoveryKey { error: None };
+        assert!(q.needs_reply());
+        assert_eq!(
+            serde_json::to_string(&q).unwrap(),
+            r#"{"type":"recovery_key","error":null}"#
+        );
+        let a: FromPrompter =
+            serde_json::from_str(r#"{"type":"recovery_key","key":"ABCD-EFGH"}"#).unwrap();
+        assert!(!format!("{a:?}").contains("ABCD"));
     }
 
     /// The previous-password question expects an answer, and its wire form

@@ -31,7 +31,10 @@ fn a_launched_prompter_talks_over_its_inherited_socket() {
     };
     let mut chan = launcher.launch().unwrap();
     let reply = chan
-        .ask(&ToPrompter::Confirm { text: "ok?".into() })
+        .ask(&ToPrompter::Confirm {
+            text: "ok?".into(),
+            default: false,
+        })
         .unwrap();
     assert_eq!(reply, FromPrompter::Confirm { yes: true });
 }

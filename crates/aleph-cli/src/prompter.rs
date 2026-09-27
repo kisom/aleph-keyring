@@ -50,9 +50,18 @@ impl Terminal {
         Ok(Secret::new(secret))
     }
 
-    fn yes(&mut self, question: &str) -> std::io::Result<bool> {
-        let answer = self.line(&format!("{question} [y/N] "))?;
-        Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
+    fn yes(&mut self, question: &str, default: bool) -> std::io::Result<bool> {
+        let hint = if default { "[Y/n]" } else { "[y/N]" };
+        let answer = self.line(&format!("{question} {hint} "))?;
+        Ok(is_yes(&answer, default))
+    }
+}
+
+/// A yes/no answer: empty takes `default`, anything but yes is no.
+fn is_yes(answer: &str, default: bool) -> bool {
+    match answer.trim() {
+        "" => default,
+        a => matches!(a, "y" | "Y" | "yes"),
     }
 }
 
@@ -114,6 +123,7 @@ fn answer(
                 Purpose::Unlock => "",
                 Purpose::Reauth => " (confirm it is you)",
                 Purpose::Create => "",
+                Purpose::Recover => " (with the recovery key)",
             };
             eprintln!("aleph: {operation}{why}");
             None
@@ -158,6 +168,14 @@ fn answer(
                 password: term.secret("Previous login password: ")?,
             })
         }
+        ToPrompter::RecoveryKey { error } => {
+            if let Some(e) = error {
+                eprintln!("aleph: {e}");
+            }
+            Some(FromPrompter::RecoveryKey {
+                key: term.secret("Recovery key (14 groups of 4): ")?,
+            })
+        }
         ToPrompter::Fido2Pin { key, error } => {
             if let Some(e) = error {
                 eprintln!("aleph: {e}");
@@ -176,8 +194,8 @@ fn answer(
             eprintln!("aleph: touch {key}");
             None
         }
-        ToPrompter::Confirm { text } => Some(FromPrompter::Confirm {
-            yes: term.yes(&text)?,
+        ToPrompter::Confirm { text, default } => Some(FromPrompter::Confirm {
+            yes: term.yes(&text, default)?,
         }),
         ToPrompter::ShowRecoveryKey { key, check, error } => {
             if let Some(e) = error {
@@ -200,4 +218,18 @@ fn answer(
         }
         ToPrompter::Done { .. } => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_yes;
+
+    #[test]
+    fn enter_takes_the_default() {
+        assert!(is_yes("", true));
+        assert!(!is_yes("  ", false));
+        assert!(is_yes("y", false));
+        assert!(!is_yes("n", true));
+        assert!(!is_yes("maybe", true));
+    }
 }

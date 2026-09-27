@@ -1092,6 +1092,7 @@ impl Keyring {
                     "These keyslots cannot be kept and will be removed: {}. Continue?",
                     names.join(", ")
                 ),
+                default: false,
             })?;
             if reply != (FromPrompter::Confirm { yes: true }) {
                 return Err(Error::Cancelled);

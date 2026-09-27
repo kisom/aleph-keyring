@@ -69,9 +69,19 @@ impl Channel {
     }
 
     /// Send a message that needs a reply and wait for it (up to the
-    /// timeout). `Cancel` becomes `Error::Cancelled`.
+    /// timeout). `Cancel` becomes `Error::Cancelled`. Never the recovery-key
+    /// question: only the recovery conversation asks it.
     pub fn ask(&mut self, msg: &ToPrompter) -> Result<FromPrompter> {
         debug_assert!(msg.needs_reply());
+        if matches!(msg, ToPrompter::RecoveryKey { .. }) {
+            return Err(Error::Prompt(
+                "the recovery key is asked for only when recovering".into(),
+            ));
+        }
+        self.ask_any(msg)
+    }
+
+    fn ask_any(&mut self, msg: &ToPrompter) -> Result<FromPrompter> {
         self.send(msg)?;
         match self.recv(Some(self.timeout))? {
             Some(FromPrompter::Cancel {}) => Err(Error::Cancelled),
@@ -321,7 +331,12 @@ mod tests {
                 .write_all(b"{\"type\":\"confirm\",\"yes\":true}\n")
                 .unwrap();
         });
-        let reply = ch.ask(&ToPrompter::Confirm { text: "ok?".into() }).unwrap();
+        let reply = ch
+            .ask(&ToPrompter::Confirm {
+                text: "ok?".into(),
+                default: false,
+            })
+            .unwrap();
         assert_eq!(reply, FromPrompter::Confirm { yes: true });
         peer.join().unwrap();
     }
@@ -336,7 +351,10 @@ mod tests {
                 b"{\"type\":\"confirm\",\"yes\":true}\n{\"type\":\"confirm\",\"yes\":false}\n",
             )
             .unwrap();
-        let q = ToPrompter::Confirm { text: "?".into() };
+        let q = ToPrompter::Confirm {
+            text: "?".into(),
+            default: false,
+        };
         assert_eq!(ch.ask(&q).unwrap(), FromPrompter::Confirm { yes: true });
         assert_eq!(ch.ask(&q).unwrap(), FromPrompter::Confirm { yes: false });
     }
@@ -350,11 +368,26 @@ mod tests {
             theirs
         });
         let err = ch
-            .ask(&ToPrompter::Confirm { text: "?".into() })
+            .ask(&ToPrompter::Confirm {
+                text: "?".into(),
+                default: false,
+            })
             .unwrap_err()
             .to_string();
         assert!(err.contains("too long"), "{err}");
         drop(writer.join());
+    }
+
+    /// Only the recovery conversation can ask for the recovery key.
+    #[test]
+    fn the_recovery_key_is_not_asked_by_ordinary_questions() {
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let mut ch = Channel::new(ours, Duration::from_secs(5)).unwrap();
+        let err = ch
+            .ask(&ToPrompter::RecoveryKey { error: None })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only when recovering"), "{err}");
     }
 
     /// A malformed answer is refused without quoting it: the error is
@@ -386,7 +419,13 @@ mod tests {
         let text = "x".repeat(8 * 1024);
         let started = Instant::now();
         // Fill the socket buffer; a write then fails instead of blocking.
-        while ch.send(&ToPrompter::Confirm { text: text.clone() }).is_ok() {
+        while ch
+            .send(&ToPrompter::Confirm {
+                text: text.clone(),
+                default: false,
+            })
+            .is_ok()
+        {
             assert!(
                 started.elapsed() < Duration::from_secs(10),
                 "never timed out"
@@ -408,7 +447,10 @@ mod tests {
         assert_eq!(reply, FromPrompter::Fido2 {});
         // Out of replies: the script cancels.
         assert!(matches!(
-            ch.ask(&ToPrompter::Confirm { text: "ok?".into() }),
+            ch.ask(&ToPrompter::Confirm {
+                text: "ok?".into(),
+                default: false
+            }),
             Err(Error::Cancelled)
         ));
     }
@@ -419,7 +461,7 @@ mod tests {
         let mut ch = Channel::new(ours, Duration::from_millis(50)).unwrap();
         let t = Instant::now();
         assert!(matches!(
-            ch.ask(&ToPrompter::Confirm { text: "?".into() }),
+            ch.ask(&ToPrompter::Confirm { text: "?".into(), default: false }),
             Err(Error::Prompt(m)) if m.contains("timed out")
         ));
         assert!(t.elapsed() < Duration::from_secs(2));
@@ -427,7 +469,7 @@ mod tests {
         theirs.write_all(&vec![b'x'; MAX_LINE + 10]).unwrap();
         theirs.write_all(b"\n").unwrap();
         assert!(matches!(
-            ch.ask(&ToPrompter::Confirm { text: "?".into() }),
+            ch.ask(&ToPrompter::Confirm { text: "?".into(), default: false }),
             Err(Error::Prompt(m)) if m.contains("too long")
         ));
     }

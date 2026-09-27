@@ -776,7 +776,12 @@ fn confirm(chan: &mut crate::prompt::Channel, text: &str, caller: Option<Caller>
             operation: text.into(),
             caller,
         })
-        .and_then(|()| chan.ask(&ToPrompter::Confirm { text: text.into() }))
+        .and_then(|()| {
+            chan.ask(&ToPrompter::Confirm {
+                text: text.into(),
+                default: false,
+            })
+        })
         .is_ok_and(|r| r == FromPrompter::Confirm { yes: true });
     chan.done(yes, None);
     yes

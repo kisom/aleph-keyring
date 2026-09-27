@@ -903,10 +903,9 @@ fn removing_a_slot_rotates_and_drops_absent_keys_only_on_confirmation() {
     ));
     assert_eq!(k.status().unwrap().keyslots, before);
     assert!(
-        decline
-            .sent()
-            .iter()
-            .any(|m| matches!(m, ToPrompter::Confirm { text } if text.contains("security key")))
+        decline.sent().iter().any(
+            |m| matches!(m, ToPrompter::Confirm { text, .. } if text.contains("security key"))
+        )
     );
     // Accept: both FIDO2 slots are gone; the TPM slot still works.
     let accept = Interactive::new(vec![
@@ -1242,7 +1241,7 @@ fn stale_tpm_slots_cost_one_failure_and_rotation_skips_them() {
         .sent()
         .into_iter()
         .find_map(|m| match m {
-            ToPrompter::Confirm { text } => Some(text),
+            ToPrompter::Confirm { text, .. } => Some(text),
             _ => None,
         })
         .unwrap();
@@ -1490,7 +1489,7 @@ fn an_absent_key_that_times_out_is_offered_for_removal() {
         .sent()
         .iter()
         .find_map(|m| match m {
-            ToPrompter::Confirm { text } => Some(text.clone()),
+            ToPrompter::Confirm { text, .. } => Some(text.clone()),
             _ => None,
         })
         .unwrap();
