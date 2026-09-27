@@ -138,7 +138,12 @@ pub fn payload_len(header: [u8; 4]) -> Result<usize> {
 impl Request {
     /// The whole frame, ready to write.
     pub fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
-        let mut payload = Zeroizing::new(Vec::new());
+        // Sized up front: growing would free copies of the password.
+        let size = match self {
+            Self::Unlock { password } => 1 + 2 + password.expose().len(),
+            Self::ChangePassword { old, new } => 1 + 4 + old.expose().len() + new.expose().len(),
+        };
+        let mut payload = Zeroizing::new(Vec::with_capacity(1 + 2 + size));
         match self {
             Self::Unlock { password } => {
                 payload.push(UNLOCK);

@@ -138,7 +138,15 @@ pub async fn serve(
     // SAFETY: getuid cannot fail.
     let own_uid = unsafe { libc::getuid() };
     loop {
-        let (stream, _) = listener.accept().await?;
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            // (Out of descriptors, say: keep serving once it passes.)
+            Err(e) => {
+                tracing::warn!("pam.sock: accept failed: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
+        };
         let (keyring, secrets, limits) = (keyring.clone(), secrets.clone(), limits.clone());
         tokio::spawn(async move {
             match stream.peer_cred() {
@@ -187,11 +195,14 @@ async fn handle(
         // interactive unlock.)
         tracing::warn!("pam.sock: {}", reply.message);
     }
+    // Answer first: the lock screen or the display manager is waiting, and
+    // bringing the Secret Service objects up to date can take a while.
+    let frame = reply.encode().map_err(std::io::Error::other)?;
+    let written = stream.write_all(&frame).await;
     if !keyring.is_locked() {
         let _ = secrets.unlocked().await;
     }
-    let frame = reply.encode().map_err(std::io::Error::other)?;
-    stream.write_all(&frame).await
+    written
 }
 
 async fn read_request(stream: &mut tokio::net::UnixStream) -> std::io::Result<Request> {

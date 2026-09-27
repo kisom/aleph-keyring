@@ -3,9 +3,10 @@
 //!
 //! - **auth:** read the password (`PAM_AUTHTOK`, set by `pam_unix` before
 //!   us). If the user's `pam.sock` exists (a screen locker, or a second
-//!   login), deliver it now; otherwise, or if that fails, keep it
-//!   (`pam_set_data`, zeroized on cleanup) for session open, when the
-//!   user's systemd instance is up.
+//!   login), deliver it now; otherwise, or if no daemon answered there,
+//!   keep it (`pam_set_data`, zeroized on cleanup) for session open, when
+//!   the user's systemd instance is up. A daemon that refused, or did not
+//!   answer in time, is not asked again: the host waits the timeout once.
 //! - **session open:** deliver a kept password.
 //! - **password (chauthtok):** in the update phase, deliver the old and new
 //!   passwords, only when both are known (root changing another user's
@@ -64,11 +65,16 @@ pub fn authenticate(pam: &mut dyn Pam, courier: &dyn Courier) {
         let request = Request::Unlock {
             password: Password::new(&password),
         };
-        if send(pam, courier, &user, &request, "unlock") == Outcome::Accepted {
-            return;
+        match send(pam, courier, &user, &request, "unlock") {
+            // Not there yet (a stale socket file), or it failed on our
+            // side: try again at session open.
+            Outcome::Unreachable | Outcome::Failed => {}
+            // Done, refused, or no answer in time (the host has waited the
+            // timeout once already): nothing more.
+            _ => return,
         }
     }
-    // Not up yet (a login), or it did not work: try again at session open.
+    // Not up yet (a login), or no daemon answered: try at session open.
     pam.keep(password);
 }
 
@@ -233,8 +239,8 @@ mod tests {
         assert!(courier.sent.borrow().is_empty());
     }
 
-    /// A delivery at auth that does not work (a stale socket, a busy
-    /// daemon) is tried again at session open.
+    /// A delivery at auth that found no daemon (a stale socket file) is
+    /// tried again at session open.
     #[test]
     fn a_failed_delivery_at_auth_is_tried_again_at_session_open() {
         let mut pam = FakePam {
@@ -242,12 +248,31 @@ mod tests {
             ..Default::default()
         };
         let mut courier = FakeCourier::new(true);
-        courier.answer = Outcome::TimedOut;
+        courier.answer = Outcome::Unreachable;
         authenticate(&mut pam, &courier);
         assert!(pam.kept.is_some());
         courier.answer = Outcome::Accepted;
         open_session(&mut pam, &courier);
         assert_eq!(*courier.sent.borrow(), [unlock("pw"), unlock("pw")]);
+    }
+
+    /// A daemon that answered (refused) or did not answer in time is not
+    /// asked again at session open: the host program waits at most the
+    /// timeout once, and a refusal is not spent twice.
+    #[test]
+    fn a_refused_or_timed_out_delivery_is_not_retried() {
+        for answer in [Outcome::TimedOut, Outcome::Refused] {
+            let mut pam = FakePam {
+                authtok: Some("pw"),
+                ..Default::default()
+            };
+            let mut courier = FakeCourier::new(true);
+            courier.answer = answer;
+            authenticate(&mut pam, &courier);
+            assert!(pam.kept.is_none(), "{answer:?}");
+            open_session(&mut pam, &courier);
+            assert_eq!(courier.sent.borrow().len(), 1, "{answer:?}");
+        }
     }
 
     #[test]

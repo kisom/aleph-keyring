@@ -67,6 +67,12 @@ pub enum Error {
     #[error("another operation is in progress; finish or cancel it first")]
     Busy,
 
+    #[error("the keyring was unlocked meanwhile")]
+    UnlockedElsewhere,
+
+    #[error("the system is going to sleep; unlock again once it has resumed")]
+    Sleeping,
+
     #[error(
         "the recovery key just shown was not installed ({0}); discard it: your previous recovery key still works"
     )]

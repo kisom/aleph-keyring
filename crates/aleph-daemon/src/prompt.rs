@@ -22,6 +22,9 @@ use crate::error::{Error, Result};
 
 pub use aleph_prompt_proto::*;
 
+/// How often a waiting question checks whether it is still needed.
+const POLL: Duration = Duration::from_millis(250);
+
 /// The daemon's end of a prompter conversation. Blocking; every read is
 /// bounded by the prompt timeout.
 pub struct Channel {
@@ -74,6 +77,32 @@ impl Channel {
             Some(FromPrompter::Cancel {}) => Err(Error::Cancelled),
             Some(reply) => Ok(reply),
             None => Err(Error::Prompt("the prompt timed out".into())),
+        }
+    }
+
+    /// `ask`, but giving up with `Error::UnlockedElsewhere` as soon as
+    /// `waiting` turns false (checked a few times a second): an unlock
+    /// conversation ends when the vault is unlocked some other way, rather
+    /// than leave a stale dialog open.
+    pub fn ask_while(
+        &mut self,
+        msg: &ToPrompter,
+        waiting: &dyn Fn() -> bool,
+    ) -> Result<FromPrompter> {
+        debug_assert!(msg.needs_reply());
+        self.send(msg)?;
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Error::Prompt("the prompt timed out".into()));
+            }
+            match self.recv(Some(left.min(POLL)))? {
+                Some(FromPrompter::Cancel {}) => return Err(Error::Cancelled),
+                Some(reply) => return Ok(reply),
+                None if !waiting() => return Err(Error::UnlockedElsewhere),
+                None => {}
+            }
         }
     }
 

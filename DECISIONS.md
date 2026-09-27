@@ -319,6 +319,44 @@ Left for Plan 6's root container:
 - the privilege drop
 - a `passwd` whose `pam_unix` update fails, which must change nothing
 
+### D13. The final review of the executed Plan 4a branch: fixes and one re-scope
+
+Nothing critical. Two important defects are fixed, each with a test that
+failed first:
+- **A login password did not end an open prompter conversation.** The
+  prompter kept its dialog up, and cancelling it failed the app although
+  the vault was open. Unlock conversations now check a few times a second
+  and end, successfully, once the vault is unlocked some other way; an
+  unlock that happened anyway counts as success.
+- **A delivery that timed out at auth was retried at session open,** so a
+  hung daemon could hold a login up for 10 s. Only a delivery that found
+  no daemon is retried now.
+
+**Re-scoped: locking with the screen on Omarchy.** Omarchy's lock
+(`omarchy-system-lock`, a Quickshell session lock) never tells logind, so
+`Session.Lock` never arrives there. The spec and docs now say so, and
+point to `aleph lock` and the idle timeout meanwhile. How setup makes
+Omarchy's lock reach alephd (a hook, a wrapper, or something upstream) is
+a Plan 4b design question for its reviewer.
+
+Minor fixes adopted:
+- Nothing unlocks between `PrepareForSleep(true)` and the resume, so an
+  open in flight cannot leave the vault open through a sleep. A keyring
+  whose setup finishes then is written but left locked.
+- `pam.sock` answers before bringing the Secret Service up to date, and
+  survives accept errors.
+- The logind watcher survives a failed `Inhibit` or a malformed signal.
+- A `passwd` change retries once the other way if the vault was unlocked
+  or locked meanwhile, and the detached write happens only while the vault
+  is still locked.
+- The hardware lock is not held across Argon2.
+- Requests are encoded in exactly sized buffers.
+- The forked child uses raw `setgroups`/`setgid`/`setuid` calls.
+
+Left as they are: a FIDO2 touch holds the hardware for as long as it takes
+(inherent), and a missing `aleph-check` still means the login stack is
+trusted (D5; the spec names it).
+
 ### D12. The pre-execution review of the Plan 4a document: fixes adopted
 
 The review of the plan and prototype found nothing critical, and six

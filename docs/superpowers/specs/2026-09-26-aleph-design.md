@@ -820,7 +820,11 @@ idle_timeout = 0         # seconds without secret access; 0 = disabled
 - **Screen lock:** logind's `Session.Lock` for a session of this user
   (`loginctl lock-session`, which hypridle sends), sent by logind itself
   (the sender is checked against the name's owner: any peer can send a
-  directed signal).
+  directed signal). Omarchy's own lock (`omarchy-system-lock`, a Quickshell
+  session lock, used by its idle service and key binding) does not tell
+  logind, so on Omarchy the vault does not yet lock with the screen. How
+  setup wires it is Plan 4b's to decide (DECISIONS.md D13); until then,
+  bind `aleph lock` next to the lock, or use `lock.idle_timeout`.
 - **Idle:** no secret read or written for `idle_timeout` seconds.
 - Without a system bus or logind, `alephd` runs without the sleep and
   screen-lock parts.

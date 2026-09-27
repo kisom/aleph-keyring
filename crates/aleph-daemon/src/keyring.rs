@@ -152,6 +152,8 @@ pub struct Keyring {
     pub key_wait: Duration,
     /// When the body was last read or written (for the idle lock).
     last_access: Mutex<Instant>,
+    /// The system is going to sleep: nothing is installed until it resumes.
+    sleeping: std::sync::atomic::AtomicBool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -182,11 +184,20 @@ impl Keyring {
             argon2: Argon2Params::LOGIN_PASSWORD_FLOOR,
             key_wait: Duration::from_secs(120),
             last_access: Mutex::new(Instant::now()),
+            sleeping: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     pub fn is_locked(&self) -> bool {
         lock(&self.inner).vault.is_none()
+    }
+
+    /// The system is going to sleep (`true`) or has resumed (`false`).
+    /// While it sleeps nothing is unlocked: an open that finishes just after
+    /// the pre-sleep lock must not leave the vault unlocked through it.
+    pub fn set_sleeping(&self, sleeping: bool) {
+        self.sleeping
+            .store(sleeping, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// How long since the body was last read or written, or the vault
@@ -341,7 +352,11 @@ impl Keyring {
     /// Unlock through the prompter.
     pub fn unlock(&self, chan: &mut Channel, caller: Option<Caller>) -> Result<()> {
         let _op = self.begin(chan)?;
-        converse(chan, |chan| self.unlock_conversation(chan, caller))
+        match converse(chan, |chan| self.unlock_conversation(chan, caller)) {
+            // Unlocked some other way meanwhile: that is what was asked.
+            Err(_) if !self.is_locked() => Ok(()),
+            other => other,
+        }
     }
 
     /// Unlock through a prompter that `launch` starts only once no other
@@ -365,8 +380,10 @@ impl Keyring {
                 return Ok(false);
             }
         };
-        converse(&mut chan, |chan| self.unlock_conversation(chan, caller))?;
-        Ok(true)
+        match converse(&mut chan, |chan| self.unlock_conversation(chan, caller)) {
+            Err(_) if !self.is_locked() => Ok(true),
+            other => other.map(|()| true),
+        }
     }
 
     fn unlock_conversation(
@@ -388,7 +405,12 @@ impl Keyring {
             slot,
             kek,
             reseal,
-        } = self.choose_and_open(chan, &locked)?;
+        } = match self.choose_and_open(chan, &locked) {
+            Err(Error::UnlockedElsewhere) => {
+                return Ok(Some("The keyring was unlocked meanwhile.".into()));
+            }
+            other => other?,
+        };
         let warning = self.install(vault, slot, kek.as_ref())?;
         let pending = |message: Option<String>| -> Option<String> {
             if !lock(&self.inner).state.rotation_pending() {
@@ -451,11 +473,14 @@ impl Keyring {
         // Previous-password tries so far (each goes straight to the TPM).
         let mut old_tries = 0;
         for _ in 0..MAX_ATTEMPTS {
-            let reply = chan.ask(&ToPrompter::Ask {
-                methods: methods.clone(),
-                error: error.take(),
-                retry_after: retry_after.take(),
-            })?;
+            let reply = chan.ask_while(
+                &ToPrompter::Ask {
+                    methods: methods.clone(),
+                    error: error.take(),
+                    retry_after: retry_after.take(),
+                },
+                &|| self.is_locked(),
+            )?;
             let attempt = match reply {
                 FromPrompter::Password { password } if methods.contains(&Method::Password) => {
                     match self.open_with_password(vault, password.expose(), true) {
@@ -477,7 +502,7 @@ impl Keyring {
                     }
                 }
                 FromPrompter::Fido2 {} if methods.contains(&Method::Fido2) => {
-                    self.open_with_fido2(chan, vault, None)
+                    self.open_with_fido2(chan, vault, None, true)
                 }
                 other => return Err(Error::Prompt(format!("unexpected reply {other:?}"))),
             };
@@ -495,6 +520,8 @@ impl Keyring {
                     e @ (Error::Cancelled
                     | Error::Prompt(_)
                     | Error::KeyTimeout
+                    | Error::UnlockedElsewhere
+                    | Error::Sleeping
                     | Error::TooManyAttempts { .. }
                     | Error::Unlock(aleph_unlock::Error::Fido2PinInvalid)),
                 ) => {
@@ -612,6 +639,8 @@ impl Keyring {
                 }
             }
         }
+        // (Argon2 below needs no hardware; others may use it meanwhile.)
+        drop(hw);
         for k in password_slots {
             match vault.unlock_login_password(k.id, password.as_bytes()) {
                 Ok(v) => {
@@ -669,9 +698,12 @@ impl Keyring {
             if let Some(wait) = lock(&self.inner).typed.blocked(now) {
                 return Err(Error::TooManyAttempts { retry_after: wait });
             }
-            let reply = chan.ask(&ToPrompter::OldPassword {
-                error: error.take(),
-            })?;
+            let reply = chan.ask_while(
+                &ToPrompter::OldPassword {
+                    error: error.take(),
+                },
+                &|| self.is_locked(),
+            )?;
             let FromPrompter::Password { password: old } = reply else {
                 return Err(Error::Prompt(format!("unexpected reply {reply:?}")));
             };
@@ -696,13 +728,17 @@ impl Keyring {
     }
 
     /// Open `vault` with a FIDO2 slot: wait for a key holding one (or only
-    /// `only`), ask its PIN if needed, then the touch.
+    /// `only`), ask its PIN if needed, then the touch. `unlocking`: this is
+    /// an unlock conversation, which ends once the vault is unlocked some
+    /// other way (re-authentication and rotations need the vault unlocked).
     fn open_with_fido2(
         &self,
         chan: &mut Channel,
         vault: &LockedVault,
         only: Option<Uuid>,
+        unlocking: bool,
     ) -> Result<Opened> {
+        let waiting = || !unlocking || self.is_locked();
         let slots: Vec<(Uuid, String, aleph_core::Fido2Slot)> = vault
             .keyslots()
             .filter(|k| only.is_none_or(|id| id == k.id))
@@ -722,15 +758,18 @@ impl Keyring {
         // The hardware lock is held only for key operations, never while the
         // prompter is asked: a PIN prompt can stay open for minutes, and a
         // login password (pam.sock) must not wait behind it.
-        let (id, label, slot) = self.wait_for_key(chan, &slots, &names)?;
+        let (id, label, slot) = self.wait_for_key(chan, &slots, &names, &waiting)?;
         let mut error = None;
         let mut wrong_pins = 0;
         loop {
             let pin = if slot.pin_required {
-                match chan.ask(&ToPrompter::Fido2Pin {
-                    key: label.clone(),
-                    error: error.take(),
-                })? {
+                match chan.ask_while(
+                    &ToPrompter::Fido2Pin {
+                        key: label.clone(),
+                        error: error.take(),
+                    },
+                    &waiting,
+                )? {
                     FromPrompter::Pin { pin } => Some(pin),
                     other => return Err(Error::Prompt(format!("unexpected reply {other:?}"))),
                 }
@@ -774,6 +813,7 @@ impl Keyring {
         chan: &mut Channel,
         slots: &[(Uuid, String, aleph_core::Fido2Slot)],
         names: &str,
+        waiting: &dyn Fn() -> bool,
     ) -> Result<(Uuid, String, aleph_core::Fido2Slot)> {
         let deadline = Instant::now() + self.key_wait;
         let mut asked = false;
@@ -790,6 +830,9 @@ impl Keyring {
             }
             if chan.cancelled()? {
                 return Err(Error::Cancelled);
+            }
+            if !waiting() {
+                return Err(Error::UnlockedElsewhere);
             }
             if Instant::now() >= deadline {
                 return Err(Error::KeyTimeout);
@@ -813,6 +856,9 @@ impl Keyring {
         // dropped, never installed over it.
         if inner.vault.is_some() {
             return Ok(None);
+        }
+        if self.sleeping.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Sleeping);
         }
         // The file may also have moved on since this copy was read
         // (unlocked elsewhere, written, locked again). An older copy must
@@ -870,7 +916,7 @@ impl Keyring {
                     Some(Zeroizing::new(password.expose().to_string())),
                 ),
                 FromPrompter::Fido2 {} if methods.contains(&Method::Fido2) => {
-                    (self.open_with_fido2(chan, &current, None), None)
+                    (self.open_with_fido2(chan, &current, None, false), None)
                 }
                 other => return Err(Error::Prompt(format!("unexpected reply {other:?}"))),
             };
@@ -1020,7 +1066,7 @@ impl Keyring {
                     other => {
                         proof.fido2 = other;
                         let current = lock(&self.inner).store.read()?;
-                        match self.open_with_fido2(chan, &current, Some(k.id)) {
+                        match self.open_with_fido2(chan, &current, Some(k.id), false) {
                             Ok(opened) => keks.push((k.id, opened.kek.expect("fido2 kek"))),
                             // Cancelling one key's wait means "skip it", and
                             // so does a wait that runs out (the key is not
@@ -1222,7 +1268,14 @@ impl Keyring {
         let ids: HashSet<Uuid> = match detached {
             Some(v) => {
                 edit(v)?;
-                lock(&self.inner).store.write(v)?;
+                // Written only while still locked (a login password through
+                // pam.sock does not wait for `ops`): otherwise the caller
+                // does the change in the unlocked vault instead.
+                let inner = lock(&self.inner);
+                if inner.vault.is_some() {
+                    return Err(Error::UnlockedElsewhere);
+                }
+                inner.store.write(v)?;
                 v.keyslots().map(|k| k.id).collect()
             }
             None => {
@@ -1267,7 +1320,22 @@ impl Keyring {
             Err(_) => false,
         };
         let _op = lock(&self.ops);
-        let locked = self.is_locked();
+        // The vault may be unlocked (pam.sock does not wait for `ops`) or
+        // locked (sleep, idle) while this runs: then once more, the other way.
+        for _ in 0..2 {
+            let locked = self.is_locked();
+            match self.change_once(old, new, vouched, locked) {
+                Err(Error::Locked) if !locked => continue,
+                Err(Error::UnlockedElsewhere) if locked => continue,
+                other => return other,
+            }
+        }
+        Err(Error::Busy)
+    }
+
+    /// One attempt at `change_login_password`, on a vault found `locked` or
+    /// not.
+    fn change_once(&self, old: &str, new: &str, vouched: bool, locked: bool) -> Result<String> {
         if !locked && vouched {
             return self.replace_password_slots(new);
         }
@@ -1350,8 +1418,15 @@ impl Keyring {
             show_recovery_key(chan, &key)?;
             let mut inner = lock(&self.inner);
             inner.store.write(&vault)?;
-            inner.vault = Some(vault);
             inner.untrusted = None;
+            // Going to sleep: the file is written, but nothing is left
+            // unlocked through it.
+            if self.sleeping.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(Some(
+                    "The keyring is ready (locked until the system resumes).".into(),
+                ));
+            }
+            inner.vault = Some(vault);
             Ok(Some("The keyring is ready.".into()))
         })
     }

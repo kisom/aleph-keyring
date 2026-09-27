@@ -317,7 +317,91 @@ fn a_login_password_does_not_wait_for_a_conversation() {
     drop(theirs); // the prompter goes away: the conversation ends
     unlocked.expect("the login password did not wait").unwrap();
     assert!(!k.is_locked());
-    assert!(waiting.join().unwrap().is_err());
+    // (The conversation ends successfully: the vault was unlocked.)
+    assert!(waiting.join().unwrap().is_ok());
+    assert!(!k.is_locked());
+}
+
+/// When a login password unlocks the vault while a prompter waits at its
+/// question, the conversation ends at once, successfully: the prompter is
+/// told `Done` (no stale dialog), and the caller's unlock succeeds.
+#[test]
+fn a_waiting_prompter_is_released_when_the_vault_unlocks_elsewhere() {
+    use std::io::{BufRead, BufReader};
+    let env = env();
+    let k = Arc::new(keyring(&env, MockKeys::default()));
+    create_with_password(&k);
+    k.lock();
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut chan =
+        aleph_daemon::prompt::Channel::new(ours, std::time::Duration::from_secs(60)).unwrap();
+    let (asked, wait_asked) = std::sync::mpsc::channel();
+    let prompter = std::thread::spawn(move || {
+        let mut reader = BufReader::new(theirs);
+        let mut line = String::new();
+        let mut seen = Vec::new();
+        while reader.read_line(&mut line).unwrap() > 0 {
+            let msg: ToPrompter = serde_json::from_str(&line).unwrap();
+            line.clear();
+            if matches!(msg, ToPrompter::Ask { .. }) {
+                asked.send(()).unwrap();
+            }
+            let done = matches!(msg, ToPrompter::Done { .. });
+            seen.push(msg);
+            if done {
+                break;
+            }
+        }
+        seen
+    });
+    let conversation = {
+        let k = k.clone();
+        std::thread::spawn(move || k.unlock(&mut chan, None))
+    };
+    wait_asked.recv().unwrap();
+    k.unlock_with_login_password(PW).unwrap();
+    let (done, wait_done) = std::sync::mpsc::channel();
+    std::thread::spawn(move || done.send(conversation.join().unwrap()).unwrap());
+    let result = wait_done
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the conversation ended without waiting for the prompter");
+    result.unwrap();
+    let seen = prompter.join().unwrap();
+    assert!(
+        matches!(seen.last(), Some(ToPrompter::Done { ok: true, .. })),
+        "{:?}",
+        seen.last()
+    );
+}
+
+/// The system going to sleep: nothing is unlocked until it has resumed
+/// (an open finishing just after the pre-sleep lock must not leave the
+/// vault unlocked through the sleep).
+#[test]
+fn nothing_unlocks_while_the_system_sleeps() {
+    let env = env();
+    let k = keyring(&env, MockKeys::default());
+    create_with_password(&k);
+    k.lock();
+    k.set_sleeping(true);
+    assert!(k.unlock_with_login_password(PW).is_err());
+    assert!(k.is_locked());
+    k.set_sleeping(false);
+    k.unlock_with_login_password(PW).unwrap();
+    assert!(!k.is_locked());
+}
+
+/// A keyring whose setup finishes after the pre-sleep lock is written, but
+/// not left unlocked through the sleep.
+#[test]
+fn a_keyring_created_during_sleep_stays_locked() {
+    let env = env();
+    let k = keyring(&env, MockKeys::default());
+    k.set_sleeping(true);
+    create_with_password(&k);
+    assert!(k.is_locked());
+    k.set_sleeping(false);
+    k.unlock_with_login_password(PW).unwrap();
     assert!(!k.is_locked());
 }
 
@@ -407,7 +491,8 @@ fn holding_pin_prompter() -> (
         let mut reply = |r: &FromPrompter| {
             let mut out = serde_json::to_vec(r).unwrap();
             out.push(b'\n');
-            writer.write_all(&out).unwrap();
+            // (The conversation may already be over: the vault unlocked.)
+            let _ = writer.write_all(&out);
         };
         while reader.read_line(&mut line).unwrap() > 0 {
             let msg: ToPrompter = serde_json::from_str(&line).unwrap();
@@ -462,7 +547,7 @@ fn a_login_password_does_not_wait_behind_a_pin_prompt() {
     unlocked
         .expect("the login password did not wait for the PIN")
         .unwrap();
-    assert!(conversation.join().unwrap().is_err());
+    assert!(conversation.join().unwrap().is_ok());
     prompter.join().unwrap();
     assert!(!k.is_locked());
 }

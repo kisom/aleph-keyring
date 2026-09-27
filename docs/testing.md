@@ -144,7 +144,10 @@ gnome-keyring-daemon.service gnome-keyring-daemon.socket`):
      `~/.config/systemd/user/`)
 
    Then: log out and in (the vault is unlocked at login, no prompt); lock
-   the screen (`aleph status`: locked) and unlock it (unlocked); `passwd`
+   the screen with a locker that calls `loginctl lock-session` (not
+   Omarchy's own lock, which does not yet reach alephd; `aleph lock` stands
+   in for it) and check `aleph status` says locked, then unlock the screen
+   (unlocked, with no prompt); `passwd`
    (the TPM slot's id changes; with a FIDO2 slot, `aleph status` asks for
    `aleph keyslot rotate-master`); suspend and resume (locked).
 7. `aleph status` shows the keyslots; `journalctl --user` (or the

@@ -257,11 +257,13 @@ unsafe fn child(
         libc::sigprocmask(libc::SIG_UNBLOCK, &alrm, std::ptr::null_mut());
         libc::alarm(secs + 1);
         // Root drops to the user (groups, then gid, then uid); anyone else
-        // must already be the user.
+        // must already be the user. Raw system calls: the child has one
+        // thread, and glibc's wrappers are not on POSIX's async-signal-safe
+        // list.
         if libc::geteuid() == 0
-            && (libc::setgroups(1, &target.gid) != 0
-                || libc::setgid(target.gid) != 0
-                || libc::setuid(target.uid) != 0)
+            && (libc::syscall(libc::SYS_setgroups, 1usize, &target.gid) != 0
+                || libc::syscall(libc::SYS_setgid, target.gid) != 0
+                || libc::syscall(libc::SYS_setuid, target.uid) != 0)
         {
             finish(reporter, NO_PRIVILEGES);
         }

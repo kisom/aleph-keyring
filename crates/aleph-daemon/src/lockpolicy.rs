@@ -9,7 +9,7 @@
 //!   anyone, so `on_suspend` covers hibernation too.
 //! - **Screen lock** (`on_screen_lock`): logind's `Session.Lock` signal
 //!   (`loginctl lock-session`, which hypridle sends) for a session of this
-//!   user. Only a signal whose sender is logind itself counts: any peer can
+//!   user. (Omarchy's own lock does not send it: see the spec, §6.) Only a signal whose sender is logind itself counts: any peer can
 //!   send a directed signal, and a match rule cannot check a well-known
 //!   sender on the receiving side.
 //! - **Idle** (`idle_timeout`): no secret read or written for that many
@@ -51,13 +51,24 @@ pub async fn watch_logind(
         .build();
     let mut locks = zbus::MessageStream::for_match_rule(rule, &system, None).await?;
     let dbus = zbus::fdo::DBusProxy::new(&system).await?;
-    let mut inhibitor = Some(inhibit(&manager).await?);
+    // (Without an inhibitor the vault still locks at sleep, though the
+    // sleep may not wait for it; one is asked for again at each resume.)
+    let mut inhibitor = inhibit(&manager)
+        .await
+        .map_err(|e| tracing::warn!("no sleep inhibitor: {e}"))
+        .ok();
     // SAFETY: getuid cannot fail.
     let uid = unsafe { libc::getuid() };
     loop {
         tokio::select! {
             Some(msg) = sleeps.next() => {
-                let (starting,): (bool,) = msg.body().deserialize()?;
+                let Ok((starting,)) = msg.body().deserialize::<(bool,)>() else {
+                    tracing::warn!("ignored a malformed PrepareForSleep");
+                    continue;
+                };
+                // Nothing unlocks from now until the resume (an unlock in
+                // flight must not leave the vault open through the sleep).
+                secrets.keyring.set_sleeping(starting);
                 if starting {
                     if config.lock().unwrap().lock.on_suspend {
                         if let Err(e) = secrets.lock().await {
@@ -68,7 +79,10 @@ pub async fn watch_logind(
                     // Done: let the sleep go ahead.
                     inhibitor = None;
                 } else if inhibitor.is_none() {
-                    inhibitor = inhibit(&manager).await.ok();
+                    inhibitor = inhibit(&manager)
+                        .await
+                        .map_err(|e| tracing::warn!("no sleep inhibitor: {e}"))
+                        .ok();
                 }
             }
             Some(Ok(msg)) = locks.next() => {
