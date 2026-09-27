@@ -4105,7 +4105,7 @@ Revert one at a time, see the test FAIL, then restore and see it pass:
 - In `unlock`, replace `Ok(true) => return ask(device),` and the `Ok(false) => {}` line after it with `Ok(_) => return ask(device),`. Test: `--test fido2 unlock_picks_the_right_key`.
 - In `unlock`, replace the `Err(e) => { first_error.get_or_insert(e); }` arm with `Err(e) => return Err(e),`. Test: `--test fido2 a_failing_preflight`.
 - In `unlock`, delete the `Err(_) if lone => return ask(device),` arm. Test: `--test fido2 a_lone_key_whose_preflight_errors`.
-- In `unlock`, right after `let lone = devices.len() == 1;` add `if lone {{ return ask(&mut devices[0]); }}`. Test: `--test fido2 another_keys_slot_does_not_spend`.
+- In `unlock`, right after `let lone = devices.len() == 1;` add `if lone { return ask(&mut devices[0]); }`. Test: `--test fido2 another_keys_slot_does_not_spend`.
 - Set `CRED_PROTECT` to `CredProtect::UvRequired`. Test: `--test fido2 unlock_picks_the_right_key`.
 - In `enroll`, replace `Verification::PinOrUv => return Err(Error::Fido2PinNotSet),` with `Verification::PinOrUv => (None, false),`. Test: `--test fido2 a_bare_key_is_refused`.
 
