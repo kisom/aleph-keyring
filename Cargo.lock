@@ -53,6 +53,10 @@ name = "aleph-daemon"
 version = "0.1.0"
 dependencies = [
  "aleph-core",
+ "aleph-daemon",
+ "aleph-prompt-proto",
+ "aleph-tpm-proto",
+ "aleph-tpmd",
  "aleph-unlock",
  "libc",
  "serde",
