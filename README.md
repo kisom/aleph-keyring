@@ -14,11 +14,13 @@ gnome-keyring's secrets store; libsecret applications work unmodified.
 
 Login and screen unlock (`pam_aleph`), `passwd` changes, and locking on
 sleep, screen lock, or idle are in place (Plan 4a). `aleph setup` does not
-yet edit PAM, take over from gnome-keyring, or import its items (Plan 4b):
+yet edit PAM, take over from gnome-keyring, or import its items (Plan 4c):
 see [docs/testing.md](docs/testing.md) for the lines to add by hand. If
 the login password is changed outside aleph, the next unlock asks for the
-previous one to update the TPM keyslot. Design decisions made along the
-way are in [DECISIONS.md](DECISIONS.md).
+previous one to update the TPM keyslot. `aleph backup` and `aleph restore`
+(with the recovery key, from `.bak`, or accepting a rolled-back file) are
+in place (Plan 4b). Design decisions made along the way are in
+[DECISIONS.md](DECISIONS.md).
 
 ## Crates
 

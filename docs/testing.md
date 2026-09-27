@@ -127,7 +127,7 @@ gnome-keyring-daemon.service gnome-keyring-daemon.socket`):
    stored for the user ("Store the password only for this user"), lock,
    reconnect, and unlock when asked: the connection must come up without
    asking for the Wi-Fi password again.
-6. **Login and screen unlock** (Plan 4a; setup's PAM edits come in 4b, so
+6. **Login and screen unlock** (Plan 4a; setup's PAM edits come in 4c, so
    by hand for now, keeping backups):
    - `install -Dm755 target/debug/libpam_aleph.so /usr/lib/security/pam_aleph.so`
    - `/etc/pam.d/sddm`: `-auth optional pam_aleph.so` after `auth include
@@ -152,6 +152,26 @@ gnome-keyring-daemon.service gnome-keyring-daemon.socket`):
    `aleph keyslot rotate-master`); suspend and resume (locked).
 7. `aleph status` shows the keyslots; `journalctl --user` (or the
    terminal) shows no secrets.
+8. **Backup and restore** (Plan 4b):
+   - `aleph backup ~/aleph.bak` (re-authenticate): the file is mode
+     `0600`, and running it again refuses to overwrite it.
+   - On a second test account (or after moving `~/.local/share/aleph/`
+     and `~/.local/state/aleph/` aside), `aleph restore ~/aleph.bak`: type
+     the recovery key, choose an unlock method, and decline or accept a
+     new recovery key. `secret-tool lookup service aleph-check` prints the
+     secret; `aleph status` shows one unlock method and the recovery slot.
+   - Back on the first account, copy an older `vault.aleph` over the
+     current one (daemon stopped): the next unlock reports a rollback and
+     `aleph status` says writes are refused. `aleph restore
+     --accept-rollback` accepts it, after re-authentication, keeping the
+     previous `.bak` as `vault.aleph.bak-<time>`.
+   - Truncate `vault.aleph` (daemon stopped): `aleph restore --from-bak`
+     brings back the previous version, keeping the broken file as
+     `vault.aleph.corrupt-<time>`.
+   - Move `vault.aleph` away (daemon stopped) and `aleph restore` another
+     account's backup: it asks for the login password before the recovery
+     key. Delete the kept `vault.aleph.*-<time>` files afterwards (they
+     still open with the old recovery key).
 
 Record the results, and the libsecret, Chromium, and NetworkManager
 versions, in `hardware-log.md`.

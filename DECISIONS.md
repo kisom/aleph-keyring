@@ -6,6 +6,82 @@ session with the spec and the code, and no part in writing them). Newest
 first. The spec (`docs/superpowers/specs/2026-09-26-aleph-design.md`)
 is updated to match wherever a decision changes it.
 
+## 2026-09-27: Plan 4b split into custody (4b) and setup (4c)
+
+### F2. The pre-execution review of the Plan 4b document: fixes adopted
+
+Two critical and three important findings, each fixed with a test that
+failed first:
+- **E7's proof could be skipped.** Moving the vault away, planting a
+  vault (or a `.bak`) whose only method was the planter's own password,
+  or restoring while unlocked with the file gone, let a same-user process
+  holding a backup and its recovery key swap it in. Proof now comes only
+  from the vault this machine expects (re-authentication, or opening it),
+  or else from the login password checked with PAM; a planted vault's
+  methods prove nothing, for `restore`, `--from-bak`, and
+  `--accept-rollback` alike.
+- **Custody writes could destroy `.bak`**, sometimes the only good copy
+  (a rotation's write removes it; `--from-bak` and an acceptance replace
+  it). `.bak` is now kept aside by a hard link before every custody
+  write.
+- **Two kept copies in the same second** collided, and the copy fallback
+  wrote into the first (the old vault's own file). Names now take a
+  `-<n>` suffix, and the fallback copies only into a new file, synced.
+- **A restore file was read on the async runtime from any descriptor**
+  (a pipe could hold a worker). Only a regular file is read, off the
+  runtime.
+- **Tests** for the Review Focus lines that lacked them: a file that is
+  not a backup, a symlink and a refused overwrite, an older backup of the
+  same vault, clients seeing the restored items, and a corrupt vault
+  replaced after its slot opened; the plan's mappings are corrected.
+
+Minor fixes adopted: kept files are named in the result, with a warning
+that they still open with the old recovery key and methods; an older
+backup of the same vault asks first, naming both generations; a backup
+goes only into an empty file (a hard link to the vault elsewhere is
+refused), and a stale `--force` temporary file is named. The crash
+window between a restore's write and recording its ID is documented
+(the next unlock asks for `--accept-rollback`).
+
+
+### F1. Plan 4b is custody only; setup's system changes become Plan 4c — Accepted with changes
+
+- **4b, custody:** `aleph restore` with the recovery key (from a backup,
+  the current vault, or its `.bak`), `--from-bak`, `--accept-rollback`,
+  and `aleph backup` (E7, E8, and their tests from E11). Nothing outside
+  the user's own files; no root, no gnome-keyring.
+- **4c, setup:** import and export (E1, E2), switchover and revert (E3,
+  E9), PAM changes (E4–E6), step checks (E10), the wizard, explaining
+  lockoutAuth (D9), and how Omarchy's screen lock reaches alephd (D13).
+  4c has daemon tasks of its own: E1's queued import and E3's write
+  freeze touch the keyring engine and the Admin interface.
+
+Custody depends on nothing in 4c: the vault-id file is written at create,
+at restore, and at the first unlock of a vault without one, never by
+setup. 4c depends on custody: its emergency-revert docs name `aleph
+restore` and `--from-bak`. Restore is not what protects a login from a
+bad PAM edit (the `-` prefix, `optional`, E4's verify-and-roll-back, and
+the TTY are); it helps when a bad switchover leaves the vault unreachable
+by its methods.
+
+Changes adopted:
+- `Confirm` carries the answer Enter gives, so the new-recovery-key offer
+  defaults to yes and everything else (accepting a rollback included)
+  to no, as E7 says; the terminal shows `[Y/n]` or `[y/N]`.
+- A test pins that a vault with no vault-id file gets one at unlock.
+- The GUI's "Recover…" belongs to the GUI plan; `aleph restore` is the
+  only recovery path until then.
+- The spec's Admin method list and setup-step numbering now say 4c
+  where setup is meant.
+
+Also added while preparing 4b:
+- A restore that finishes after the pre-sleep lock writes nothing and
+  fails with "going to sleep", the counterpart of D13's rule for unlocks.
+- The file a restore replaces is kept by a hard link made before the
+  write (a copy where links fail), not moved away first: a crash between
+  the two leaves the old vault in place, where a rename would have left
+  no vault at all, and a later `setup` would have created an empty one.
+
 ## 2026-09-27: Plan 4b (custody and setup), design
 
 All twelve proposals were **Accepted with changes**, and the changes are
@@ -175,7 +251,8 @@ this machine.
 
 ### E12. Task list
 
-Nine tasks, with the additions above. The switchover-and-revert task and
+Nine tasks, with the additions above. (Split by F1: custody is Plan 4b,
+the rest Plan 4c.) The switchover-and-revert task and
 the wizard task are separate, and the docs task adds an emergency
 manual-revert section.
 
@@ -194,7 +271,8 @@ Reviewer verdicts are given as **Accepted**, **Accepted with changes**
   setup's system changes and `setup --revert`, and lockoutAuth.
 
 4b's setup installs the PAM lines 4a's module needs. Until then, 4a's docs
-give the lines to add by hand, marked provisional.
+give the lines to add by hand, marked provisional. (Setup later moved to
+Plan 4c: F1.)
 
 ### D2. `passwd` without FIDO2 slots rotates MK; with them, it keeps MK and marks a rotation pending — Accepted with changes
 

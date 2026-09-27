@@ -176,6 +176,15 @@ holds every decrypted secret. Separation protects MK, not the secrets.
 - If `vault.aleph` fails to parse or authenticate and `vault.aleph.bak`
   opens, `alephd` does not switch over automatically. It reports the
   problem and offers `aleph restore --from-bak`.
+- A file that a restore or `--from-bak` replaces is kept as
+  `vault.aleph.replaced-<time>` (or `.corrupt-<time>` if it could not be
+  read), never deleted. It is linked under that name before the write,
+  so a crash in between leaves it in place as `vault.aleph`. `.bak` is
+  kept the same way (`vault.aleph.bak-<time>`) before every custody
+  write, since the write replaces it and it may be the only good copy.
+  Kept files still open with the old recovery key and the old unlock
+  methods; `aleph` names them and says to delete them once the keyring
+  has been checked.
 
 ### Layout
 
@@ -219,6 +228,18 @@ On unlock:
 - **Higher `generation` with a different `mk_id`:** MK changed somewhere
   other than this daemon, or someone holding an old MK is replaying it
   under a forged generation (`Rekeyed`). Same handling.
+
+`alephd` also records the ID of the vault this machine uses
+(`$XDG_STATE_HOME/aleph/vault-id`, written at create and restore, or at
+the first unlock if missing). A vault with a different ID at the path is
+not trusted, with the same handling, even with no mark for its ID. (A
+crash between a restore's write and recording its ID makes the next
+unlock report a different vault; `aleph restore --accept-rollback`
+settles it.)
+
+A restore or an acceptance writes the vault at generation
+`max(recorded, found) + 1`, so the mark is never lowered and every older
+copy stays detectable.
 
 Only the daemon's own writes move the mark to a new MK. The daemon writes
 with `write_recorded`, which notes the intended mark before the rename
@@ -689,7 +710,7 @@ Verified against a stock Omarchy install on 2026-09-26.
   ```
 
 - **Which services get them**, with setup editing each and keeping a
-  backup (Plan 4b; by hand until then, `docs/testing.md`):
+  backup (Plan 4c; by hand until then, `docs/testing.md`):
 
   | Service | Change |
   |---|---|
@@ -773,8 +794,9 @@ Verified against a stock Omarchy install on 2026-09-26.
   whether MK is `mlock`ed, TPM usability, keyslots with stale marks),
   `Lock`, `Unlock`, `Create`, `EnrollTpm`, `EnrollFido2`,
   `RemoveKeyslot`, `RotateMaster`, `ReissueRecoveryKey`, `RetryKeyslot`,
-  `GetConfig`, `SetConfig`, and (Plan 4b) `ImportGnomeKeyring`,
-  `ExportToGnomeKeyring`, `Backup`, `Restore`.
+  `GetConfig`, `SetConfig`, (Plan 4b) `Backup`, `Recover`,
+  `RestoreBackup`, `RestoreFromBak`, `AcceptRollback`, and (Plan 4c)
+  `ImportGnomeKeyring`, `ExportToGnomeKeyring`.
 - **Methods that need the user take a prompter:** one end of a
   socketpair, passed as a Unix fd, speaking the prompter protocol. The
   CLI answers it in the terminal, `aleph-gui` in its windows. The call
@@ -823,7 +845,7 @@ idle_timeout = 0         # seconds without secret access; 0 = disabled
   directed signal). Omarchy's own lock (`omarchy-system-lock`, a Quickshell
   session lock, used by its idle service and key binding) does not tell
   logind, so on Omarchy the vault does not yet lock with the screen. How
-  setup wires it is Plan 4b's to decide (DECISIONS.md D13); until then,
+  setup wires it is Plan 4c's to decide (DECISIONS.md D13, F1); until then,
   bind `aleph lock` next to the lock, or use `lock.idle_timeout`.
 - **Idle:** no secret read or written for `idle_timeout` seconds.
 - Without a system bus or logind, `alephd` runs without the sleep and
@@ -877,7 +899,7 @@ aleph ls [collection]
 aleph import gnome-keyring
 aleph export gnome-keyring
 aleph config get|set <key> [value]
-aleph backup <path>
+aleph backup [--force] <path>
 aleph restore [--from-bak | --accept-rollback] [<path>]
 ```
 
@@ -894,7 +916,7 @@ aleph restore [--from-bak | --accept-rollback] [<path>]
   6. system changes (sudo)
 
   Plan 3 implements steps 1, 2, and 4 (creating the vault) and says that
-  the rest is not available yet; Plan 4b adds 3, 5, and 6.
+  the rest is not available yet; Plan 4c adds 3, 5, and 6.
 - **Import** reads every collection and item through the Secret Service
   API while gnome-keyring still owns the bus name. That covers everything
   shown in Seahorse's Passwords view.
@@ -902,10 +924,38 @@ aleph restore [--from-bak | --accept-rollback] [<path>]
   the recovery slot**, with its MK wrap. It also warns that generic backups
   of `~/.local/share/aleph/` contain every slot, including
   `login-password` on machines without a TPM.
+- **`aleph backup <path>`** needs re-authentication. The CLI creates the
+  file (new, mode `0600`, never following a symlink; with `--force`, a
+  temporary file renamed over `<path>` once the backup is written) and
+  hands the descriptor to `alephd`, which writes to it only if it is an
+  empty regular file outside aleph's data and state directories; the
+  daemon never opens a path it was given, and reads a restore file only
+  if it is a regular file.
 - **`aleph restore`** goes through `alephd`. The daemon opens the backup
-  with the recovery key, rotates MK, drops slots from the old machine,
-  enrolls this machine's slots, resets the high-water mark, and writes the
-  result.
+  (a descriptor, as above), or with no path the current vault (or `.bak`
+  if the vault cannot be read), with the recovery key. It keeps only the
+  recovery slot, enrolls one fresh unlock method for this machine,
+  rotates MK, writes the result past every recorded generation (§4), and
+  offers a new recovery key. A plain `restore` is refused while the
+  vault is unlocked and trusted.
+- **Proof.** Recovering the vault this machine expects needs only its
+  recovery key. Anything else that replaces the vault (a backup, or a
+  file that is not the expected vault) needs proof, so a same-user
+  process holding an old backup and its recovery key cannot swap it in:
+  the expected vault's method (re-authentication while it is unlocked,
+  or opening it; a corrupt one whose slot opens counts), or, where the
+  expected vault is missing, unreadable, or not the file there, the login
+  password checked with PAM, since a planted vault's own methods prove
+  nothing. Only a machine with no vault and none expected needs no proof.
+- An **older backup of the same vault** is restored only after a
+  question naming both generations and saying that anything written
+  since the backup is not in it (Enter says no).
+- **`aleph restore --from-bak`** replaces the vault with `.bak`, opened
+  with the normal methods; a `.bak` that is not the expected vault also
+  needs the login password. **`aleph restore --accept-rollback`**
+  accepts the unlocked, untrusted vault as current, after
+  re-authentication (plus the login password for a vault that is not the
+  expected one) and an explicit yes naming what is accepted.
 
 ### GUI (`aleph-gui`, eframe/egui)
 
