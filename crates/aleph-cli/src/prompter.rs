@@ -146,6 +146,18 @@ fn answer(
                 Method::Fido2 => FromPrompter::Fido2 {},
             })
         }
+        ToPrompter::OldPassword { error } => {
+            match error {
+                Some(e) => eprintln!("aleph: {e}"),
+                None => eprintln!(
+                    "aleph: your login password was changed without aleph; enter the previous \
+                     one to update the TPM keyslot (a wrong one costs a TPM attempt)"
+                ),
+            }
+            Some(FromPrompter::Password {
+                password: term.secret("Previous login password: ")?,
+            })
+        }
         ToPrompter::Fido2Pin { key, error } => {
             if let Some(e) = error {
                 eprintln!("aleph: {e}");

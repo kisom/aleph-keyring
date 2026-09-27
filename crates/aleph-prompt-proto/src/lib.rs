@@ -83,6 +83,12 @@ pub enum ToPrompter {
         /// Seconds until trying again can succeed, when known.
         retry_after: Option<u64>,
     },
+    /// The login password changed without aleph: PAM accepts the one just
+    /// given, but the TPM keyslot was sealed under the previous one. Ask
+    /// for the previous password (reply `Password`) to update the slot.
+    OldPassword {
+        error: Option<String>,
+    },
     /// The key `key` needs its PIN (reply `Pin`).
     Fido2Pin {
         key: String,
@@ -118,6 +124,7 @@ impl ToPrompter {
         matches!(
             self,
             Self::Ask { .. }
+                | Self::OldPassword { .. }
                 | Self::Fido2Pin { .. }
                 | Self::Confirm { .. }
                 | Self::ShowRecoveryKey { .. }
@@ -162,5 +169,17 @@ mod tests {
         let p: FromPrompter =
             serde_json::from_str(r#"{"type":"password","password":"hunter2"}"#).unwrap();
         assert!(!format!("{p:?}").contains("hunter2"));
+    }
+
+    /// The previous-password question expects an answer, and its wire form
+    /// is fixed (prompters in other programs match on it).
+    #[test]
+    fn the_old_password_question_needs_a_reply() {
+        let m = ToPrompter::OldPassword { error: None };
+        assert!(m.needs_reply());
+        assert_eq!(
+            serde_json::to_string(&m).unwrap(),
+            r#"{"type":"old_password","error":null}"#
+        );
     }
 }

@@ -87,7 +87,8 @@ fn too_many_typos_are_refused_with_a_wait() {
 }
 
 /// A TPM slot that rejects a password PAM accepts (the password changed
-/// elsewhere) is marked stale and no longer offered; retrying clears it.
+/// elsewhere) is marked stale, and the previous password is asked for
+/// (declined here); retrying clears the mark.
 #[test]
 fn a_slot_that_rejects_the_current_password_goes_stale() {
     let env = env();
@@ -102,12 +103,15 @@ fn a_slot_that_rejects_the_current_password_goes_stale() {
         password: Box::new(Fixed(|p| p == "new password")),
     };
     let k = Keyring::new(&env.paths, backends).unwrap();
-    let p = Interactive::new(vec![password("new password")]);
-    assert!(k.unlock(&mut p.channel(), None).is_err());
-    let errors = asks(&p.sent());
+    let p = Interactive::new(vec![password("new password"), FromPrompter::Cancel {}]);
+    assert!(matches!(
+        k.unlock(&mut p.channel(), None),
+        Err(Error::Cancelled)
+    ));
     assert!(
-        errors[1].0.as_deref().unwrap().contains("stale"),
-        "{errors:?}"
+        p.sent()
+            .iter()
+            .any(|m| matches!(m, ToPrompter::OldPassword { error: None }))
     );
     let tpm = k
         .status()
@@ -117,14 +121,555 @@ fn a_slot_that_rejects_the_current_password_goes_stale() {
         .find(|s| s.kind == "tpm")
         .unwrap();
     assert!(tpm.stale);
-    // With the only password slot stale, there is nothing to offer.
-    let p = Interactive::new(vec![]);
-    assert!(matches!(
-        k.unlock(&mut p.channel(), None),
-        Err(Error::NoMethodWorked(_))
-    ));
     k.retry_slot(tpm.id).unwrap();
     assert!(!k.status().unwrap().keyslots.iter().any(|s| s.stale));
+}
+
+/// The TPM slots' ids and the master key's id on disk.
+fn slots_and_mk(k: &Keyring, env: &Env, kind: &str) -> (Vec<uuid::Uuid>, [u8; 16]) {
+    let ids = k
+        .status()
+        .unwrap()
+        .keyslots
+        .into_iter()
+        .filter(|s| s.kind == kind)
+        .map(|s| s.id)
+        .collect();
+    let mk = aleph_core::LockedVault::read(&env.paths.vault())
+        .unwrap()
+        .mark()
+        .mk_id;
+    (ids, mk)
+}
+
+/// `passwd` (through `pam_aleph`) replaces the TPM slot with one sealed
+/// under the new password and rotates MK: the old slot is gone and the
+/// new password unlocks, with no failed TPM attempt.
+#[test]
+fn a_password_change_reseals_the_tpm_slot_and_rotates() {
+    let env = env();
+    let login = Accepting::new(PW);
+    let k = keyring_with(
+        &env,
+        Box::new(TpmClient::new(env.socket.clone())),
+        MockKeys::default(),
+        Box::new(login.clone()),
+    );
+    create_with_password(&k);
+    let (before, mk_before) = slots_and_mk(&k, &env, "tpm");
+    login.set("new");
+    let done = k.change_login_password(PW, "new").unwrap();
+    assert!(done.contains("rotated"), "{done}");
+    let (after, mk_after) = slots_and_mk(&k, &env, "tpm");
+    assert_eq!(after.len(), 1);
+    assert_ne!(after, before);
+    assert_ne!(mk_after, mk_before);
+    k.lock();
+    k.unlock(&mut Interactive::new(vec![password("new")]).channel(), None)
+        .unwrap();
+    assert_eq!(env.sw.tpm().status().unwrap().failed_tries, 0);
+    assert!(!k.status().unwrap().rotation_pending);
+}
+
+/// With a FIDO2 slot (which needs a touch) MK cannot rotate during
+/// `passwd`: the TPM slot is replaced keeping MK, and a rotation is marked
+/// pending until the user runs one.
+#[test]
+fn with_a_security_key_a_password_change_marks_a_rotation_pending() {
+    let env = env();
+    let login = Accepting::new(PW);
+    let k = keyring_with(
+        &env,
+        Box::new(TpmClient::new(env.socket.clone())),
+        MockKeys::one(MockAuthenticator::with_pin(PIN)),
+        Box::new(login.clone()),
+    );
+    create_with_password(&k);
+    k.enroll_fido2(
+        &mut Interactive::new(vec![password(PW), pin(PIN)]).channel(),
+        false,
+    )
+    .unwrap();
+    let (before, mk_before) = slots_and_mk(&k, &env, "tpm");
+    login.set("new");
+    let done = k.change_login_password(PW, "new").unwrap();
+    assert!(done.contains("rotate-master"), "{done}");
+    let (after, mk_after) = slots_and_mk(&k, &env, "tpm");
+    assert_eq!(after.len(), 1);
+    assert_ne!(after, before);
+    assert_eq!(mk_after, mk_before);
+    assert_eq!(slots_and_mk(&k, &env, "fido2").0.len(), 1);
+    assert!(k.status().unwrap().rotation_pending);
+    // Every unlock repeats it until done.
+    k.lock();
+    let p = Interactive::new(vec![password("new")]);
+    k.unlock(&mut p.channel(), None).unwrap();
+    assert!(
+        matches!(
+            p.sent().last(),
+            Some(ToPrompter::Done { ok: true, message: Some(m) }) if m.contains("rotate-master")
+        ),
+        "{:?}",
+        p.sent().last()
+    );
+    let p = Interactive::new(vec![password("new"), pin(PIN)]);
+    k.rotate_master(&mut p.channel()).unwrap();
+    assert!(!k.status().unwrap().rotation_pending);
+    assert_ne!(slots_and_mk(&k, &env, "tpm").1, mk_before);
+}
+
+/// A password change while locked opens the vault with the old password
+/// for the change, then locks it again.
+#[test]
+fn a_password_change_while_locked_leaves_it_locked() {
+    let env = env();
+    let login = Accepting::new(PW);
+    let k = keyring_with(
+        &env,
+        Box::new(TpmClient::new(env.socket.clone())),
+        MockKeys::default(),
+        Box::new(login.clone()),
+    );
+    create_with_password(&k);
+    k.lock();
+    login.set("new");
+    k.change_login_password(PW, "new").unwrap();
+    assert!(k.is_locked());
+    k.unlock(&mut Interactive::new(vec![password("new")]).channel(), None)
+        .unwrap();
+}
+
+/// A login-password slot (no TPM) is replaced by one for the new password.
+#[test]
+fn a_password_change_replaces_a_login_password_slot() {
+    let env = env();
+    let login = Accepting::new(PW);
+    let k = keyring_with(
+        &env,
+        Box::new(NoTpm),
+        MockKeys::default(),
+        Box::new(login.clone()),
+    );
+    create_with_password(&k);
+    login.set("new");
+    k.change_login_password(PW, "new").unwrap();
+    k.lock();
+    k.unlock(&mut Interactive::new(vec![password("new")]).channel(), None)
+        .unwrap();
+    assert_eq!(slots_and_mk(&k, &env, "login-password").0.len(), 1);
+}
+
+/// `pam_aleph` runs even when `passwd` failed to change the password: a new
+/// password PAM does not accept changes nothing.
+#[test]
+fn a_failed_passwd_changes_nothing() {
+    let env = env();
+    let k = keyring(&env, MockKeys::default());
+    create_with_password(&k);
+    let before = slots_and_mk(&k, &env, "tpm");
+    assert!(k.change_login_password(PW, "new").is_err());
+    assert_eq!(slots_and_mk(&k, &env, "tpm"), before);
+}
+
+/// A password from the login stack is still checked with PAM when PAM can:
+/// a wrong one never reaches the TPM or marks a slot stale.
+#[test]
+fn a_wrong_login_stack_password_never_reaches_the_tpm() {
+    let env = env();
+    let k = keyring(&env, MockKeys::default());
+    create_with_password(&k);
+    k.lock();
+    assert!(matches!(
+        k.unlock_with_login_password("wrong"),
+        Err(Error::WrongPassword)
+    ));
+    assert_eq!(env.sw.tpm().status().unwrap().failed_tries, 0);
+    assert!(!k.status().unwrap().keyslots.iter().any(|s| s.stale));
+    k.unlock_with_login_password(PW).unwrap();
+    assert!(!k.is_locked());
+}
+
+/// A login password does not wait behind an open conversation (a prompter
+/// nobody is answering, say while the screen is locked): it unlocks at
+/// once, and the conversation's own late result does not replace it.
+#[test]
+fn a_login_password_does_not_wait_for_a_conversation() {
+    let env = env();
+    let k = Arc::new(keyring(&env, MockKeys::default()));
+    create_with_password(&k);
+    k.lock();
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut silent =
+        aleph_daemon::prompt::Channel::new(ours, std::time::Duration::from_secs(60)).unwrap();
+    let waiting = {
+        let k = k.clone();
+        std::thread::spawn(move || k.unlock(&mut silent, None))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    // While the prompter stays silent (its timeout is a minute), the login
+    // password gets in.
+    let (done, wait_done) = std::sync::mpsc::channel();
+    {
+        let k = k.clone();
+        std::thread::spawn(move || done.send(k.unlock_with_login_password(PW)).unwrap());
+    }
+    let unlocked = wait_done.recv_timeout(std::time::Duration::from_secs(30));
+    drop(theirs); // the prompter goes away: the conversation ends
+    unlocked.expect("the login password did not wait").unwrap();
+    assert!(!k.is_locked());
+    assert!(waiting.join().unwrap().is_err());
+    assert!(!k.is_locked());
+}
+
+/// Whichever opens the vault first stays: a conversation that finishes
+/// after a login password unlocked it (and a secret was stored meanwhile,
+/// and the vault locked again) does not put back the older copy it opened:
+/// it opens the current file, which is neither lost nor read as a rollback.
+#[test]
+fn a_late_unlock_does_not_replace_the_open_vault() {
+    use std::io::{BufRead, BufReader, Write};
+    let env = env();
+    let k = Arc::new(keyring(&env, MockKeys::default()));
+    create_with_password(&k);
+    k.lock();
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut chan =
+        aleph_daemon::prompt::Channel::new(ours, std::time::Duration::from_secs(10)).unwrap();
+    let (asked, wait_asked) = std::sync::mpsc::channel();
+    let (answer, wait_answer) = std::sync::mpsc::channel::<()>();
+    // A prompter that answers the password question only when told.
+    let prompter = std::thread::spawn(move || {
+        let mut reader = BufReader::new(theirs.try_clone().unwrap());
+        let mut writer = theirs;
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap() > 0 {
+            let msg: ToPrompter = serde_json::from_str(&line).unwrap();
+            line.clear();
+            match msg {
+                ToPrompter::Ask { .. } => {
+                    asked.send(()).unwrap();
+                    wait_answer.recv().unwrap();
+                    let mut out = serde_json::to_vec(&password(PW)).unwrap();
+                    out.push(b'\n');
+                    writer.write_all(&out).unwrap();
+                }
+                ToPrompter::Done { .. } => return,
+                _ => {}
+            }
+        }
+    });
+    let conversation = {
+        let k = k.clone();
+        std::thread::spawn(move || k.unlock(&mut chan, None))
+    };
+    wait_asked.recv().unwrap();
+    k.unlock_with_login_password(PW).unwrap();
+    k.modify(|b| {
+        b.collections[0].upsert(
+            aleph_core::Item::new(
+                "x",
+                Default::default(),
+                aleph_core::SecretBytes::new(b"s".to_vec()),
+                "text/plain",
+            ),
+            false,
+        );
+        Ok(())
+    })
+    .unwrap();
+    k.lock();
+    answer.send(()).unwrap();
+    conversation.join().unwrap().unwrap();
+    prompter.join().unwrap();
+    assert_eq!(k.read(|b| b.collections[0].items.len()).unwrap(), 1);
+    assert_eq!(k.status().unwrap().untrusted, None);
+}
+
+/// A prompter that answers "security key", then holds the PIN question
+/// until told, then cancels. Returns (the channel, a receiver that fires
+/// when the PIN is asked, a sender that lets it cancel, its thread).
+fn holding_pin_prompter() -> (
+    aleph_daemon::prompt::Channel,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::io::{BufRead, BufReader, Write};
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let chan =
+        aleph_daemon::prompt::Channel::new(ours, std::time::Duration::from_secs(60)).unwrap();
+    let (asked, wait_asked) = std::sync::mpsc::channel();
+    let (release, wait_release) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let mut reader = BufReader::new(theirs.try_clone().unwrap());
+        let mut writer = theirs;
+        let mut line = String::new();
+        let mut reply = |r: &FromPrompter| {
+            let mut out = serde_json::to_vec(r).unwrap();
+            out.push(b'\n');
+            writer.write_all(&out).unwrap();
+        };
+        while reader.read_line(&mut line).unwrap() > 0 {
+            let msg: ToPrompter = serde_json::from_str(&line).unwrap();
+            line.clear();
+            match msg {
+                ToPrompter::Ask { .. } => reply(&FromPrompter::Fido2 {}),
+                ToPrompter::Fido2Pin { .. } => {
+                    asked.send(()).unwrap();
+                    wait_release.recv().unwrap();
+                    reply(&FromPrompter::Cancel {});
+                }
+                ToPrompter::Done { .. } => return,
+                _ => {}
+            }
+        }
+    });
+    (chan, wait_asked, release, thread)
+}
+
+/// A login password does not wait behind a security-key conversation
+/// either, even while its PIN question is open (the hardware is not held
+/// while the prompter is asked).
+#[test]
+fn a_login_password_does_not_wait_behind_a_pin_prompt() {
+    let env = env();
+    let k = Arc::new(keyring(
+        &env,
+        MockKeys::one(MockAuthenticator::with_pin(PIN)),
+    ));
+    create_with_password(&k);
+    k.enroll_fido2(
+        &mut Interactive::new(vec![password(PW), pin(PIN)]).channel(),
+        false,
+    )
+    .unwrap();
+    k.lock();
+    let (mut chan, pin_asked, release, prompter) = holding_pin_prompter();
+    let conversation = {
+        let k = k.clone();
+        std::thread::spawn(move || k.unlock(&mut chan, None))
+    };
+    pin_asked.recv().unwrap();
+    // While the PIN question stays open (the prompter's timeout is a
+    // minute), the login password gets in.
+    let (done, wait_done) = std::sync::mpsc::channel();
+    {
+        let k = k.clone();
+        std::thread::spawn(move || done.send(k.unlock_with_login_password(PW)).unwrap());
+    }
+    let unlocked = wait_done.recv_timeout(std::time::Duration::from_secs(30));
+    release.send(()).unwrap();
+    unlocked
+        .expect("the login password did not wait for the PIN")
+        .unwrap();
+    assert!(conversation.join().unwrap().is_err());
+    prompter.join().unwrap();
+    assert!(!k.is_locked());
+}
+
+/// `passwd` still changes the slots after a login with the new password got
+/// there first (and marked the old TPM slot stale): the change opens the
+/// file with the previous password whatever the stale mark.
+#[test]
+fn passwd_after_a_login_with_the_new_password_still_changes() {
+    let env = env();
+    let login = Accepting::new(PW);
+    let k = keyring_with(
+        &env,
+        Box::new(TpmClient::new(env.socket.clone())),
+        MockKeys::default(),
+        Box::new(login.clone()),
+    );
+    create_with_password(&k);
+    k.lock();
+    login.set("new");
+    assert!(matches!(
+        k.unlock_with_login_password("new"),
+        Err(Error::PasswordChanged)
+    ));
+    k.change_login_password(PW, "new").unwrap();
+    let p = Interactive::new(vec![password("new")]);
+    k.unlock(&mut p.channel(), None).unwrap();
+    assert!(
+        !p.sent()
+            .iter()
+            .any(|m| matches!(m, ToPrompter::OldPassword { .. }))
+    );
+}
+
+/// When PAM cannot vouch for the new password, the old one must open the
+/// vault file first: no same-user process can re-seal the vault under a
+/// password of its choosing.
+#[test]
+fn without_pam_a_change_must_prove_the_old_password() {
+    #[derive(Clone, Default)]
+    struct Vanishing(Arc<std::sync::atomic::AtomicBool>);
+    impl aleph_daemon::password::PasswordCheck for Vanishing {
+        fn check(&self, pw: &str) -> aleph_daemon::Result<bool> {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Error::PasswordCheckUnavailable);
+            }
+            Ok(pw == PW)
+        }
+    }
+    let env = env();
+    let pam = Vanishing::default();
+    let k = keyring_with(
+        &env,
+        Box::new(TpmClient::new(env.socket.clone())),
+        MockKeys::default(),
+        Box::new(pam.clone()),
+    );
+    create_with_password(&k);
+    pam.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    let before = slots_and_mk(&k, &env, "tpm");
+    assert!(matches!(
+        k.change_login_password("junk", "chosen"),
+        Err(Error::WrongPassword)
+    ));
+    assert_eq!(slots_and_mk(&k, &env, "tpm"), before);
+    k.change_login_password(PW, "chosen").unwrap();
+    assert_ne!(slots_and_mk(&k, &env, "tpm").0, before.0);
+}
+
+/// The previous password is asked at most twice per conversation, even
+/// when the current one is typed again in between.
+#[test]
+fn the_previous_password_is_asked_at_most_twice_per_conversation() {
+    let env = env();
+    let login = Accepting::new(PW);
+    let k = keyring_with(
+        &env,
+        Box::new(TpmClient::new(env.socket.clone())),
+        MockKeys::default(),
+        Box::new(login.clone()),
+    );
+    create_with_password(&k);
+    k.lock();
+    login.set("new");
+    let p = Interactive::new(vec![
+        password("new"),
+        password("wrong 1"),
+        password("wrong 2"),
+        password("new"),
+        password("wrong 3"),
+    ]);
+    assert!(k.unlock(&mut p.channel(), None).is_err());
+    let asked = p
+        .sent()
+        .iter()
+        .filter(|m| matches!(m, ToPrompter::OldPassword { .. }))
+        .count();
+    assert_eq!(asked, 2);
+}
+
+/// Declining the previous-password question returns to the choice of
+/// method; a security key then opens the vault, and the TPM slot is still
+/// re-sealed under the current password.
+#[test]
+fn declining_the_previous_password_leaves_the_security_key() {
+    let env = env();
+    let login = Accepting::new(PW);
+    let k = keyring_with(
+        &env,
+        Box::new(TpmClient::new(env.socket.clone())),
+        MockKeys::one(MockAuthenticator::with_pin(PIN)),
+        Box::new(login.clone()),
+    );
+    create_with_password(&k);
+    k.enroll_fido2(
+        &mut Interactive::new(vec![password(PW), pin(PIN)]).channel(),
+        false,
+    )
+    .unwrap();
+    let (before, _) = slots_and_mk(&k, &env, "tpm");
+    k.lock();
+    login.set("new");
+    let p = Interactive::new(vec![
+        password("new"),
+        FromPrompter::Cancel {},
+        FromPrompter::Fido2 {},
+        pin(PIN),
+    ]);
+    k.unlock(&mut p.channel(), None).unwrap();
+    let (after, _) = slots_and_mk(&k, &env, "tpm");
+    assert_eq!(after.len(), 1);
+    assert_ne!(after, before);
+    k.lock();
+    k.unlock(&mut Interactive::new(vec![password("new")]).channel(), None)
+        .unwrap();
+    assert_eq!(env.sw.tpm().status().unwrap().failed_tries, 1);
+}
+
+/// After an outside password change (PAM accepts the new password, the TPM
+/// slot was sealed under the old one), the previous password opens the
+/// vault and the slot is re-sealed under the new one: one failed TPM
+/// attempt in all, and the next unlock needs only the new password.
+#[test]
+fn a_password_changed_elsewhere_is_resealed_with_the_previous_one() {
+    let env = env();
+    let login = Accepting::new(PW);
+    let k = keyring_with(
+        &env,
+        Box::new(TpmClient::new(env.socket.clone())),
+        MockKeys::default(),
+        Box::new(login.clone()),
+    );
+    create_with_password(&k);
+    let (before, _) = slots_and_mk(&k, &env, "tpm");
+    k.lock();
+    login.set("new");
+    let p = Interactive::new(vec![password("new"), password(PW)]);
+    k.unlock(&mut p.channel(), None).unwrap();
+    assert!(
+        p.sent()
+            .iter()
+            .any(|m| matches!(m, ToPrompter::OldPassword { .. }))
+    );
+    let (after, _) = slots_and_mk(&k, &env, "tpm");
+    assert_ne!(after, before);
+    assert!(!k.status().unwrap().keyslots.iter().any(|s| s.stale));
+    assert_eq!(env.sw.tpm().status().unwrap().failed_tries, 1);
+    k.lock();
+    let p = Interactive::new(vec![password("new")]);
+    k.unlock(&mut p.channel(), None).unwrap();
+    assert!(
+        !p.sent()
+            .iter()
+            .any(|m| matches!(m, ToPrompter::OldPassword { .. }))
+    );
+    assert_eq!(env.sw.tpm().status().unwrap().failed_tries, 1);
+}
+
+/// Wrong previous passwords go straight to the TPM, so they are few: at
+/// most two per conversation, and the TPM helper's own limit holds.
+#[test]
+fn wrong_previous_passwords_are_few() {
+    let env = env();
+    let login = Accepting::new(PW);
+    let k = keyring_with(
+        &env,
+        Box::new(TpmClient::new(env.socket.clone())),
+        MockKeys::default(),
+        Box::new(login.clone()),
+    );
+    create_with_password(&k);
+    k.lock();
+    login.set("new");
+    let p = Interactive::new(vec![
+        password("new"),
+        password("wrong"),
+        password("wrong"),
+        password("wrong"),
+    ]);
+    assert!(k.unlock(&mut p.channel(), None).is_err());
+    let old_asked = p
+        .sent()
+        .iter()
+        .filter(|m| matches!(m, ToPrompter::OldPassword { .. }))
+        .count();
+    assert!(old_asked <= 2, "{old_asked}");
+    assert!(env.sw.tpm().status().unwrap().failed_tries <= 2);
 }
 
 /// Refusals that say nothing about the slot (here the TPM's reserve)
@@ -384,9 +929,8 @@ fn reads_do_not_wait_for_a_prompt() {
     assert!(waiting.join().unwrap().is_err());
 }
 
-/// `status` never waits for the hardware: while a FIDO2 unlock waits for
-/// the key to be plugged in (holding the hardware), it answers at once,
-/// with the TPM's usability unknown.
+/// `status` never waits for a conversation: while a FIDO2 unlock waits for
+/// the key to be plugged in, it answers at once.
 #[test]
 fn status_does_not_wait_while_a_key_is_awaited() {
     let env = env();
@@ -404,13 +948,13 @@ fn status_does_not_wait_while_a_key_is_awaited() {
     };
     std::thread::sleep(std::time::Duration::from_millis(150));
     let t = std::time::Instant::now();
-    let s = k.status().unwrap();
+    k.status().unwrap();
+    // (One round trip to the TPM helper at most; the key wait takes 600 ms.)
     assert!(
-        t.elapsed() < std::time::Duration::from_millis(100),
+        t.elapsed() < std::time::Duration::from_millis(500),
         "{:?}",
         t.elapsed()
     );
-    assert_eq!(s.tpm, None);
     assert!(waiting.join().unwrap().is_err());
 }
 

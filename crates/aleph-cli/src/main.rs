@@ -170,7 +170,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             };
             outcome(c.converse("Create", Args::Str(method)).await?)?;
             eprintln!(
-                "aleph: note: login unlock, taking over from gnome-keyring, and importing its items are not available yet"
+                "aleph: note: setup does not yet set up login unlock (PAM), take over from gnome-keyring, or import its items: these are not available yet (see docs/testing.md for the PAM lines)"
             );
         }
         Cmd::Status => {
@@ -190,6 +190,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 if s.memory_locked == Some(false) {
                     println!(
                         "warning: the master key could not be locked in RAM (mlock); it may be swapped"
+                    );
+                }
+                if s.rotation_pending {
+                    println!(
+                        "warning: after a password change the master key still needs rotating: run `aleph keyslot rotate-master`"
                     );
                 }
                 print_slots(&s.keyslots);

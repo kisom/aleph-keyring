@@ -32,9 +32,14 @@ pub enum Error {
     WrongPassword,
 
     #[error(
-        "the TPM keyslot '{0}' no longer accepts your login password (was it changed?) and is marked stale; unlock with another method, or set the previous password again with `passwd`, unlock, and run `aleph keyslot add tpm` before changing it"
+        "the TPM keyslot '{0}' no longer accepts your login password (was it changed?) and is marked stale; unlock again and give your previous password when asked, to update it"
     )]
     Stale(String),
+
+    #[error(
+        "your login password no longer opens the TPM keyslot (was it changed without aleph?); your previous password can update it"
+    )]
+    PasswordChanged,
 
     #[error("too many wrong passwords; retry in {} s", .retry_after.as_secs())]
     TooManyAttempts { retry_after: Duration },
@@ -96,9 +101,6 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Why unlocking cannot start when every enrolled method is stale.
-pub(crate) const ALL_STALE: &str = "every enrolled unlock method is stale (was your login password changed?); set the previous password again with `passwd`, then unlock";
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,12 +108,14 @@ mod tests {
     /// Stale-slot advice is read while the vault is locked, so it must not
     /// send the user to commands that need it unlocked (re-enrolling) or
     /// that only repeat the failure (`keyslot retry`); what works then is
-    /// setting the previous password again.
+    /// the previous password, which updates the slot (§5).
     #[test]
     fn stale_advice_works_while_locked() {
-        let stale = Error::Stale("tpm".into()).to_string();
-        for advice in [stale.as_str(), ALL_STALE] {
-            assert!(advice.contains("passwd"), "{advice}");
+        for advice in [
+            Error::Stale("tpm".into()).to_string(),
+            Error::PasswordChanged.to_string(),
+        ] {
+            assert!(advice.contains("previous password"), "{advice}");
             assert!(!advice.contains("re-enroll it with"), "{advice}");
             assert!(!advice.contains("keyslot retry"), "{advice}");
         }

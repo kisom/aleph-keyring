@@ -18,27 +18,47 @@ use crate::error::Result;
 #[serde(deny_unknown_fields)]
 struct File {
     stale: BTreeSet<Uuid>,
+    /// A password change replaced slots without rotating MK (spec §5
+    /// "Password change"); the next rotation clears it.
+    #[serde(default)]
+    rotation_pending: bool,
 }
 
 #[derive(Debug)]
 pub struct SlotState {
     path: PathBuf,
     stale: BTreeSet<Uuid>,
+    rotation_pending: bool,
 }
 
 impl SlotState {
     /// Load the state; a missing or unreadable file means "nothing stale"
     /// (the worst case is one extra attempt per slot).
     pub fn load(path: &Path) -> Self {
-        let stale = std::fs::read(path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<File>(&b).ok())
-            .map(|f| f.stale)
-            .unwrap_or_default();
+        let file = match std::fs::read(path) {
+            Ok(b) => serde_json::from_slice::<File>(&b).unwrap_or_else(|e| {
+                tracing::warn!("ignoring unreadable {}: {e}", path.display());
+                File::default()
+            }),
+            Err(_) => File::default(),
+        };
         Self {
             path: path.to_path_buf(),
-            stale,
+            stale: file.stale,
+            rotation_pending: file.rotation_pending,
         }
+    }
+
+    pub fn rotation_pending(&self) -> bool {
+        self.rotation_pending
+    }
+
+    pub fn set_rotation_pending(&mut self, pending: bool) -> Result<()> {
+        if self.rotation_pending != pending {
+            self.rotation_pending = pending;
+            self.save()?;
+        }
+        Ok(())
     }
 
     pub fn is_stale(&self, slot: Uuid) -> bool {
@@ -82,6 +102,7 @@ impl SlotState {
             &tmp,
             serde_json::to_vec(&File {
                 stale: self.stale.clone(),
+                rotation_pending: self.rotation_pending,
             })
             .expect("serializable"),
         )?;
@@ -109,6 +130,22 @@ mod tests {
         s.retain(|id| id != b).unwrap();
         let s = SlotState::load(&path);
         assert!(!s.is_stale(a) && !s.is_stale(b));
+    }
+
+    /// A pending rotation persists; files written before it existed load.
+    #[test]
+    fn a_pending_rotation_persists_and_old_files_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slots.json");
+        let a = Uuid::new_v4();
+        std::fs::write(&path, format!("{{\"stale\":[\"{a}\"]}}")).unwrap();
+        let mut s = SlotState::load(&path);
+        assert!(s.is_stale(a) && !s.rotation_pending());
+        s.set_rotation_pending(true).unwrap();
+        let mut s = SlotState::load(&path);
+        assert!(s.rotation_pending() && s.is_stale(a));
+        s.set_rotation_pending(false).unwrap();
+        assert!(!SlotState::load(&path).rotation_pending());
     }
 
     #[test]

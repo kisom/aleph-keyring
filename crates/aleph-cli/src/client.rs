@@ -33,6 +33,8 @@ pub struct Status {
     pub memory_locked: Option<bool>,
     pub tpm: Option<bool>,
     pub keyslots: Vec<SlotInfo>,
+    #[serde(default)]
+    pub rotation_pending: bool,
 }
 
 /// One item, as the CLI shows it.

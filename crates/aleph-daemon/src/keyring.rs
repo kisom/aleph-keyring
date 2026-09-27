@@ -91,6 +91,9 @@ pub struct Status {
     /// (the hardware is busy with a prompt, and status never waits).
     pub tpm: Option<bool>,
     pub keyslots: Vec<SlotInfo>,
+    /// A password change replaced slots without rotating MK (FIDO2 slots
+    /// need a touch): `aleph keyslot rotate-master` should follow.
+    pub rotation_pending: bool,
 }
 
 /// Answers a conversation accepts before giving up.
@@ -100,6 +103,9 @@ const MAX_ATTEMPTS: usize = 10;
 const PIN_ATTEMPTS: usize = 3;
 /// Tries at a login-password slot's own password during a rotation.
 const SLOT_PASSWORD_ATTEMPTS: usize = 3;
+/// Tries at the previous login password after an outside change: each
+/// wrong one goes straight to the TPM (PAM no longer knows it).
+const OLD_PASSWORD_ATTEMPTS: usize = 2;
 
 /// KEKs gathered for a rotation, by slot.
 type Keks = Vec<(Uuid, Kek)>;
@@ -122,6 +128,9 @@ struct Opened {
     vault: UnlockedVault,
     slot: Uuid,
     kek: Option<Kek>,
+    /// Opened with the previous login password: re-seal the password slots
+    /// under this one, the current login password, once installed.
+    reseal: Option<Zeroizing<String>>,
 }
 
 struct Inner {
@@ -220,6 +229,7 @@ impl Keyring {
             memory_locked: inner.vault.as_ref().map(UnlockedVault::memory_locked),
             tpm,
             keyslots,
+            rotation_pending: inner.state.rotation_pending(),
         })
     }
 
@@ -280,16 +290,15 @@ impl Keyring {
     }
 
     /// The methods the prompter may offer for `vault`: the login password
-    /// if a usable password slot exists, FIDO2 if a FIDO2 slot does. Never
-    /// recovery (§5: recovery is its own flow).
+    /// if a password slot exists (a stale TPM slot counts: the password
+    /// leads to re-sealing it, §5 "Password change"), FIDO2 if a FIDO2 slot
+    /// does. Never recovery (§5: recovery is its own flow).
     fn methods(&self, vault: &LockedVault) -> Vec<Method> {
-        let inner = lock(&self.inner);
         let mut password = false;
         let mut fido = false;
         for k in vault.keyslots() {
             match &k.kind {
-                SlotKind::Tpm(_) if !inner.state.is_stale(k.id) => password = true,
-                SlotKind::LoginPassword(_) => password = true,
+                SlotKind::Tpm(_) | SlotKind::LoginPassword(_) => password = true,
                 SlotKind::Fido2(_) => fido = true,
                 _ => {}
             }
@@ -363,30 +372,73 @@ impl Keyring {
             return Ok(None);
         }
         let locked = lock(&self.inner).store.read()?;
-        let opened = self.choose_and_open(chan, &locked)?;
-        self.install(opened.vault)
+        let Opened {
+            vault,
+            slot,
+            kek,
+            reseal,
+        } = self.choose_and_open(chan, &locked)?;
+        let warning = self.install(vault, slot, kek.as_ref())?;
+        let pending = |message: Option<String>| -> Option<String> {
+            if !lock(&self.inner).state.rotation_pending() {
+                return message;
+            }
+            let note = "a password change still needs the master key rotated: run `aleph keyslot rotate-master`";
+            Some(match message {
+                Some(m) => format!("{m}; {note}"),
+                None => note.into(),
+            })
+        };
+        let Some(current) = reseal else {
+            return Ok(pending(warning));
+        };
+        // Opened with the previous password: seal under the current one.
+        // The vault is open either way; a failure here is only reported.
+        let update = match self.replace_password_slots(&current) {
+            Ok(done) => done,
+            Err(e) => {
+                tracing::warn!("could not update the password keyslots: {e}");
+                format!("the TPM keyslot could not be updated ({e}); unlock again to retry")
+            }
+        };
+        Ok(pending(Some(match warning {
+            Some(w) => format!("{w}; {update}"),
+            None => update,
+        })))
     }
 
-    /// Unlock with a password the login stack already accepted (from
-    /// `pam_aleph`, Plan 4): no PAM check, no typed-attempt accounting.
+    /// Unlock with a password from the login stack (`pam_aleph` through
+    /// `pam.sock`). It is still checked with PAM when PAM can check, so a
+    /// wrong one never reaches the TPM; only when PAM cannot is the login
+    /// stack trusted. No typed-attempt accounting (`pam.sock` limits its
+    /// own failures). It does not wait for a running conversation: whichever
+    /// opens the vault first is installed.
     pub fn unlock_with_login_password(&self, password: &str) -> Result<()> {
-        let _op = lock(&self.ops);
         if !self.is_locked() {
             return Ok(());
         }
+        if let Ok(false) = lock(&self.hw).password.check(password) {
+            return Err(Error::WrongPassword);
+        }
         let locked = lock(&self.inner).store.read()?;
         let opened = self.open_with_password(&locked, password, false)?;
-        self.install(opened.vault).map(|_| ())
+        self.install(opened.vault, opened.slot, opened.kek.as_ref())
+            .map(|_| ())
     }
 
     /// Ask for a method until one opens `vault` (or the user cancels).
     fn choose_and_open(&self, chan: &mut Channel, vault: &LockedVault) -> Result<Opened> {
         let methods = self.methods(vault);
         if methods.is_empty() {
-            return Err(Error::NoMethodWorked(Some(crate::error::ALL_STALE.into())));
+            return Err(Error::NoMethodWorked(None));
         }
         let mut error: Option<String> = None;
         let mut retry_after = None;
+        // The current login password, once PAM accepted one that opens no
+        // TPM slot: whatever opens the vault then, it re-seals under it.
+        let mut current: Option<Zeroizing<String>> = None;
+        // Previous-password tries so far (each goes straight to the TPM).
+        let mut old_tries = 0;
         for _ in 0..MAX_ATTEMPTS {
             let reply = chan.ask(&ToPrompter::Ask {
                 methods: methods.clone(),
@@ -395,7 +447,23 @@ impl Keyring {
             })?;
             let attempt = match reply {
                 FromPrompter::Password { password } if methods.contains(&Method::Password) => {
-                    self.open_with_password(vault, password.expose(), true)
+                    match self.open_with_password(vault, password.expose(), true) {
+                        Err(Error::PasswordChanged) => {
+                            current = Some(Zeroizing::new(password.expose().to_string()));
+                            match self.open_with_old_password(
+                                chan,
+                                vault,
+                                password.expose(),
+                                &mut old_tries,
+                            ) {
+                                // Declined: back to the choice (a security
+                                // key, say), keeping the current password.
+                                Err(Error::Cancelled) => Err(Error::PasswordChanged),
+                                other => other,
+                            }
+                        }
+                        other => other,
+                    }
                 }
                 FromPrompter::Fido2 {} if methods.contains(&Method::Fido2) => {
                     self.open_with_fido2(chan, vault, None)
@@ -403,7 +471,12 @@ impl Keyring {
                 other => return Err(Error::Prompt(format!("unexpected reply {other:?}"))),
             };
             match attempt {
-                Ok(opened) => return Ok(opened),
+                Ok(mut opened) => {
+                    if opened.reseal.is_none() {
+                        opened.reseal = current;
+                    }
+                    return Ok(opened);
+                }
                 // Waiting is not something to retry at once, and a key's
                 // PIN budget for this conversation is spent (each wrong
                 // PIN costs one of the key's lifetime retries).
@@ -428,7 +501,11 @@ impl Keyring {
     /// Try `password` on the usable password slots: TPM slots first (after
     /// a PAM check if it was typed, so typos never reach the TPM), then
     /// login-password slots. A TPM slot that rejects a password PAM
-    /// accepted is marked stale.
+    /// accepted is marked stale. A password the login stack vouches for
+    /// (PAM accepted it, or it came from `pam_aleph`) that no TPM slot
+    /// takes, every one being stale or rejecting it, is
+    /// `Error::PasswordChanged`: the login password was changed without
+    /// aleph.
     fn open_with_password(
         &self,
         vault: &LockedVault,
@@ -436,6 +513,7 @@ impl Keyring {
         typed: bool,
     ) -> Result<Opened> {
         let now = Instant::now();
+        let any_tpm = vault.keyslots().any(|k| matches!(k.kind, SlotKind::Tpm(_)));
         let (tpm_slots, password_slots): (Vec<_>, Vec<_>) = {
             let mut inner = lock(&self.inner);
             if typed && let Some(wait) = inner.typed.blocked(now) {
@@ -450,17 +528,18 @@ impl Keyring {
                 })
                 .partition(|k| matches!(k.kind, SlotKind::Tpm(_)))
         };
-        if tpm_slots.is_empty() && password_slots.is_empty() {
-            return Err(Error::NoMethodWorked(Some(
-                "no usable password keyslot".into(),
-            )));
+        if !any_tpm && password_slots.is_empty() {
+            return Err(Error::NoMethodWorked(Some("no password keyslot".into())));
         }
         let hw = lock(&self.hw);
         let mut last = None;
-        let mut use_tpm = !tpm_slots.is_empty();
+        let all_stale = tpm_slots.is_empty();
+        let mut use_tpm = !all_stale;
         // PAM vouched for it: a slot refusing it is then not a typo.
         let mut accepted = false;
-        if typed && use_tpm {
+        // (Checked even when every TPM slot is stale: that tells a typo from
+        // a changed password.)
+        if typed && any_tpm {
             match hw.password.check(password) {
                 Ok(true) => accepted = true,
                 // Not the current login password: keep it from the TPM (it
@@ -477,6 +556,8 @@ impl Keyring {
                 }
             }
         }
+        // A TPM slot rejected it in this attempt.
+        let mut rejected = false;
         if use_tpm {
             // Newest first: the most recently enrolled slot is the one most
             // likely sealed with the current password. Once one rejects it,
@@ -496,17 +577,24 @@ impl Keyring {
                             vault: vault.unlock(k.id, &kek)?,
                             slot: k.id,
                             kek: Some(kek),
+                            reseal: None,
                         });
                     }
                     // Only these say something about the slot (Plan 2): the
                     // password it was sealed with is not this one.
-                    Err(aleph_unlock::Error::TpmAuthFailed | aleph_unlock::Error::TpmWrongUser) => {
+                    Err(
+                        e
+                        @ (aleph_unlock::Error::TpmAuthFailed | aleph_unlock::Error::TpmWrongUser),
+                    ) => {
                         let mut inner = lock(&self.inner);
                         for older in &tpm_slots[i..] {
                             inner.state.mark_stale(older.id)?;
                         }
                         tracing::warn!(slot = %k.id, "TPM keyslot rejected the login password; marked stale");
                         last = Some(Error::Stale(k.label.clone()));
+                        // (A slot of another user's: the previous password
+                        // cannot help there.)
+                        rejected = matches!(e, aleph_unlock::Error::TpmAuthFailed);
                         break;
                     }
                     Err(e) => last = Some(e.into()),
@@ -520,6 +608,7 @@ impl Keyring {
                         vault: v,
                         slot: k.id,
                         kek: None,
+                        reseal: None,
                     });
                 }
                 Err(aleph_core::Error::UnwrapFailed) => last = Some(Error::WrongPassword),
@@ -531,7 +620,68 @@ impl Keyring {
         if typed && !accepted && matches!(last, Some(Error::WrongPassword)) {
             lock(&self.inner).typed.record_failure(now);
         }
+        let vouched = accepted || !typed;
+        if vouched && any_tpm && (all_stale || rejected) {
+            return Err(Error::PasswordChanged);
+        }
         Err(last.unwrap_or(Error::NoMethodWorked(None)))
+    }
+
+    /// After an outside password change (`current`, which PAM accepts, opens
+    /// no TPM slot): ask for the previous password and try it on the newest
+    /// TPM slot, straight at the TPM. PAM no longer knows that password, so
+    /// each wrong one spends one of the TPM's dictionary-attack attempts:
+    /// hence only the newest slot, [`OLD_PASSWORD_ATTEMPTS`] tries per
+    /// conversation (`tries` counts them across questions), and the typing
+    /// limit. Once installed, the vault re-seals under `current`.
+    fn open_with_old_password(
+        &self,
+        chan: &mut Channel,
+        vault: &LockedVault,
+        current: &str,
+        tries: &mut usize,
+    ) -> Result<Opened> {
+        let newest = newest_tpm_slot(vault).ok_or(Error::NoMethodWorked(None))?;
+        let SlotKind::Tpm(slot) = &newest.kind else {
+            unreachable!("a TPM slot")
+        };
+        if *tries >= OLD_PASSWORD_ATTEMPTS {
+            return Err(Error::Invalid(
+                "no more tries at the previous password in this conversation; use another method, or unlock again later"
+                    .into(),
+            ));
+        }
+        let mut error = None;
+        while *tries < OLD_PASSWORD_ATTEMPTS {
+            *tries += 1;
+            let now = Instant::now();
+            if let Some(wait) = lock(&self.inner).typed.blocked(now) {
+                return Err(Error::TooManyAttempts { retry_after: wait });
+            }
+            let reply = chan.ask(&ToPrompter::OldPassword {
+                error: error.take(),
+            })?;
+            let FromPrompter::Password { password: old } = reply else {
+                return Err(Error::Prompt(format!("unexpected reply {reply:?}")));
+            };
+            let unsealed = lock(&self.hw).tpm.unseal(slot, old.expose().as_bytes());
+            match unsealed {
+                Ok(kek) => {
+                    return Ok(Opened {
+                        vault: vault.unlock(newest.id, &kek)?,
+                        slot: newest.id,
+                        kek: Some(kek),
+                        reseal: Some(Zeroizing::new(current.to_string())),
+                    });
+                }
+                Err(aleph_unlock::Error::TpmAuthFailed | aleph_unlock::Error::TpmWrongUser) => {
+                    lock(&self.inner).typed.record_failure(now);
+                    error = Some("that password does not open the TPM keyslot either".into());
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(Error::WrongPassword)
     }
 
     /// Open `vault` with a FIDO2 slot: wait for a key holding one (or only
@@ -553,13 +703,15 @@ impl Keyring {
         if slots.is_empty() {
             return Err(Error::NoMethodWorked(Some("no FIDO2 keyslot".into())));
         }
-        let mut hw = lock(&self.hw);
         let names = slots
             .iter()
             .map(|s| s.1.as_str())
             .collect::<Vec<_>>()
             .join(" or ");
-        let (id, label, slot) = self.wait_for_key(chan, &mut hw, &slots, &names)?;
+        // The hardware lock is held only for key operations, never while the
+        // prompter is asked: a PIN prompt can stay open for minutes, and a
+        // login password (pam.sock) must not wait behind it.
+        let (id, label, slot) = self.wait_for_key(chan, &slots, &names)?;
         let mut error = None;
         let mut wrong_pins = 0;
         loop {
@@ -575,12 +727,18 @@ impl Keyring {
                 None
             };
             chan.send(&ToPrompter::Touch { key: label.clone() })?;
-            match fido2::unlock(&mut *hw.keys, &slot, pin.as_ref().map(Secret::expose)) {
+            let unlocked = fido2::unlock(
+                &mut *lock(&self.hw).keys,
+                &slot,
+                pin.as_ref().map(Secret::expose),
+            );
+            match unlocked {
                 Ok(kek) => {
                     return Ok(Opened {
                         vault: vault.unlock(id, &kek)?,
                         slot: id,
                         kek: Some(kek),
+                        reseal: None,
                     });
                 }
                 Err(aleph_unlock::Error::Fido2PinInvalid) if slot.pin_required => {
@@ -603,7 +761,6 @@ impl Keyring {
     fn wait_for_key(
         &self,
         chan: &mut Channel,
-        hw: &mut Backends,
         slots: &[(Uuid, String, aleph_core::Fido2Slot)],
         names: &str,
     ) -> Result<(Uuid, String, aleph_core::Fido2Slot)> {
@@ -611,7 +768,8 @@ impl Keyring {
         let mut asked = false;
         loop {
             for s in slots {
-                if fido2::present(&mut *hw.keys, &s.2)? {
+                let found = fido2::present(&mut *lock(&self.hw).keys, &s.2)?;
+                if found {
                     return Ok(s.clone());
                 }
             }
@@ -629,20 +787,40 @@ impl Keyring {
         }
     }
 
-    /// Make an opened vault the unlocked one, after the high-water check.
-    /// Returns the warning to show if the file is not trusted for writes.
-    fn install(&self, vault: UnlockedVault) -> Result<Option<String>> {
+    /// Make an opened vault (opened through `slot`, with `kek` if the slot
+    /// has one) the unlocked one, after the high-water check. Returns the
+    /// warning to show if the file is not trusted for writes.
+    fn install(
+        &self,
+        vault: UnlockedVault,
+        slot: Uuid,
+        kek: Option<&Kek>,
+    ) -> Result<Option<String>> {
         let mut inner = lock(&self.inner);
-        let untrusted = match inner.store.raise(&vault)? {
-            Standing::Unrecorded | Standing::Current | Standing::Newer => None,
-            Standing::Pending => {
-                inner.store.record(&vault.mark())?;
-                None
+        // Unlocked meanwhile (a login password through pam.sock does not
+        // wait for a conversation): the first open stays, and this one is
+        // dropped, never installed over it.
+        if inner.vault.is_some() {
+            return Ok(None);
+        }
+        // The file may also have moved on since this copy was read
+        // (unlocked elsewhere, written, locked again). An older copy must
+        // never be installed: it would read as a rollback and hide what was
+        // written. Reopen the current file with the same key instead.
+        let current = inner.store.read()?;
+        let vault = if current.mark() == vault.mark() {
+            vault
+        } else {
+            match kek.map(|k| current.unlock(slot, k)) {
+                Some(Ok(v)) => v,
+                _ => {
+                    return Err(Error::Invalid(
+                        "the keyring changed while it was being unlocked; unlock again".into(),
+                    ));
+                }
             }
-            Standing::RolledBack { .. } => Some("rolled back to an older version"),
-            Standing::Replaced => Some("replaced by a different vault"),
-            Standing::Rekeyed => Some("re-keyed somewhere else"),
         };
+        let untrusted = trust(&inner.store, &vault)?;
         let ids: HashSet<Uuid> = vault.keyslots().map(|k| k.id).collect();
         inner.state.retain(|id| ids.contains(&id))?;
         inner.vault = Some(vault);
@@ -965,7 +1143,161 @@ impl Keyring {
         for id in &drops {
             inner.state.clear(*id)?;
         }
+        inner.state.set_rotation_pending(false)?;
         Ok(())
+    }
+
+    /// Replace every password slot (TPM and login-password) with fresh ones
+    /// for `new`, the current login password: one TPM slot sealed under it
+    /// if there were TPM slots, one login-password slot if there was one
+    /// (spec §5 "Password change"). MK rotates when that needs no one
+    /// (every other slot is a recovery slot). Otherwise, since FIDO2 slots
+    /// need a touch, the old slots are removed keeping MK, and a rotation
+    /// is marked pending for `aleph keyslot rotate-master`. Sealing comes
+    /// first, so a TPM refusal changes nothing. The caller holds `ops`, and
+    /// the vault is unlocked.
+    fn replace_password_slots(&self, new: &str) -> Result<String> {
+        self.replace_slots(new, None)
+    }
+
+    /// `replace_password_slots`, in `detached` (an opened copy, written
+    /// through the store here) if given, else in the unlocked vault.
+    fn replace_slots(&self, new: &str, detached: Option<&mut UnlockedVault>) -> Result<String> {
+        let (tpm_old, login_old, rotatable) = match &detached {
+            Some(v) => password_slots(v),
+            None => password_slots(lock(&self.inner).vault.as_ref().ok_or(Error::Locked)?),
+        };
+        if tpm_old.is_empty() && login_old.is_empty() {
+            return Ok("no password keyslot to update".into());
+        }
+        let sealed = if tpm_old.is_empty() {
+            None
+        } else {
+            Some(lock(&self.hw).tpm.seal(new.as_bytes())?)
+        };
+        let old: Vec<Uuid> = tpm_old.iter().chain(&login_old).copied().collect();
+        let argon2 = self.argon2;
+        let edit = |v: &mut UnlockedVault| -> Result<()> {
+            let tpm_new = match &sealed {
+                Some((kek, slot)) => {
+                    Some((v.add_keyslot("tpm", SlotKind::Tpm(slot.clone()), kek)?, kek))
+                }
+                None => None,
+            };
+            let login_new = if login_old.is_empty() {
+                None
+            } else {
+                let id = v.add_login_password_slot("login password", new.as_bytes(), argon2)?;
+                Some((id, v.login_password_kek(id, new.as_bytes())?))
+            };
+            if rotatable {
+                let mut keks: Vec<(Uuid, &Kek)> = Vec::new();
+                keks.extend(tpm_new);
+                keks.extend(login_new.as_ref().map(|(id, kek)| (*id, kek)));
+                v.rotate_master(&keks, &old)?;
+            } else {
+                for id in &old {
+                    v.remove_keyslot_keeping_mk(*id)?;
+                }
+            }
+            Ok(())
+        };
+        // Marked before writing: a change written without rotation must
+        // never go unreported (a spurious mark only asks for a rotation).
+        if !rotatable {
+            lock(&self.inner).state.set_rotation_pending(true)?;
+        }
+        let ids: HashSet<Uuid> = match detached {
+            Some(v) => {
+                edit(v)?;
+                lock(&self.inner).store.write(v)?;
+                v.keyslots().map(|k| k.id).collect()
+            }
+            None => {
+                self.modify_vault(edit)?;
+                let inner = lock(&self.inner);
+                let v = inner.vault.as_ref().ok_or(Error::Locked)?;
+                v.keyslots().map(|k| k.id).collect()
+            }
+        };
+        let mut inner = lock(&self.inner);
+        let state = &mut inner.state;
+        state.retain(|id| ids.contains(&id))?;
+        if rotatable {
+            state.set_rotation_pending(false)?;
+            Ok("the keyslots now use the new login password; the master key was rotated".into())
+        } else {
+            Ok(
+                "the keyslots now use the new login password; run `aleph keyslot rotate-master` \
+                to finish (it needs your security keys)"
+                    .into(),
+            )
+        }
+    }
+
+    /// The login password changed from `old` to `new` (`pam_aleph`, during
+    /// `passwd`): replace the password slots (spec §5 "Password change").
+    /// `pam_aleph` runs even when the change itself failed, so nothing
+    /// happens unless PAM accepts `new` (or cannot check). A locked vault
+    /// is never unlocked for this: a copy is opened with `old`, changed,
+    /// and written. Waits for a running conversation.
+    pub fn change_login_password(&self, old: &str, new: &str) -> Result<String> {
+        // Before waiting for anything: a new password PAM rejects changes
+        // nothing.
+        let vouched = match lock(&self.hw).password.check(new) {
+            Ok(true) => true,
+            Ok(false) => {
+                return Err(Error::Invalid(
+                    "the new password is not the login password (did the change fail?); nothing changed"
+                        .into(),
+                ));
+            }
+            Err(_) => false,
+        };
+        let _op = lock(&self.ops);
+        let locked = self.is_locked();
+        if !locked && vouched {
+            return self.replace_password_slots(new);
+        }
+        // `old` must open the vault file: on a locked vault, to change a
+        // copy; on an unlocked one when PAM could not vouch for `new`, so no
+        // same-user process can re-seal the vault under a password of its
+        // choosing.
+        let file = lock(&self.inner).store.read()?;
+        let mut copy = self.open_with_previous(&file, old)?;
+        if !locked {
+            drop(copy);
+            return self.replace_password_slots(new);
+        }
+        if let Some(why) = trust(&lock(&self.inner).store, &copy)? {
+            return Err(Error::Untrusted(why));
+        }
+        self.replace_slots(new, Some(&mut copy))
+    }
+
+    /// Open `file` with the login password it was last sealed under: the
+    /// newest TPM slot whatever its stale mark (a login with the new
+    /// password may have just marked it), then any login-password slot.
+    /// Nothing is marked stale: `old` is expected to be outdated.
+    fn open_with_previous(&self, file: &LockedVault, old: &str) -> Result<UnlockedVault> {
+        if let Some(k) = newest_tpm_slot(file)
+            && let SlotKind::Tpm(slot) = &k.kind
+        {
+            let unsealed = lock(&self.hw).tpm.unseal(slot, old.as_bytes());
+            match unsealed {
+                Ok(kek) => return Ok(file.unlock(k.id, &kek)?),
+                Err(aleph_unlock::Error::TpmAuthFailed | aleph_unlock::Error::TpmWrongUser) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        for k in file.keyslots() {
+            if matches!(k.kind, SlotKind::LoginPassword(_))
+                && let Ok(v) = file.unlock_login_password(k.id, old.as_bytes())
+            {
+                return Ok(v);
+            }
+        }
+        Err(Error::WrongPassword)
     }
 
     /// Create the vault with a recovery slot and one unlock method.
@@ -1179,6 +1511,7 @@ impl Keyring {
                 Ok(v.rotate_master(&refs, &drops)?)
             })
             .map_err(|e| Error::RecoveryNotInstalled(Box::new(e)))?;
+            lock(&self.inner).state.set_rotation_pending(false)?;
             Ok(Some(
                 "New recovery key issued; the old one no longer works.".into(),
             ))
@@ -1204,6 +1537,49 @@ impl Keyring {
             f()
         })
     }
+}
+
+/// Whether an opened vault may be written: `Some(reason)` if the file was
+/// rolled back, replaced, or re-keyed elsewhere (§4 "Generation and
+/// high-water mark"). Raises the mark otherwise.
+fn trust(store: &Store, vault: &UnlockedVault) -> Result<Option<&'static str>> {
+    Ok(match store.raise(vault)? {
+        Standing::Unrecorded | Standing::Current | Standing::Newer => None,
+        Standing::Pending => {
+            store.record(&vault.mark())?;
+            None
+        }
+        Standing::RolledBack { .. } => Some("rolled back to an older version"),
+        Standing::Replaced => Some("replaced by a different vault"),
+        Standing::Rekeyed => Some("re-keyed somewhere else"),
+    })
+}
+
+/// The newest TPM slot of `v` (ties within a second: the later-added).
+fn newest_tpm_slot(v: &LockedVault) -> Option<&Keyslot> {
+    v.keyslots()
+        .enumerate()
+        .filter(|(_, k)| matches!(k.kind, SlotKind::Tpm(_)))
+        .max_by_key(|(i, k)| (k.created, *i))
+        .map(|(_, k)| k)
+}
+
+/// The password slots of `v` (TPM, login-password), and whether MK can
+/// rotate without the user (no FIDO2 or unknown-type slots).
+fn password_slots(v: &UnlockedVault) -> (Vec<Uuid>, Vec<Uuid>, bool) {
+    let ids = |tpm: bool| -> Vec<Uuid> {
+        v.keyslots()
+            .filter(|k| match k.kind {
+                SlotKind::Tpm(_) => tpm,
+                SlotKind::LoginPassword(_) => !tpm,
+                _ => false,
+            })
+            .map(|k| k.id)
+            .collect()
+    };
+    let rotatable = v.unknown_keyslots().next().is_none()
+        && v.keyslots().all(|k| !matches!(k.kind, SlotKind::Fido2(_)));
+    (ids(true), ids(false), rotatable)
 }
 
 /// Run a conversation and end it with `Done` either way.
