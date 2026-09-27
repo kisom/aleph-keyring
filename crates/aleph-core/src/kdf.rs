@@ -1,4 +1,5 @@
-//! Argon2id key derivation for the password-like keyslots.
+//! Argon2id key derivation for the login-password keyslot (the only
+//! slot type whose KEK comes from a secret the user types).
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -25,26 +26,16 @@ pub struct Argon2Params {
 }
 
 impl Argon2Params {
-    /// Recovery keys carry 256 bits of entropy; the KDF only needs to be
-    /// non-trivial, not the main defence.
-    pub const RECOVERY_KEY: Self = Self {
-        m_kib: 256 * 1024,
-        t: 3,
-        p: 4,
-    };
-    /// Floor for user-chosen passphrases; `tune` may raise it.
-    pub const PASSPHRASE_FLOOR: Self = Self {
-        m_kib: 1024 * 1024,
-        t: 3,
-        p: 4,
-    };
-    /// Floor for the no-TPM login-password fallback; must not slow login.
+    /// Floor for the no-TPM login-password fallback; `tune` raises `t` to
+    /// about 0.3 s. Enrollment refuses anything weaker.
     pub const LOGIN_PASSWORD_FLOOR: Self = Self {
         m_kib: 64 * 1024,
         t: 2,
         p: 4,
     };
-    /// Only for tests: fast, and never valid in a real vault.
+    /// Only for tests: fast, and never valid in a real vault. Exists only
+    /// under `cfg(test)` or the `insecure-test-params` feature.
+    #[cfg(any(test, feature = "insecure-test-params"))]
     pub const INSECURE_TEST: Self = Self {
         m_kib: 32,
         t: 1,
@@ -58,6 +49,21 @@ impl Argon2Params {
         t: 64,
         p: 16,
     };
+
+    /// True if every cost is at least `floor`'s.
+    pub fn meets(&self, floor: &Self) -> bool {
+        self.m_kib >= floor.m_kib && self.t >= floor.t && self.p >= floor.p
+    }
+
+    /// Whether enrollment may use these parameters: at least the floor, or
+    /// the test parameters when the `insecure-test-params` feature is on.
+    pub fn enrollable(&self) -> bool {
+        #[cfg(any(test, feature = "insecure-test-params"))]
+        if *self == Self::INSECURE_TEST {
+            return true;
+        }
+        self.meets(&Self::LOGIN_PASSWORD_FLOOR)
+    }
 
     fn argon2(&self) -> Result<argon2::Argon2<'static>> {
         if self.m_kib > Self::MAX.m_kib || self.t > Self::MAX.t || self.p > Self::MAX.p {
@@ -204,22 +210,40 @@ mod tests {
         assert_ne!(a.expose(), c.expose());
     }
 
-    /// Known answer for the production recovery-key parameters. If this
-    /// changes, existing recovery slots can no longer be opened. Verified
+    /// Known answer for the login-password floor. If this changes,
+    /// existing login-password slots can no longer be opened. Verified
     /// against the reference C implementation:
-    /// `printf "aleph known answer" | argon2 BBBBBBBBBBBBBBBB -id -t 3 -m 18 -p 4 -l 32 -r`
+    /// `printf "aleph known answer" | argon2 BBBBBBBBBBBBBBBB -id -t 2 -m 16 -p 4 -l 32 -r`
     #[test]
-    fn recovery_key_params_known_answer() {
+    fn login_password_floor_known_answer() {
         let kek = derive_kek(
             b"aleph known answer",
             &[0x42; SALT_LEN],
-            &Argon2Params::RECOVERY_KEY,
+            &Argon2Params::LOGIN_PASSWORD_FLOOR,
         )
         .unwrap();
         assert_eq!(
             hex(kek.expose()),
-            "c9fe4f6f54f7be70ac688b57e8f6aa5d496cf378fa86f60e38176f2f77bcce1f"
+            "70f16ec941691d57b88ca192c0b7d38373c5cee7adbe788a52e3f5d4b1860cbb"
         );
+    }
+
+    #[test]
+    fn enrollment_requires_the_floor() {
+        let floor = Argon2Params::LOGIN_PASSWORD_FLOOR;
+        assert!(floor.enrollable());
+        assert!(Argon2Params { t: 5, ..floor }.enrollable());
+        assert!(
+            !Argon2Params {
+                m_kib: 1024,
+                ..floor
+            }
+            .enrollable()
+        );
+        assert!(!Argon2Params { t: 1, ..floor }.enrollable());
+        assert!(!Argon2Params { p: 1, ..floor }.enrollable());
+        // Test parameters are enrollable only because cfg(test) is on here.
+        assert!(Argon2Params::INSECURE_TEST.enrollable());
     }
 
     #[test]

@@ -24,7 +24,13 @@ uuid.workspace = true
 x-wing.workspace = true
 zeroize.workspace = true
 
+[features]
+# Exposes `Argon2Params::INSECURE_TEST` and lets vaults be built with it.
+# Only for tests (this crate's own integration tests enable it below).
+insecure-test-params = []
+
 [dev-dependencies]
+aleph-core = { path = ".", features = ["insecure-test-params"] }
 hex.workspace = true
 proptest.workspace = true
 serde_json.workspace = true
