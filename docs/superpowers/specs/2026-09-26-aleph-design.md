@@ -494,8 +494,13 @@ secrets in transit. `mlock` does not keep pages out of a hibernation image
     (touch-only enrollment remains possible, with its warning).
   - defaults to requiring user verification: the PIN, or on-device UV
     where supported. Touch-only is an explicit opt-in
-    (`--touch-only`, with a warning).
+    (`--touch-only`, with a warning). On a key with a PIN, touch-only
+    enrollment still passes the PIN to `makeCredential`, which many keys
+    require, but the slot's assertions never use it.
   - the key's `getInfo` must list `hmac-secret`, or enrollment is refused
+  - exactly one key must be plugged in, counting keys that cannot be
+    opened (a browser may hold one), so which key is enrolled is never
+    ambiguous
 - **Unlock:**
   - **Device selection:** each plugged-in key is preflighted with
     `getAssertion(up = false)`, without a PIN, on the slot's credential ID
@@ -503,7 +508,10 @@ secrets in transit. `mlock` does not keep pages out of a hibernation image
     and a touch. This holds for a single key too, so the slot of an absent
     backup key never spends the plugged key's PIN retries. A key whose
     preflight errors is skipped (or, if it is the only key, asked
-    directly); if no key matches, the first such error is reported.
+    directly); if no key matches, the first such error is reported. A
+    preflight "yes" is checked: a key that names a different credential
+    ID is not it, and a key that then cannot produce the secret
+    (`NO_CREDENTIALS`) does not end the search.
   - **What level 2 exposes:** anyone holding the key, without its PIN, can
     learn whether it holds a given credential ID and obtain its non-UV
     `hmac-secret` output, which opens nothing enrolled with PIN/UV.

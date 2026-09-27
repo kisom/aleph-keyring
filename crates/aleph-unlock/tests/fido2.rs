@@ -94,6 +94,7 @@ fn enrollment_needs_exactly_one_key() {
             MockAuthenticator::with_pin(PIN),
             MockAuthenticator::with_pin(PIN),
         ],
+        ..Default::default()
     };
     assert!(matches!(
         fido2::enroll(&mut two, Some(PIN), Verification::PinOrUv),
@@ -114,6 +115,7 @@ fn unlock_picks_the_right_key_among_several_and_touches_only_it() {
             right,
             MockAuthenticator::with_pin(PIN),
         ],
+        ..Default::default()
     };
     let back = fido2::unlock(&mut keys, &slot, Some(PIN)).unwrap();
     assert!(same_kek(&kek, &back));
@@ -265,6 +267,54 @@ fn a_key_without_separate_uv_secrets_is_refused_for_pin_slots() {
     old.single_cred_random = true;
     let mut keys = MockKeys::one(old);
     fido2::enroll(&mut keys, None, Verification::TouchOnly).unwrap();
+}
+
+/// A key that claims every credential is asked first but cannot produce
+/// the secret; the search goes on to the key that really holds it.
+#[test]
+fn a_key_claiming_every_credential_does_not_hide_the_right_one() {
+    let mut keys = MockKeys::one(MockAuthenticator::new());
+    let (kek, slot) = fido2::enroll(&mut keys, None, Verification::TouchOnly).unwrap();
+    let mut liar = MockAuthenticator::new();
+    liar.lie_preflight = true;
+    keys.devices.insert(0, liar);
+    assert!(same_kek(
+        &kek,
+        &fido2::unlock(&mut keys, &slot, None).unwrap()
+    ));
+}
+
+/// A second key that is plugged in but cannot be opened (a browser holds
+/// it) still makes enrollment ambiguous; unlock is unaffected.
+#[test]
+fn an_unopenable_second_key_still_makes_enrollment_ambiguous() {
+    let mut keys = MockKeys::one(MockAuthenticator::with_pin(PIN));
+    keys.unopenable = 1;
+    assert!(matches!(
+        fido2::enroll(&mut keys, Some(PIN), Verification::PinOrUv),
+        Err(Error::Fido2MultipleDevices)
+    ));
+    keys.unopenable = 0;
+    let (kek, slot) = fido2::enroll(&mut keys, Some(PIN), Verification::PinOrUv).unwrap();
+    keys.unopenable = 1;
+    assert!(same_kek(
+        &kek,
+        &fido2::unlock(&mut keys, &slot, Some(PIN)).unwrap()
+    ));
+}
+
+/// Touch-only on a key that has a PIN: keys that insist on the PIN to
+/// create a credential get it for that step only; the slot itself needs
+/// no PIN.
+#[test]
+fn touch_only_enrollment_on_a_pin_key_uses_the_pin_only_to_create() {
+    let mut keys = MockKeys::one(MockAuthenticator::with_pin(PIN));
+    let (kek, slot) = fido2::enroll(&mut keys, Some(PIN), Verification::TouchOnly).unwrap();
+    assert!(!slot.pin_required && !slot.uv_required);
+    assert!(same_kek(
+        &kek,
+        &fido2::unlock(&mut keys, &slot, None).unwrap()
+    ));
 }
 
 #[test]

@@ -1,12 +1,14 @@
 //! FIDO2 keyslots via the `hmac-secret` extension (spec §5).
 //!
-//! - **Enrollment** needs exactly one key plugged in, one that lists
-//!   `hmac-secret`. It creates a non-resident credential for the constant
+//! - **Enrollment** needs exactly one key plugged in (counting keys that
+//!   could not be opened), one that lists `hmac-secret`. It creates a non-resident credential for the constant
 //!   RP ID [`RP_ID`] with credential protection "UV optional with
 //!   credential ID". By default ([`Verification::PinOrUv`]) it requires
 //!   user verification: the key's PIN if it has one, else on-device UV. A
 //!   key with neither is refused unless the user opts into
-//!   [`Verification::TouchOnly`].
+//!   [`Verification::TouchOnly`]. Touch-only on a key with a PIN passes
+//!   the PIN to credential creation only, since many keys require it
+//!   there.
 //! - **The KEK** is `HKDF(hmac-secret(salt), "aleph fido2 v1")`. A CTAP
 //!   2.1 key returns a different secret with and without UV, so a slot
 //!   enrolled with UV cannot be opened by a touch alone. A CTAP 2.0 key
@@ -27,7 +29,9 @@
 //!   wrong PIN. A key whose preflight fails (unplugged mid-scan, a
 //!   firmware quirk) is treated as "not this key", unless it is the only
 //!   key, which is then asked directly; if no key matches, the first such
-//!   error is reported instead of "no credential".
+//!   error is reported instead of "no credential". A key that claims the
+//!   credential but then cannot produce its secret does not end the
+//!   search.
 //!
 //! All hardware access goes through [`Keys`] and [`Authenticator`], so the
 //! logic is tested against [`mock::MockKeys`].
@@ -104,6 +108,12 @@ pub trait Authenticator {
 pub trait Keys {
     fn devices(&mut self) -> Result<Vec<&mut dyn Authenticator>>;
 
+    /// How many keys are plugged in, including any that could not be
+    /// opened (which `devices` leaves out).
+    fn listed(&mut self) -> usize {
+        self.devices().map_or(0, |d| d.len())
+    }
+
     /// True if any key is connected (drives the prompter's "insert your
     /// key" screen).
     fn any_present(&mut self) -> bool {
@@ -131,8 +141,20 @@ pub fn enroll(
     pin: Option<&str>,
     policy: Verification,
 ) -> Result<(Kek, Fido2Slot)> {
+    // Count keys that could not be opened too: with a second key plugged
+    // in, which one gets enrolled must not depend on which one a browser
+    // happens to hold.
+    let listed = keys.listed();
+    if listed > 1 {
+        return Err(Error::Fido2MultipleDevices);
+    }
     let mut devices = keys.devices()?;
     let device = match devices.len() {
+        0 if listed > 0 => {
+            return Err(Error::Fido2(
+                "the FIDO2 key could not be opened; close programs using it".into(),
+            ));
+        }
         0 => return Err(Error::Fido2NoDevice),
         1 => &mut devices[0],
         _ => return Err(Error::Fido2MultipleDevices),
@@ -141,6 +163,7 @@ pub fn enroll(
     if !info.hmac_secret {
         return Err(Error::Fido2Unsupported);
     }
+    let given_pin = pin;
     // A PIN, when the key has one, performs UV; otherwise use built-in UV.
     let (pin, uv) = match policy {
         Verification::PinOrUv if info.pin_set => (Some(pin.ok_or(Error::Fido2PinRequired)?), false),
@@ -148,7 +171,14 @@ pub fn enroll(
         Verification::PinOrUv => return Err(Error::Fido2PinNotSet),
         Verification::TouchOnly => (None, false),
     };
-    let credential_id = device.make_credential(RP_ID, CRED_PROTECT, pin, uv)?;
+    // Touch-only on a key with a PIN: many keys (CTAP 2.0, or 2.1 without
+    // makeCredUvNotRqd) insist on the PIN to create a credential. Give it
+    // for that step only; the slot's assertions stay touch-only.
+    let create_pin = match policy {
+        Verification::TouchOnly if info.pin_set => given_pin,
+        _ => pin,
+    };
+    let credential_id = device.make_credential(RP_ID, CRED_PROTECT, create_pin, uv)?;
     let salt = aleph_core::crypto::random_array::<32>()?;
     let secret = device.hmac_secret(RP_ID, &credential_id, &salt, pin, uv)?;
     if pin.is_some() || uv {
@@ -196,7 +226,12 @@ pub fn unlock(keys: &mut dyn Keys, slot: &Fido2Slot, pin: Option<&str>) -> Resul
     let mut first_error = None;
     for device in devices.iter_mut() {
         match device.has_credential(RP_ID, &slot.credential_id) {
-            Ok(true) => return ask(device),
+            Ok(true) => match ask(device) {
+                // The preflight claimed the credential but the key cannot
+                // use it (a buggy or hostile key): keep looking.
+                Err(Error::Fido2NoCredential) => {}
+                result => return result,
+            },
             Ok(false) => {}
             // Nothing to choose between: a lone key that cannot answer
             // the preflight is asked directly.

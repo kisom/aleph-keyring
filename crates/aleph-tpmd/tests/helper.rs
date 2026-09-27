@@ -310,7 +310,7 @@ fn with_owner_auth_set_and_no_srk_enrollment_is_refused() {
 /// The attack the budgets exist for: many uids (a compromised account can
 /// have several, and every login uid has its own budget) guessing across
 /// many recovery windows. The TPM must never reach lockout, which would
-/// also block disk unlock and survive reboot; refusing with `Busy` is the
+/// also block disk unlock and survive reboot; refusing with `Exhausted` is the
 /// accepted cost.
 #[test]
 fn guessing_from_many_uids_over_many_windows_never_locks_the_tpm() {
@@ -321,7 +321,7 @@ fn guessing_from_many_uids_over_many_windows_never_locks_the_tpm() {
         let t0 = Instant::now();
         let uids: Vec<u32> = (0..20).map(|i| UID + i).collect();
         let objects: Vec<_> = uids.iter().map(|&u| seal(&h, u, PW).0).collect();
-        let mut busy = 0;
+        let mut exhausted = 0;
         for w in 0..5 {
             let at = t0 + window(600) * w;
             for (&uid, object) in uids.iter().zip(&objects) {
@@ -336,13 +336,13 @@ fn guessing_from_many_uids_over_many_windows_never_locks_the_tpm() {
                     );
                     match reply {
                         Response::Failed(Failure::AuthFailed | Failure::RateLimited) => {}
-                        Response::Failed(Failure::Exhausted) => busy += 1,
+                        Response::Failed(Failure::Exhausted) => exhausted += 1,
                         other => panic!("max_tries {max_tries}: {other:?}"),
                     }
                 }
             }
         }
-        assert!(busy > 0, "the reserve never engaged");
+        assert!(exhausted > 0, "the reserve never engaged");
         let Response::Status(s) = h.handle(UID, Request::Status {}) else {
             panic!()
         };

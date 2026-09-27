@@ -29,6 +29,8 @@ pub struct MockAuthenticator {
     /// Model a CTAP 2.0 key: one CredRandom, so `hmac-secret` returns the
     /// same output with and without user verification.
     pub single_cred_random: bool,
+    /// Answer every preflight with "yes" (a buggy or hostile key).
+    pub lie_preflight: bool,
 }
 
 impl MockAuthenticator {
@@ -43,6 +45,7 @@ impl MockAuthenticator {
             touches: 0,
             fail_preflight: false,
             single_cred_random: false,
+            lie_preflight: false,
         }
     }
 
@@ -142,6 +145,9 @@ impl Authenticator for MockAuthenticator {
         if self.fail_preflight {
             return Err(Error::Fido2("preflight failed".into()));
         }
+        if self.lie_preflight {
+            return Ok(true);
+        }
         // A level-3 credential is invisible to an assertion without UV.
         Ok(self
             .credentials
@@ -184,12 +190,16 @@ impl Authenticator for MockAuthenticator {
 #[derive(Default)]
 pub struct MockKeys {
     pub devices: Vec<MockAuthenticator>,
+    /// Keys that are plugged in but cannot be opened (held by another
+    /// program): listed, never returned by `devices`.
+    pub unopenable: usize,
 }
 
 impl MockKeys {
     pub fn one(device: MockAuthenticator) -> Self {
         Self {
             devices: vec![device],
+            unopenable: 0,
         }
     }
 }
@@ -201,5 +211,9 @@ impl Keys for MockKeys {
             .iter_mut()
             .map(|d| d as &mut dyn Authenticator)
             .collect())
+    }
+
+    fn listed(&mut self) -> usize {
+        self.devices.len() + self.unopenable
     }
 }

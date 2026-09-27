@@ -73,7 +73,11 @@ impl Authenticator for Libfido2Authenticator {
         req.set_allow_credential(credential_id).map_err(map_err)?;
         req.set_up(Opt::False).map_err(map_err)?;
         match self.device.get_assertion(req, None) {
-            Ok(_) => Ok(true),
+            // A key may omit the credential ID when the allow list has one
+            // entry; if it names one, it must be ours.
+            Ok(assertions) => Ok(assertions
+                .iter()
+                .all(|a| a.id().is_empty() || a.id() == credential_id)),
             Err(e) => match map_err(e) {
                 Error::Fido2NoCredential => Ok(false),
                 other => Err(other),
@@ -140,6 +144,10 @@ impl Keys for Libfido2Keys {
             .iter_mut()
             .map(|d| d as &mut dyn Authenticator)
             .collect())
+    }
+
+    fn listed(&mut self) -> usize {
+        DeviceList::list_devices(16).map_or(0, |list| list.count())
     }
 }
 
