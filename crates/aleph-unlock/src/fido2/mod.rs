@@ -7,9 +7,11 @@
 //!   user verification: the key's PIN if it has one, else on-device UV. A
 //!   key with neither is refused unless the user opts into
 //!   [`Verification::TouchOnly`].
-//! - **The KEK** is `HKDF(hmac-secret(salt), "aleph fido2 v1")`. The key
-//!   returns a different secret with and without UV, so a slot enrolled
-//!   with UV cannot be opened by a touch alone. That is why credProtect
+//! - **The KEK** is `HKDF(hmac-secret(salt), "aleph fido2 v1")`. A CTAP
+//!   2.1 key returns a different secret with and without UV, so a slot
+//!   enrolled with UV cannot be opened by a touch alone. A CTAP 2.0 key
+//!   returns the same one; PIN/UV enrollment detects that with a third
+//!   touch and refuses the key. That is why credProtect
 //!   level 2 suffices: level 3 would also hide the credential from the
 //!   no-touch preflight, and choosing among several keys would then burn
 //!   PIN retries on the wrong ones.
@@ -121,6 +123,9 @@ pub enum Verification {
 
 /// Enroll the single connected key: create a credential, then evaluate it
 /// once to derive the KEK (two touches, as with `systemd-cryptenroll`).
+/// A PIN/UV enrollment takes a third touch to check that the key's
+/// unverified secret differs, refusing CTAP 2.0 keys, whose PIN would not
+/// protect the slot.
 pub fn enroll(
     keys: &mut dyn Keys,
     pin: Option<&str>,
@@ -146,6 +151,16 @@ pub fn enroll(
     let credential_id = device.make_credential(RP_ID, CRED_PROTECT, pin, uv)?;
     let salt = aleph_core::crypto::random_array::<32>()?;
     let secret = device.hmac_secret(RP_ID, &credential_id, &salt, pin, uv)?;
+    if pin.is_some() || uv {
+        // The slot's protection rests on the key's secret without
+        // verification being a different one (CTAP 2.1's two CredRandoms).
+        // A CTAP 2.0 key has one, and a touch alone would open the slot:
+        // check with a third touch rather than trust version strings.
+        let unverified = device.hmac_secret(RP_ID, &credential_id, &salt, None, false)?;
+        if *unverified == *secret {
+            return Err(Error::Fido2NoUvSeparation);
+        }
+    }
     let slot = Fido2Slot {
         credential_id,
         salt,

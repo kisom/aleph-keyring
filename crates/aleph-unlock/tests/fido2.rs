@@ -16,9 +16,12 @@ fn a_pin_key_enrolls_with_the_pin_and_unlocks_with_it() {
     let mut keys = MockKeys::one(MockAuthenticator::with_pin(PIN));
     let (kek, slot) = fido2::enroll(&mut keys, Some(PIN), Verification::PinOrUv).unwrap();
     assert!(slot.pin_required && !slot.uv_required);
-    assert_eq!(keys.devices[0].touches, 2, "enrollment is two touches");
+    assert_eq!(
+        keys.devices[0].touches, 3,
+        "enrollment is three touches (the third checks UV separation)"
+    );
     let back = fido2::unlock(&mut keys, &slot, Some(PIN)).unwrap();
-    assert_eq!(keys.devices[0].touches, 3, "unlock is one touch");
+    assert_eq!(keys.devices[0].touches, 4, "unlock is one touch");
     assert!(same_kek(&kek, &back));
 }
 
@@ -243,6 +246,25 @@ fn enrollment_uses_cred_protect_level_2() {
             .has_credential(fido2::RP_ID, &slot.credential_id)
             .unwrap()
     );
+}
+
+/// A CTAP 2.0 key returns the same `hmac-secret` with and without PIN/UV,
+/// so its PIN would protect nothing: a thief with the key could open the
+/// slot with a touch. PIN/UV enrollment checks and refuses such a key;
+/// touch-only enrollment (which claims no more) still works.
+#[test]
+fn a_key_without_separate_uv_secrets_is_refused_for_pin_slots() {
+    let mut old = MockAuthenticator::with_pin(PIN);
+    old.single_cred_random = true;
+    let mut keys = MockKeys::one(old);
+    assert!(matches!(
+        fido2::enroll(&mut keys, Some(PIN), Verification::PinOrUv),
+        Err(Error::Fido2NoUvSeparation)
+    ));
+    let mut old = MockAuthenticator::new();
+    old.single_cred_random = true;
+    let mut keys = MockKeys::one(old);
+    fido2::enroll(&mut keys, None, Verification::TouchOnly).unwrap();
 }
 
 #[test]

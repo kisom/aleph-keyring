@@ -70,6 +70,11 @@ pub enum Error {
     #[error("the FIDO2 operation was declined on the key")]
     Fido2Denied,
 
+    #[error(
+        "this FIDO2 key returns the same secret with and without its PIN/UV (a CTAP 2.0 key), so a PIN would not protect the slot; use a CTAP 2.1 key or enroll touch-only"
+    )]
+    Fido2NoUvSeparation,
+
     #[error("FIDO2 PIN is required")]
     Fido2PinRequired,
 

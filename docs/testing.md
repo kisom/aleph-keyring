@@ -45,7 +45,10 @@ hardware model, firmware) in the release notes.
    SoloKey, Nitrokey 3, …) and has a PIN set (`fido2-token -S <device>`)
    or built-in UV.
 2. Run `ALEPH_FIDO2_PIN=<pin, if set> cargo test -p aleph-unlock --test fido2_hardware -- --ignored`.
-   Touch twice (enroll), then once (unlock). Expect `1 passed`.
+   Touch three times (enroll; the third checks that the key keeps
+   separate secrets with and without PIN/UV), once (unlock), then twice
+   more. Expect `1 passed`. A CTAP 2.0 key fails enrollment with
+   `Fido2NoUvSeparation`, which is the intended refusal.
 3. Plug in a second FIDO2 key as well and rerun step 2. Expect a failure
    reporting `Fido2MultipleDevices`, since enrollment needs exactly one key.
 4. With a wrong `ALEPH_FIDO2_PIN`, expect `Fido2PinInvalid`, and the key's

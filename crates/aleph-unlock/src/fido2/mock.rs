@@ -26,6 +26,9 @@ pub struct MockAuthenticator {
     pub touches: usize,
     /// Make the no-touch preflight fail (a key unplugged mid-scan).
     pub fail_preflight: bool,
+    /// Model a CTAP 2.0 key: one CredRandom, so `hmac-secret` returns the
+    /// same output with and without user verification.
+    pub single_cred_random: bool,
 }
 
 impl MockAuthenticator {
@@ -39,6 +42,7 @@ impl MockAuthenticator {
             credentials: HashMap::new(),
             touches: 0,
             fail_preflight: false,
+            single_cred_random: false,
         }
     }
 
@@ -168,7 +172,7 @@ impl Authenticator for MockAuthenticator {
         self.touches += 1;
         // CTAP2: supplying a PIN performs user verification, and the
         // authenticator then uses a different secret (CredRandomWithUV).
-        let verified = uv || pin.is_some();
+        let verified = (uv || pin.is_some()) && !self.single_cred_random;
         let mut mac = Hmac::<Sha256>::new_from_slice(&secret).expect("any key length");
         mac.update(&[u8::from(verified)]);
         mac.update(salt);

@@ -484,8 +484,14 @@ secrets in transit. `mlock` does not keep pages out of a hibernation image
     keys would burn PIN retries on the wrong ones (`systemd-cryptenroll`
     uses level 2 for the same reason). The protection level 3 would add is
     already provided: aleph requires UV/PIN at every unlock of a PIN/UV
-    slot, and the key's `hmac-secret` without UV is a different secret, so
-    a touch alone derives the wrong KEK.
+    slot, and a CTAP 2.1 key's `hmac-secret` without UV is a different
+    secret (CredRandomWithUV vs. CredRandomWithoutUV), so a touch alone
+    derives the wrong KEK.
+  - **CTAP 2.0 keys** have a single CredRandom: the same output with or
+    without UV, so a PIN would not protect the slot. PIN/UV enrollment
+    therefore takes a third touch, evaluating the new credential once
+    without verification, and refuses the key if the outputs match
+    (touch-only enrollment remains possible, with its warning).
   - defaults to requiring user verification: the PIN, or on-device UV
     where supported. Touch-only is an explicit opt-in
     (`--touch-only`, with a warning).
