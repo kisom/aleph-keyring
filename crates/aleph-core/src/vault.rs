@@ -450,3 +450,21 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     File::open(dir)?.sync_all()?;
     Ok(())
 }
+
+/// Atomically write a small private file (0600, in a 0700 directory it
+/// creates if needed): temp file, fsync, rename. No backup, no lock.
+pub(crate) fn write_small_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if !dir.exists() {
+        fs::create_dir_all(dir)?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    let tmp = sibling(path, ".tmp")?;
+    write_file_synced(&tmp, bytes)?;
+    fs::rename(&tmp, path)?;
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}

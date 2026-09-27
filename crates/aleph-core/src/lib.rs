@@ -5,6 +5,7 @@
 
 pub mod crypto;
 pub mod error;
+pub mod highwater;
 pub mod kdf;
 pub mod key;
 pub mod keyslot;
@@ -14,6 +15,7 @@ pub mod vault;
 pub mod xwing;
 
 pub use error::{Error, Result};
+pub use highwater::{HighWater, Mark, Standing};
 pub use kdf::{Argon2Params, derive_kek};
 pub use key::{Kek, KeyHandle, WrappedKey};
 pub use keyslot::{Argon2Kind, Argon2Slot, Fido2Slot, Keyslot, SlotKind, TpmAuth, TpmSlot};
