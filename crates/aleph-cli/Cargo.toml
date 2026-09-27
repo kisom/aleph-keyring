@@ -1,0 +1,27 @@
+[package]
+name = "aleph-cli"
+description = "aleph: the command-line client for the aleph keyring"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "aleph"
+path = "src/main.rs"
+
+[dependencies]
+aleph-prompt-proto = { path = "../aleph-prompt-proto" }
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+rpassword = "7"
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", features = ["rt", "macros"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+zeroize.workspace = true
+
+[dev-dependencies]
+aleph-core = { path = "../aleph-core", features = ["insecure-test-params"] }
+aleph-daemon = { path = "../aleph-daemon", features = ["testing"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
