@@ -1,5 +1,6 @@
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;
+use std::time::Duration;
 
 use aleph_core::{LockedVault, RecoveryKey, SlotKind, UnlockedVault};
 use aleph_tpmd::server::Policy;
@@ -78,7 +79,10 @@ fn helper_refusals_map_to_specific_errors() {
     let sw = SwTpm::start();
     sw.set_da_parameters(1, 600, 86400);
     let h = helper_with(sw, Policy::allow_all());
-    assert!(matches!(h.client.seal(PW), Err(Error::TpmExhausted)));
+    assert!(matches!(
+        h.client.seal(PW),
+        Err(Error::TpmExhausted { retry_after: None })
+    ));
 
     // With the reserve reached (2 failures of 3, spent directly on the
     // TPM), unseals are refused before they reach it.
@@ -92,7 +96,7 @@ fn helper_refusals_map_to_specific_errors() {
     let (_, slot) = h.client.seal(PW).unwrap();
     assert!(matches!(
         h.client.unseal(&slot, PW),
-        Err(Error::TpmExhausted)
+        Err(Error::TpmExhausted { retry_after: Some(d) }) if d == Duration::from_secs(600)
     ));
 
     // SAFETY: getuid has no preconditions.

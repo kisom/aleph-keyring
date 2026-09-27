@@ -49,6 +49,18 @@ impl RateLimiter {
             .is_some_and(|f| f.len() >= FAILURES_PER_UID)
     }
 
+    /// How long until `uid` may try again: until its oldest failure leaves
+    /// the window (zero if it is not blocked).
+    pub fn retry_after(&mut self, uid: u32, now: Instant, window: Duration) -> Duration {
+        self.prune(now, window);
+        match self.failures.get(&uid) {
+            Some(f) if f.len() >= FAILURES_PER_UID => {
+                window.saturating_sub(now.duration_since(f[0]))
+            }
+            _ => Duration::ZERO,
+        }
+    }
+
     /// Record a failed unseal by `uid`.
     pub fn record_failure(&mut self, uid: u32, now: Instant, window: Duration) {
         self.prune(now, window);
@@ -88,6 +100,21 @@ mod tests {
         assert!(l.blocked(1000, t0, W));
         assert!(l.blocked(1000, t0 + W - Duration::from_secs(1), W));
         assert!(!l.blocked(1000, t0 + W, W));
+    }
+
+    #[test]
+    fn retry_after_counts_down_from_the_oldest_failure() {
+        let t0 = Instant::now();
+        let mut l = RateLimiter::default();
+        assert_eq!(l.retry_after(1000, t0, W), Duration::ZERO);
+        l.record_failure(1000, t0, W);
+        l.record_failure(1000, t0 + Duration::from_secs(5), W);
+        assert_eq!(l.retry_after(1000, t0, W), W);
+        assert_eq!(
+            l.retry_after(1000, t0 + Duration::from_secs(10), W),
+            W - Duration::from_secs(10)
+        );
+        assert_eq!(l.retry_after(1000, t0 + W, W), Duration::ZERO);
     }
 
     #[test]

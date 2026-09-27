@@ -244,6 +244,24 @@ pub fn unlock(keys: &mut dyn Keys, slot: &Fido2Slot, pin: Option<&str>) -> Resul
     Err(first_error.unwrap_or(Error::Fido2NoCredential))
 }
 
+/// Whether a connected key holds `slot`'s credential: the same no-touch,
+/// no-PIN preflight `unlock` uses, so a caller can ask for the right key's
+/// PIN before the touch. A lone key that cannot answer counts as present
+/// (`unlock` then asks it directly).
+pub fn present(keys: &mut dyn Keys, slot: &Fido2Slot) -> Result<bool> {
+    let mut devices = keys.devices()?;
+    let lone = devices.len() == 1;
+    for device in devices.iter_mut() {
+        match device.has_credential(RP_ID, &slot.credential_id) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(_) if lone => return Ok(true),
+            Err(_) => {}
+        }
+    }
+    Ok(false)
+}
+
 fn derive_kek(secret: &[u8; 32]) -> Result<Kek> {
     Ok(Kek::try_init(|buf| {
         buf.copy_from_slice(aleph_core::crypto::hkdf(secret, KEK_INFO).as_slice());

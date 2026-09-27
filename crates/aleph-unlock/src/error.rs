@@ -13,10 +13,8 @@ pub enum Error {
     #[error("the TPM is in dictionary-attack lockout; wait and retry")]
     TpmLockout,
 
-    #[error(
-        "too many failed TPM attempts; wait before trying again (up to the TPM's recovery time)"
-    )]
-    TpmRateLimited,
+    #[error("too many failed TPM attempts; retry in {} s", retry_after.as_secs())]
+    TpmRateLimited { retry_after: std::time::Duration },
 
     /// The helper stayed busy (another request from this user, or its
     /// connection limit) through the client's retries.
@@ -27,7 +25,10 @@ pub enum Error {
     /// disk unlock), or the TPM allows too few failures for aleph to use.
     /// Not a reason to mark the slot stale.
     #[error("the TPM is not accepting password attempts now; try later or use another method")]
-    TpmExhausted,
+    TpmExhausted {
+        /// `None`: waiting will not help (this TPM allows too few failures).
+        retry_after: Option<std::time::Duration>,
+    },
 
     #[error("aleph-tpmd serves login users only")]
     TpmNotPermitted,

@@ -175,7 +175,12 @@ fn failed_unseals_are_rate_limited_per_user() {
         );
     }
     // Blocked now, even with the right password: the TPM is not asked.
-    assert_eq!(attempt(PW, UID, t0), Response::Failed(Failure::RateLimited));
+    assert_eq!(
+        attempt(PW, UID, t0),
+        Response::Failed(Failure::RateLimited {
+            retry_after: window(600).as_secs() as u32
+        })
+    );
     // Another user is unaffected.
     let (other, _) = seal(&h, UID + 1, PW);
     assert!(matches!(
@@ -335,8 +340,11 @@ fn guessing_from_many_uids_over_many_windows_never_locks_the_tpm() {
                         at,
                     );
                     match reply {
-                        Response::Failed(Failure::AuthFailed | Failure::RateLimited) => {}
-                        Response::Failed(Failure::Exhausted) => exhausted += 1,
+                        Response::Failed(Failure::AuthFailed | Failure::RateLimited { .. }) => {}
+                        // At the threshold, one recovery time frees a try.
+                        Response::Failed(Failure::Exhausted {
+                            retry_after: Some(600),
+                        }) => exhausted += 1,
                         other => panic!("max_tries {max_tries}: {other:?}"),
                     }
                 }
@@ -375,7 +383,10 @@ fn a_payload_for_another_uid_is_wrong_user() {
     for _ in 0..FAILURES_PER_UID {
         assert_eq!(attempt(), Response::Failed(Failure::WrongUser));
     }
-    assert_eq!(attempt(), Response::Failed(Failure::RateLimited));
+    assert!(matches!(
+        attempt(),
+        Response::Failed(Failure::RateLimited { .. })
+    ));
 }
 
 #[test]
@@ -450,7 +461,7 @@ fn a_tpm_with_no_spare_budget_refuses_enrollment() {
                 secret: Secret(PW.to_vec())
             }
         ),
-        Response::Failed(Failure::Exhausted)
+        Response::Failed(Failure::Exhausted { retry_after: None })
     );
     sw.set_da_parameters(1, 0, 0);
     let (object, kek) = seal(&h, UID, PW);

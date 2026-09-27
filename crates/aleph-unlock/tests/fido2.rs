@@ -317,6 +317,26 @@ fn touch_only_enrollment_on_a_pin_key_uses_the_pin_only_to_create() {
     ));
 }
 
+/// `present` tells which slot's key is plugged in, without a touch.
+#[test]
+fn present_finds_the_slots_key_without_a_touch() {
+    let mut keys = MockKeys::one(MockAuthenticator::with_pin(PIN));
+    let (_, slot) = fido2::enroll(&mut keys, Some(PIN), Verification::PinOrUv).unwrap();
+    let touches = keys.devices[0].touches;
+    assert!(fido2::present(&mut keys, &slot).unwrap());
+    assert_eq!(keys.devices[0].touches, touches);
+    let mut other = MockKeys::one(MockAuthenticator::with_pin(PIN));
+    assert!(!fido2::present(&mut other, &slot).unwrap());
+    assert!(!fido2::present(&mut MockKeys::default(), &slot).unwrap());
+}
+
+/// Libfido2Keys can be kept by a daemon that serves requests on threads.
+#[test]
+fn libfido2_keys_can_move_between_threads() {
+    fn send<T: Send>() {}
+    send::<aleph_unlock::fido2::libfido2::Libfido2Keys>();
+}
+
 #[test]
 fn any_present_reflects_connected_keys() {
     assert!(!MockKeys::default().any_present());

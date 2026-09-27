@@ -96,7 +96,7 @@ impl TpmClient {
 
     fn call_once(&self, request: &Request) -> Result<Response> {
         let unavailable = |e: &dyn std::fmt::Display| Error::TpmUnavailable(e.to_string());
-        let mut stream = UnixStream::connect(&self.socket).map_err(|e| unavailable(&e))?;
+        let stream = UnixStream::connect(&self.socket).map_err(|e| unavailable(&e))?;
         stream
             .set_read_timeout(Some(TIMEOUT))
             .map_err(|e| unavailable(&e))?;
@@ -148,9 +148,13 @@ fn unexpected(response: Response) -> Error {
         Response::Failed(f) => match f {
             Failure::AuthFailed => Error::TpmAuthFailed,
             Failure::Lockout => Error::TpmLockout,
-            Failure::RateLimited => Error::TpmRateLimited,
+            Failure::RateLimited { retry_after } => Error::TpmRateLimited {
+                retry_after: Duration::from_secs(retry_after.into()),
+            },
             Failure::Busy => Error::TpmBusy,
-            Failure::Exhausted => Error::TpmExhausted,
+            Failure::Exhausted { retry_after } => Error::TpmExhausted {
+                retry_after: retry_after.map(|s| Duration::from_secs(s.into())),
+            },
             Failure::NotPermitted => Error::TpmNotPermitted,
             Failure::WrongUser => Error::TpmWrongUser,
             Failure::ParentMismatch => Error::TpmParentMismatch,

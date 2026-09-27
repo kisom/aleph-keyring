@@ -176,7 +176,7 @@ impl Helper {
                 // never be opened: refuse it now rather than at unlock.
                 match tpm.da_counters() {
                     Ok((_, max, recovery)) if recovery > 0 && reserve_threshold(max) == 0 => {
-                        return Response::Failed(Failure::Exhausted);
+                        return Response::Failed(Failure::Exhausted { retry_after: None });
                     }
                     Ok(_) => {}
                     Err(e) => return Response::Failed(failure(e)),
@@ -197,13 +197,21 @@ impl Helper {
                 let window = window(recovery);
                 let mut limiter = lock(&self.limiter);
                 if limiter.blocked(uid, now, window) {
-                    return Response::Failed(Failure::RateLimited);
+                    let wait = limiter.retry_after(uid, now, window);
+                    return Response::Failed(Failure::RateLimited {
+                        retry_after: secs_ceil(wait),
+                    });
                 }
                 // Never spend the TPM's reserve: that is what keeps aleph
                 // from ever locking the TPM out. A recovery time of zero
                 // turns dictionary-attack counting off: nothing to protect.
                 if recovery > 0 && failed >= reserve_threshold(max) {
-                    return Response::Failed(Failure::Exhausted);
+                    // The TPM forgets one failure per recovery time; this
+                    // many must go before the count is under the threshold.
+                    let needed = failed - reserve_threshold(max) + 1;
+                    return Response::Failed(Failure::Exhausted {
+                        retry_after: Some(needed.saturating_mul(recovery)),
+                    });
                 }
                 match tpm.unseal(uid, &object, &secret.0) {
                     Ok(kek) => Response::Unsealed {
@@ -225,6 +233,12 @@ impl Helper {
             },
         }
     }
+}
+
+/// Whole seconds, rounded up (a client told 0 would retry too early).
+fn secs_ceil(d: Duration) -> u32 {
+    let secs = d.as_secs() + u64::from(d.subsec_nanos() > 0);
+    u32::try_from(secs).unwrap_or(u32::MAX)
 }
 
 fn failure(e: TpmError) -> Failure {

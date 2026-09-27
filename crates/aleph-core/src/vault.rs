@@ -351,6 +351,11 @@ impl UnlockedVault {
         self.vault_id
     }
 
+    /// Whether MK's page is locked in RAM (§4 "Memory hygiene").
+    pub fn memory_locked(&self) -> bool {
+        self.key.memory_locked()
+    }
+
     pub fn keyslots(&self) -> impl Iterator<Item = &Keyslot> {
         known(&self.entries)
     }

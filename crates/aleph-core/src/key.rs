@@ -57,6 +57,8 @@ pub struct WrappedKey {
 struct LockedPage {
     page: *mut u8,
     len: usize,
+    /// Whether `mlock` succeeded (best effort; `aleph status` reports it).
+    mlocked: bool,
 }
 
 // SAFETY: the page is exclusively owned; it is only read through `&self`
@@ -90,14 +92,16 @@ impl LockedPage {
         // best effort: failure (e.g. RLIMIT_MEMLOCK exhausted) is not fatal.
         // mlock is not inherited across fork, so WIPEONFORK gives a forked
         // child zeroes rather than an unlocked copy of the key.
-        unsafe {
-            libc::mlock(page, len);
+        let mlocked = unsafe {
+            let ok = libc::mlock(page, len) == 0;
             libc::madvise(page, len, libc::MADV_DONTDUMP);
             libc::madvise(page, len, libc::MADV_WIPEONFORK);
-        }
+            ok
+        };
         Ok(Self {
             page: page.cast(),
             len,
+            mlocked,
         })
     }
 
@@ -139,6 +143,12 @@ impl KeyHandle {
         let mut mk = LockedPage::new()?;
         crypto::fill_random(mk.key_mut())?;
         Ok(Self { mk })
+    }
+
+    /// Whether the master key's page is locked in RAM (`mlock` is best
+    /// effort, e.g. RLIMIT_MEMLOCK may forbid it).
+    pub fn memory_locked(&self) -> bool {
+        self.mk.mlocked
     }
 
     /// Wrap the master key for storage in a keyslot.
@@ -358,6 +368,13 @@ mod tests {
             locked_kib(key_addr(&b)) > 0,
             "live key unlocked by dropping another"
         );
+    }
+
+    /// `memory_locked` reports what really happened to the page.
+    #[test]
+    fn memory_locked_reports_the_page_state() {
+        let k = KeyHandle::generate().unwrap();
+        assert_eq!(k.memory_locked(), locked_kib(key_addr(&k)) > 0);
     }
 
     /// A forked child (the daemon spawning a prompter or swtpm) must not

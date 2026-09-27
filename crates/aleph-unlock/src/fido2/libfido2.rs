@@ -127,6 +127,11 @@ impl Libfido2Keys {
     }
 }
 
+// SAFETY: libfido2 device handles are not tied to the thread that opened
+// them; users of `Libfido2Keys` (the daemon keeps it behind a mutex) never
+// touch one from two threads at once, which `&mut self` already enforces.
+unsafe impl Send for Libfido2Keys {}
+
 impl Keys for Libfido2Keys {
     fn devices(&mut self) -> Result<Vec<&mut dyn Authenticator>> {
         self.open.clear();

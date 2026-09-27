@@ -96,8 +96,10 @@ pub enum Failure {
     AuthFailed,
     #[error("the TPM is in dictionary-attack lockout")]
     Lockout,
-    #[error("too many failed attempts from this user; wait for the TPM's recovery time")]
-    RateLimited,
+    /// This uid used its failure budget; `retry_after` seconds until the
+    /// oldest failure leaves the window.
+    #[error("too many failed attempts from this user; retry in {retry_after} s")]
+    RateLimited { retry_after: u32 },
     /// Transient: this user already has a request in progress, or the
     /// helper is at its connection limit. Retry shortly.
     #[error("the TPM helper is busy; retry shortly")]
@@ -105,8 +107,11 @@ pub enum Failure {
     /// The TPM's shared failure budget is spent (the rest is kept for
     /// disk unlock), or the TPM allows too few failures for aleph to use.
     /// Lasts until the TPM forgets failures, one per recovery time.
+    /// `retry_after` is an upper bound in seconds on when the TPM will have
+    /// forgotten enough failures; `None` means waiting will not help (the
+    /// TPM allows too few failures for aleph to use at all).
     #[error("the TPM is not accepting password attempts now; try later or use another method")]
-    Exhausted,
+    Exhausted { retry_after: Option<u32> },
     #[error("this user may not use the TPM helper (not a login uid)")]
     NotPermitted,
     #[error("this sealed object belongs to another user")]
@@ -223,9 +228,12 @@ mod tests {
         for f in [
             Failure::AuthFailed,
             Failure::Lockout,
-            Failure::RateLimited,
+            Failure::RateLimited { retry_after: 1200 },
             Failure::Busy,
-            Failure::Exhausted,
+            Failure::Exhausted {
+                retry_after: Some(7200),
+            },
+            Failure::Exhausted { retry_after: None },
             Failure::NotPermitted,
             Failure::WrongUser,
             Failure::ParentMismatch,
