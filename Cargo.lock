@@ -108,6 +108,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aleph-pam-proto"
+version = "0.1.0"
+dependencies = [
+ "zeroize",
+]
+
+[[package]]
 name = "aleph-prompt-proto"
 version = "0.1.0"
 dependencies = [

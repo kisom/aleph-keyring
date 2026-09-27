@@ -1,0 +1,10 @@
+[package]
+name = "aleph-pam-proto"
+description = "The request format between pam_aleph and alephd's pam.sock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+zeroize.workspace = true

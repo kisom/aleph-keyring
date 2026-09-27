@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/aleph-core", "crates/aleph-tpm-proto", "crates/aleph-tpmd", "crates/aleph-unlock", "crates/aleph-prompt-proto", "crates/aleph-daemon", "crates/aleph-cli"]
+members = ["crates/aleph-core", "crates/aleph-tpm-proto", "crates/aleph-tpmd", "crates/aleph-unlock", "crates/aleph-prompt-proto", "crates/aleph-daemon", "crates/aleph-cli", "crates/aleph-pam-proto"]
 
 [workspace.package]
 version = "0.1.0"
