@@ -615,6 +615,56 @@ async fn unlock_prompts_share_one_prompter() {
     assert_eq!(s.svc.waiting_count(), 2);
 }
 
+/// Unlock prompts that joined a running conversation end with it when it
+/// is dismissed (cancelled, timed out, prompter gone), instead of waiting
+/// with no prompter for an unlock that may never come.
+#[tokio::test(flavor = "multi_thread")]
+async fn joined_unlock_prompts_end_when_the_conversation_is_dismissed() {
+    use futures_util::StreamExt;
+    let (s, holding) = served_holding().await;
+    s.svc.lock().await.unwrap();
+    let c = client(&s).await;
+    let mut prompts = Vec::new();
+    for _ in 0..2 {
+        let (_, prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) = service(&c)
+            .await
+            .call(
+                "Unlock",
+                &(vec![
+                    ObjectPath::try_from("/org/freedesktop/secrets/aliases/default").unwrap(),
+                ],),
+            )
+            .await
+            .unwrap();
+        let p = zbus::Proxy::new(
+            &c,
+            "org.freedesktop.secrets",
+            prompt,
+            "org.freedesktop.Secret.Prompt",
+        )
+        .await
+        .unwrap();
+        let completed = p.receive_signal("Completed").await.unwrap();
+        p.call_method("Prompt", &("",)).await.unwrap();
+        prompts.push((p, completed));
+        // The first starts the conversation; the second joins it.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert_eq!(held(&holding), 1);
+    // The held conversation times out after 2 s: both prompts complete.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    for (_, completed) in &mut prompts {
+        let msg = tokio::time::timeout_at(deadline, completed.next())
+            .await
+            .expect("the prompt completes")
+            .unwrap();
+        let (dismissed, _): (bool, zbus::zvariant::OwnedValue) = msg.body().deserialize().unwrap();
+        assert!(dismissed);
+    }
+    assert_eq!(s.svc.waiting_count(), 0);
+    assert_eq!(held(&holding), 1);
+}
+
 /// A prompt dismissed while its conversation runs completes once: the
 /// conversation ending later sends nothing more.
 #[tokio::test(flavor = "multi_thread")]

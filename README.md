@@ -12,6 +12,12 @@ gnome-keyring's secrets store; libsecret applications work unmodified.
 **Status:** early development. The design is in
 [`docs/superpowers/specs/2026-09-26-aleph-design.md`](docs/superpowers/specs/2026-09-26-aleph-design.md).
 
+Not yet handled: changing your login password outside aleph (`passwd`).
+TPM keyslots are sealed under the login password; after an outside change
+they go stale, and until session integration lands (re-sealing with the
+previous password, recovery-key unlock) the way back in is to set the
+previous password again. A FIDO2 keyslot is unaffected.
+
 ## Crates
 
 | Crate | Purpose |

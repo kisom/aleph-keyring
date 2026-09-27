@@ -114,7 +114,23 @@ struct Waiting {
     prompt: OwnedObjectPath,
     client: Option<String>,
     targets: Vec<Target>,
+    /// The unlock conversation this prompt joined, if it joined one (it
+    /// ends with that conversation if the conversation is dismissed).
+    joined: Option<u64>,
 }
+
+/// The unlock conversation (one runs at a time).
+#[derive(Default)]
+struct UnlockConversation {
+    running: bool,
+    /// The number of the latest conversation.
+    current: u64,
+    /// Recent conversations that ended dismissed.
+    dismissed: std::collections::VecDeque<u64>,
+}
+
+/// Dismissed conversations remembered (for prompts joining as one ends).
+const DISMISSED_KEPT: usize = 16;
 
 /// Prompt objects one client may hold at once (started or not).
 const MAX_PROMPTS_PER_CLIENT: usize = 16;
@@ -142,8 +158,8 @@ pub struct SecretService {
     waiting: Mutex<Vec<Waiting>>,
     /// Every live prompt object and the client that asked for it.
     prompts: Mutex<HashMap<OwnedObjectPath, Option<String>>>,
-    /// An unlock conversation is running.
-    unlock_running: std::sync::atomic::AtomicBool,
+    /// The unlock conversation, if one is running, and how recent ones ended.
+    unlock: Mutex<UnlockConversation>,
     conn: std::sync::OnceLock<Connection>,
 }
 
@@ -158,7 +174,7 @@ impl SecretService {
             searches: Mutex::default(),
             waiting: Mutex::default(),
             prompts: Mutex::default(),
-            unlock_running: Default::default(),
+            unlock: Mutex::default(),
             conn: std::sync::OnceLock::new(),
         })
     }
@@ -393,6 +409,23 @@ impl SecretService {
         Ok(())
     }
 
+    /// End (dismissed) the waiting prompts that joined an unlock
+    /// conversation which was dismissed: nothing else is asking the user.
+    async fn end_dismissed_joiners(self: &Arc<Self>) {
+        let dismissed = self.unlock.lock().unwrap().dismissed.clone();
+        let ended: Vec<Waiting> = {
+            let mut waiting = self.waiting.lock().unwrap();
+            let (ended, kept) = waiting
+                .drain(..)
+                .partition(|w| w.joined.is_some_and(|id| dismissed.contains(&id)));
+            *waiting = kept;
+            ended
+        };
+        for w in ended {
+            finish(self, &w.prompt, None, empty_paths()).await;
+        }
+    }
+
     /// A placeholder item standing for `query` while the vault is locked.
     async fn placeholder(
         self: &Arc<Self>,
@@ -589,19 +622,44 @@ impl SecretService {
             // One unlock conversation at a time: the others wait for it
             // (and complete when it unlocks), rather than each opening a
             // prompter window.
-            if self.unlock_running.swap(true, Ordering::SeqCst) {
-                return Outcome::Wait;
-            }
+            let id = {
+                let mut u = self.unlock.lock().unwrap();
+                if u.running {
+                    return Outcome::Joined(u.current);
+                }
+                u.running = true;
+                u.current += 1;
+                u.current
+            };
             // Cleared on every exit, a panic included: a flag stuck at
             // true would leave every later unlock prompt waiting forever.
-            struct Running<'a>(&'a std::sync::atomic::AtomicBool);
+            // A conversation that did not end well (a panic too) is
+            // recorded as dismissed, so the prompts that joined it end.
+            struct Running<'a> {
+                unlock: &'a Mutex<UnlockConversation>,
+                id: u64,
+                dismissed: bool,
+            }
             impl Drop for Running<'_> {
                 fn drop(&mut self) {
-                    self.0.store(false, Ordering::SeqCst);
+                    let mut u = self.unlock.lock().unwrap_or_else(|e| e.into_inner());
+                    u.running = false;
+                    if self.dismissed {
+                        u.dismissed.push_back(self.id);
+                        if u.dismissed.len() > DISMISSED_KEPT {
+                            u.dismissed.pop_front();
+                        }
+                    }
                 }
             }
-            let _running = Running(&self.unlock_running);
-            return self.run_unlock(targets, caller);
+            let mut running = Running {
+                unlock: &self.unlock,
+                id,
+                dismissed: true,
+            };
+            let outcome = self.run_unlock(targets, caller);
+            running.dismissed = matches!(outcome, Outcome::Dismissed);
+            return outcome;
         }
         let mut chan = match self.launcher.launch() {
             Ok(chan) => chan,
@@ -695,6 +753,9 @@ enum Outcome {
     Dismissed,
     /// No prompter could start: wait for an unlock from elsewhere.
     Wait,
+    /// Another unlock conversation (this number) is running: wait for it,
+    /// and end with it if it is dismissed.
+    Joined(u64),
 }
 
 fn path_value(p: OwnedObjectPath) -> OwnedValue {
@@ -1398,8 +1459,17 @@ impl PromptObj {
                     }
                     finish(&svc, &p, Some(value), empty).await;
                 }
-                Outcome::Dismissed => finish(&svc, &p, None, empty).await,
-                Outcome::Wait => {
+                Outcome::Dismissed => {
+                    finish(&svc, &p, None, empty).await;
+                    if unlocking {
+                        svc.end_dismissed_joiners().await;
+                    }
+                }
+                Outcome::Wait | Outcome::Joined(_) => {
+                    let joined = match outcome {
+                        Outcome::Joined(id) => Some(id),
+                        _ => None,
+                    };
                     let admitted = {
                         let mut waiting = svc.waiting.lock().unwrap();
                         let mine = waiting.iter().filter(|w| w.client == client).count();
@@ -1409,6 +1479,7 @@ impl PromptObj {
                                 prompt: p.clone(),
                                 client: client.clone(),
                                 targets,
+                                joined,
                             });
                         }
                         ok
@@ -1416,6 +1487,11 @@ impl PromptObj {
                     if !admitted {
                         finish(&svc, &p, None, empty).await;
                         return;
+                    }
+                    // The conversation may have been dismissed while this
+                    // prompt was joining it.
+                    if joined.is_some() {
+                        svc.end_dismissed_joiners().await;
                     }
                     svc.gone_already(client.as_deref()).await;
                     // Unlocked meanwhile? Then complete now.

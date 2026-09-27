@@ -324,9 +324,7 @@ impl Keyring {
     fn choose_and_open(&self, chan: &mut Channel, vault: &LockedVault) -> Result<Opened> {
         let methods = self.methods(vault);
         if methods.is_empty() {
-            return Err(Error::NoMethodWorked(Some(
-                "every enrolled unlock method is stale; `aleph keyslot retry` or re-enroll".into(),
-            )));
+            return Err(Error::NoMethodWorked(Some(crate::error::ALL_STALE.into())));
         }
         let mut error: Option<String> = None;
         let mut retry_after = None;

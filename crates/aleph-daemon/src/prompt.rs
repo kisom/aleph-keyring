@@ -31,6 +31,12 @@ pub struct Channel {
 
 impl Channel {
     pub fn new(stream: UnixStream, timeout: Duration) -> Result<Self> {
+        // A prompter's fd may arrive non-blocking (async runtimes set the
+        // flag, and it travels with the fd), which would turn every read
+        // into an instant "timed out". Writes are bounded too: a prompter
+        // that stops reading must not block the daemon.
+        stream.set_nonblocking(false)?;
+        stream.set_write_timeout(Some(timeout))?;
         Ok(Self {
             reader: BufReader::new(stream.try_clone()?),
             writer: stream,
@@ -239,6 +245,46 @@ pub mod scripted {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A prompter built on an async runtime passes a non-blocking fd (the
+    /// flag travels with SCM_RIGHTS): the channel must still wait for its
+    /// answers, not read "no data yet" as a timeout.
+    #[test]
+    fn a_non_blocking_prompter_fd_still_waits_for_the_answer() {
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        ours.set_nonblocking(true).unwrap();
+        let mut ch = Channel::new(ours, Duration::from_secs(5)).unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut question = String::new();
+            BufReader::new(theirs.try_clone().unwrap())
+                .read_line(&mut question)
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            theirs
+                .write_all(b"{\"type\":\"confirm\",\"yes\":true}\n")
+                .unwrap();
+        });
+        let reply = ch.ask(&ToPrompter::Confirm { text: "ok?".into() }).unwrap();
+        assert_eq!(reply, FromPrompter::Confirm { yes: true });
+        peer.join().unwrap();
+    }
+
+    /// A prompter that stops reading cannot block the daemon forever (it
+    /// holds the conversation lock while it writes).
+    #[test]
+    fn a_prompter_that_stops_reading_times_out_writes() {
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let mut ch = Channel::new(ours, Duration::from_millis(200)).unwrap();
+        let text = "x".repeat(8 * 1024);
+        let started = Instant::now();
+        // Fill the socket buffer; a write then fails instead of blocking.
+        while ch.send(&ToPrompter::Confirm { text: text.clone() }).is_ok() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "never timed out"
+            );
+        }
+    }
 
     #[test]
     fn a_scripted_prompter_answers_in_order() {

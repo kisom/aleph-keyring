@@ -32,7 +32,7 @@ pub enum Error {
     WrongPassword,
 
     #[error(
-        "the TPM keyslot '{0}' no longer accepts your password (was it changed?); it is marked stale: re-enroll it with `aleph keyslot add tpm`"
+        "the TPM keyslot '{0}' no longer accepts your login password (was it changed?) and is marked stale; unlock with another method, or set the previous password again with `passwd`, unlock, and run `aleph keyslot add tpm` before changing it"
     )]
     Stale(String),
 
@@ -84,3 +84,25 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Why unlocking cannot start when every enrolled method is stale.
+pub(crate) const ALL_STALE: &str = "every enrolled unlock method is stale (was your login password changed?); set the previous password again with `passwd`, then unlock";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stale-slot advice is read while the vault is locked, so it must not
+    /// send the user to commands that need it unlocked (re-enrolling) or
+    /// that only repeat the failure (`keyslot retry`); what works then is
+    /// setting the previous password again.
+    #[test]
+    fn stale_advice_works_while_locked() {
+        let stale = Error::Stale("tpm".into()).to_string();
+        for advice in [stale.as_str(), ALL_STALE] {
+            assert!(advice.contains("passwd"), "{advice}");
+            assert!(!advice.contains("re-enroll it with"), "{advice}");
+            assert!(!advice.contains("keyslot retry"), "{advice}");
+        }
+    }
+}
