@@ -14,6 +14,28 @@ use tss_esapi::Context;
 
 static START_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Let the child inherit nothing above stderr. tss2 opens its TPM sockets
+/// without close-on-exec: a long-lived swtpm that inherits another test's
+/// connection keeps it open after its owner closes it, and that test's
+/// swtpm (one client at a time) never accepts the next one.
+fn no_inherited_fds(cmd: &mut Command) -> &mut Command {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: close_range is async-signal-safe and touches no memory.
+    // CLOSE_RANGE_CLOEXEC, not closing: std's exec-error pipe must stay
+    // open until the exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_uint,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            );
+            Ok(())
+        })
+    }
+}
+
 pub struct SwTpm {
     child: Child,
     port: u16,
@@ -40,7 +62,7 @@ impl SwTpm {
     fn try_start() -> Option<Self> {
         let port = free_port_pair()?;
         let dir = tempfile::tempdir().unwrap();
-        let child = Command::new("swtpm")
+        let child = no_inherited_fds(&mut Command::new("swtpm"))
             .arg("socket")
             .arg("--tpm2")
             .arg("--tpmstate")
@@ -186,11 +208,16 @@ impl SwTpm {
 }
 
 impl SwTpm {
+    /// The swtpm process's id.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Set the TPM's dictionary-attack parameters, as a real TPM might ship
     /// (swtpm defaults to 3 tries). tss-esapi 7.7 lacks
     /// TPM2_DictionaryAttackParameters, so this uses tpm2-tools.
     pub fn set_da_parameters(&self, max_tries: u32, recovery_time: u32, lockout_recovery: u32) {
-        let status = Command::new("tpm2_dictionarylockout")
+        let status = no_inherited_fds(&mut Command::new("tpm2_dictionarylockout"))
             .env("TPM2TOOLS_TCTI", self.tcti())
             .arg("--setup-parameters")
             .arg(format!("--max-tries={max_tries}"))
