@@ -288,9 +288,11 @@ async fn sessions_are_freed_when_their_client_leaves() {
 }
 
 /// Review I4: with no prompter, one client's waiting unlock prompts are
-/// capped, and they go when the client leaves.
+/// bounded (by the 16 prompts a client may hold: every one of them may
+/// wait, so none is dismissed for want of room), and they go when the
+/// client leaves.
 #[tokio::test(flavor = "multi_thread")]
-async fn waiting_prompts_are_capped_and_dropped_with_their_client() {
+async fn waiting_prompts_are_bounded_and_dropped_with_their_client() {
     let s = served(vec![]).await;
     s.svc.lock().await.unwrap();
     let client = zbus::connection::Builder::address(s.address.as_str())
@@ -336,7 +338,7 @@ async fn waiting_prompts_are_capped_and_dropped_with_their_client() {
         let _ = p.call_method("Prompt", &("",)).await;
     }
     assert!(
-        wait_until(|| s.svc.waiting_count() == 8).await,
+        wait_until(|| s.svc.waiting_count() == 12).await,
         "{}",
         s.svc.waiting_count()
     );

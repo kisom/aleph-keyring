@@ -671,6 +671,12 @@ async fn revert(c: &Client) -> Result<()> {
         Ok(None) => {}
         Err(e) => eprintln!("alephctl: {e}"),
     }
+    if let Err(e) = c.release_secret_service().await {
+        let _ = c.thaw_writes().await;
+        return Err(e);
+    }
+    // (Only once gnome-keyring has everything back: a failed release keeps
+    // aleph serving, and its prompt keeps its window rule.)
     match wizard::remove_hyprland_rule(&dirs.config_home) {
         Ok(Some(config)) => eprintln!(
             "alephctl: took the prompt's window rule out of {}",
@@ -678,10 +684,6 @@ async fn revert(c: &Client) -> Result<()> {
         ),
         Ok(None) => {}
         Err(e) => eprintln!("alephctl: {e}"),
-    }
-    if let Err(e) = c.release_secret_service().await {
-        let _ = c.thaw_writes().await;
-        return Err(e);
     }
     record.revert_phase = None;
     record.save(&dirs)?;

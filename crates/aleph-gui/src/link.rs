@@ -120,10 +120,18 @@ fn read_loop(mut stream: UnixStream, tx: &Sender<Event>, wake: &dyn Fn()) {
 
 /// Send one answer.
 pub fn send(mut stream: &UnixStream, reply: &FromPrompter) -> std::io::Result<()> {
-    // Zeroizing: answers carry passwords, PINs, and recovery groups.
-    let mut line = Zeroizing::new(serde_json::to_vec(reply).map_err(std::io::Error::other)?);
-    line.push(b'\n');
-    stream.write_all(&line)
+    // Answers carry passwords, PINs, and recovery groups: written into one
+    // buffer of the line limit's size (a growing one would leave unwiped
+    // copies behind when it moves), wiped on drop. One that does not fit
+    // is refused; alephd would refuse the line anyway.
+    let mut buf = Zeroizing::new(vec![0u8; MAX_LINE + 1]);
+    let mut rest: &mut [u8] = &mut buf[..];
+    let fits = serde_json::to_writer(&mut rest, reply).is_ok() && rest.write_all(b"\n").is_ok();
+    if !fits {
+        return Err(std::io::Error::other("the answer is too long"));
+    }
+    let len = MAX_LINE + 1 - rest.len();
+    stream.write_all(&buf[..len])
 }
 
 #[cfg(test)]
@@ -183,6 +191,22 @@ mod tests {
             other => panic!("{other:?}"),
         }
         drop(writer.join());
+    }
+
+    /// An answer is written into one buffer of the line limit's size, never
+    /// grown (a grown buffer leaves an unwiped copy of the password
+    /// behind): one that would not fit is refused.
+    #[test]
+    fn an_over_long_answer_is_refused() {
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let err = send(
+            &ours,
+            &FromPrompter::Password {
+                password: Secret::new("x".repeat(MAX_LINE)),
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("too long"), "{err}");
     }
 
     #[test]

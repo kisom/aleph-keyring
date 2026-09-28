@@ -336,6 +336,86 @@ fn keys_arriving_with_the_focus_are_ignored() {
     assert!(d.heard_nothing());
 }
 
+/// A message alephd sends that cannot be read (a version mismatch after an
+/// upgrade) is prompter trouble: the window closes without answering, so
+/// the prompt waits (a Cancel would dismiss it).
+#[test]
+fn an_unreadable_message_closes_without_answering() {
+    let (mut h, mut d) = window(ThemeChoice::Neon);
+    begin(&mut d, Purpose::Unlock, "Unlock the keyring");
+    d.stream
+        .write_all(b"{\"type\":\"from_the_future\"}\n")
+        .unwrap();
+    settle(&mut h);
+    assert!(h.state().closed);
+    assert!(d.heard_nothing());
+}
+
+/// However long an error (up to the 400 characters shown), the field and
+/// the buttons stay on the window.
+#[test]
+fn a_long_error_never_pushes_the_buttons_off() {
+    let (mut h, mut d) = window(ThemeChoice::Auto);
+    begin(&mut d, Purpose::Unlock, "Unlock the keyring");
+    let error = "W".repeat(1000);
+    d.say(&ask(
+        vec![Method::Password, Method::Fido2],
+        Some(&error),
+        None,
+    ));
+    settle(&mut h);
+    let unlock = h.get_by_label("Unlock").rect();
+    let field = h.get_by_label("Login password").rect();
+    assert!(
+        unlock.bottom() <= aleph_gui::screens::SIZE[1],
+        "the buttons are off the window: {unlock:?}"
+    );
+    assert!(field.bottom() <= unlock.top(), "{field:?} {unlock:?}");
+}
+
+/// A note after a successful unlock (a pending rotation, say) goes sooner
+/// than a failure's message: the window holds the keyboard while it is up.
+#[test]
+fn a_note_after_success_closes_sooner() {
+    let (mut h, mut d) = window(ThemeChoice::Neon);
+    h.state_mut().message_for = Duration::from_secs(60);
+    h.state_mut().note_for = Duration::from_millis(100);
+    begin(&mut d, Purpose::Unlock, "Unlock the keyring");
+    d.say(&ToPrompter::Done {
+        ok: true,
+        message: Some("a password change still needs the master key rotated".into()),
+    });
+    settle(&mut h);
+    std::thread::sleep(Duration::from_millis(150));
+    frames(&mut h);
+    assert!(h.state().closed);
+}
+
+/// Enter in an empty PIN field leaves the keyboard on it: what is typed
+/// next still lands there.
+#[test]
+fn enter_in_an_empty_pin_field_keeps_the_keyboard() {
+    let (mut h, mut d) = window(ThemeChoice::Neon);
+    begin(&mut d, Purpose::Unlock, "Unlock the keyring");
+    d.say(&ToPrompter::Fido2Pin {
+        key: "yubikey".into(),
+        error: None,
+    });
+    settle(&mut h);
+    h.key_press(Key::Enter);
+    frames(&mut h);
+    h.get_by_label("PIN for yubikey").type_text("1234");
+    frames(&mut h);
+    h.key_press(Key::Enter);
+    frames(&mut h);
+    assert_eq!(
+        d.heard(),
+        FromPrompter::Pin {
+            pin: Secret::new("1234")
+        }
+    );
+}
+
 /// A closing message closes itself: the window holds the keyboard while it
 /// is open.
 #[test]

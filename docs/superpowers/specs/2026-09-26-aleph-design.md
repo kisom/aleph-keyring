@@ -386,11 +386,12 @@ classic case) create a new key that orphans their existing data.
   locked changes nothing.
 - No method call ever blocks waiting for the user. `Unlock()` returns a
   prompt with no reply timeout. If no prompter can start (no graphical
-  session), or the prompter times out or ends without an answer (it
-  crashed, or could not open its window), the prompt is not dismissed
-  (only the user's Cancel dismisses it): it waits until the vault is
-  unlocked some other way (`alephctl unlock`, PAM), then completes. At
-  most 8 prompts per client, and 128 in all, may wait; a prompt starts
+  session), or its conversation ends any way but the user's Cancel (the
+  prompter timed out, crashed, or could not open its window; the typed
+  attempts ran out; the machine went to sleep), the prompt is not
+  dismissed (only Cancel dismisses it): it waits until the vault is
+  unlocked some other way (`alephctl unlock`, PAM), then completes. Every
+  prompt a client may hold may wait (16), and 128 in all; a prompt starts
   once; while one unlock conversation runs, other unlock prompts wait for
   it instead of opening more prompter windows (if it is cancelled, they
   keep waiting for a later unlock). A client may hold 16 prompts.
@@ -1084,7 +1085,8 @@ alephctl restore [--from-bak | --accept-rollback] [<path>]
   prompt inside the real one nor push the buttons out of view.
 - If no window can open, the prompter exits without answering, and the
   prompt waits (§4). When alephd ends the conversation, the window
-  closes; a closing message stays up for 20 seconds or until closed.
+  closes; a closing message stays up until closed, or for 20 seconds
+  (6 for a note after a successful unlock).
   Keys arriving just as a screen appears are ignored, so text typed into
   another window never becomes an answer.
 - The package ships a Hyprland window rule,

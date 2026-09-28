@@ -33,8 +33,9 @@ pub struct PromptApp {
     /// an answer here.
     pub input_guard: Duration,
     /// How long a closing message stays up (the window holds the keyboard
-    /// while it is open).
+    /// while it is open): a failure's, and a note after success.
     pub message_for: Duration,
+    pub note_for: Duration,
     /// When the current screen appeared.
     shown_at: Instant,
     /// When a closing message closes itself.
@@ -43,8 +44,10 @@ pub struct PromptApp {
 
 /// Keys ignored after a screen appears.
 pub const INPUT_GUARD: Duration = Duration::from_millis(400);
-/// A closing message's time on screen.
+/// A closing message's time on screen: a failure's, and a note after
+/// success (a pending rotation: it would come with every unlock).
 pub const MESSAGE_FOR: Duration = Duration::from_secs(20);
+pub const NOTE_FOR: Duration = Duration::from_secs(6);
 
 impl PromptApp {
     pub fn new(
@@ -67,6 +70,7 @@ impl PromptApp {
             closed: false,
             input_guard: INPUT_GUARD,
             message_for: MESSAGE_FOR,
+            note_for: NOTE_FOR,
             shown_at: Instant::now(),
             close_at: None,
         }
@@ -138,9 +142,11 @@ impl PromptApp {
                         self.close(&ctx);
                     }
                 }
+                // Prompter trouble, not the person's no: close without
+                // answering, so the prompt waits (a Cancel would dismiss it).
                 Event::Broken(why) => {
                     eprintln!("aleph-gui: {why}");
-                    self.reply(&ctx, FromPrompter::Cancel {});
+                    self.close(&ctx);
                 }
             }
         }
@@ -155,9 +161,12 @@ impl PromptApp {
             crate::conversation::Screen::Finished { message: None, .. } => self.close(&ctx),
             // A closing message closes itself after a while.
             crate::conversation::Screen::Finished {
-                message: Some(_), ..
+                ok,
+                message: Some(_),
+                ..
             } => {
-                let at = *self.close_at.get_or_insert(now + self.message_for);
+                let stay = if ok { self.note_for } else { self.message_for };
+                let at = *self.close_at.get_or_insert(now + stay);
                 if now >= at {
                     self.close(&ctx);
                 } else {

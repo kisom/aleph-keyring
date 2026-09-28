@@ -17,6 +17,9 @@ pub const SIZE: [f32; 2] = [460.0, 300.0];
 /// Room kept for the row of buttons along the bottom.
 const BUTTON_ROW: f32 = 36.0;
 
+/// The most rows an error takes.
+const ERROR_ROWS: usize = 3;
+
 /// The prompter's state between frames: the conversation and what is
 /// being typed.
 pub struct PromptUi {
@@ -114,9 +117,11 @@ impl PromptUi {
         }
     }
 
+    /// An error, cut to three rows: the field and the buttons below it
+    /// must stay on the window.
     fn error(ui: &mut egui::Ui, p: &Palette, error: &Option<String>) {
         if let Some(e) = error {
-            ui.label(RichText::new(e).color(p.error));
+            ui.label(fitted(ui, e, ERROR_ROWS, p.error));
         }
     }
 
@@ -300,7 +305,12 @@ impl PromptUi {
             Screen::Confirm { text, default } => {
                 // (Cut to the rows that fit above the buttons: the text may
                 // carry another program's collection label.)
-                ui.label(fitted(ui, text));
+                ui.label(fitted(
+                    ui,
+                    text,
+                    rows_above_buttons(ui),
+                    ui.visuals().text_color(),
+                ));
                 let mut answer = None;
                 let bar = Self::buttons(ui, |ui| {
                     // (Right to left: "Yes" rightmost.)
@@ -400,7 +410,7 @@ impl PromptUi {
                     .as_deref()
                     .unwrap_or(if *ok { "Done." } else { "Stopped." });
                 let color = if *ok { p.foreground } else { p.error };
-                ui.label(RichText::new(text).color(color));
+                ui.label(fitted(ui, text, rows_above_buttons(ui), color));
                 let mut close = false;
                 ui.with_layout(Layout::bottom_up(Align::Max), |ui| {
                     close = Self::primary(p, "Close", true, ui);
@@ -421,6 +431,10 @@ impl PromptUi {
         make: fn(Secret) -> Action,
     ) -> Option<Action> {
         let ready = !self.secret.is_empty();
+        if submit && !ready {
+            // (Enter left the empty field: give it the keyboard back.)
+            self.focused_for = u64::MAX;
+        }
         let mut clicked = false;
         let bar = Self::buttons(ui, |ui| {
             clicked = Self::primary(p, "Continue", ready, ui);
@@ -430,17 +444,21 @@ impl PromptUi {
     }
 }
 
-/// `text` wrapped to the width, cut (with "…") to the rows that fit above
-/// the row of buttons.
-fn fitted(ui: &egui::Ui, text: &str) -> egui::text::LayoutJob {
+/// The rows of body text that fit between here and the row of buttons.
+fn rows_above_buttons(ui: &egui::Ui) -> usize {
     let font = egui::TextStyle::Body.resolve(ui.style());
     let row = ui.fonts_mut(|f| f.row_height(&font));
-    let rows = ((ui.available_height() - BUTTON_ROW) / row)
+    ((ui.available_height() - BUTTON_ROW) / row)
         .floor()
-        .max(1.0) as usize;
+        .max(1.0) as usize
+}
+
+/// `text` wrapped to the width, cut (with "…") to `rows`.
+fn fitted(ui: &egui::Ui, text: &str, rows: usize, color: egui::Color32) -> egui::text::LayoutJob {
+    let font = egui::TextStyle::Body.resolve(ui.style());
     let mut job = egui::text::LayoutJob::single_section(
         text.to_string(),
-        egui::TextFormat::simple(font, ui.visuals().text_color()),
+        egui::TextFormat::simple(font, color),
     );
     job.wrap = egui::text::TextWrapping {
         max_width: ui.available_width(),

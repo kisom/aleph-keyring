@@ -138,8 +138,10 @@ const MAX_PROMPTS_PER_CLIENT: usize = 16;
 /// Sessions one client may hold open at once.
 const MAX_SESSIONS_PER_CLIENT: usize = 32;
 
-/// Waiting unlock prompts allowed per client, and in all.
-const MAX_WAITING_PER_CLIENT: usize = 8;
+/// Waiting unlock prompts allowed per client (every prompt it may hold:
+/// none is dismissed for want of room while the person is away), and in
+/// all.
+const MAX_WAITING_PER_CLIENT: usize = MAX_PROMPTS_PER_CLIENT;
 const MAX_WAITING: usize = 128;
 
 /// The daemon state the D-Bus objects share.

@@ -26,9 +26,10 @@ impl Session for OwnEnvironment {
 }
 
 /// A display name the prompter may use: a bare socket name in the runtime
-/// directory (`wayland-1`), never a path. Any process of the user can set
-/// the manager's environment; a path could send the prompt, and what is
-/// typed into it, through a proxy of its choosing.
+/// directory (`wayland-1`), never a path to a socket elsewhere. (This keeps
+/// the prompt in the runtime directory; it does not stop a process of the
+/// same user, which can put a socket of its own there and name it. Same-user
+/// processes are outside what aleph defends against: spec §4.)
 fn usable(name: &str) -> bool {
     !name.is_empty() && !name.contains('/')
 }

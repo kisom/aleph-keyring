@@ -450,7 +450,7 @@ impl Keyring {
                 return Ok(false);
             }
         };
-        match converse(&mut chan, |chan| self.unlock_conversation(chan, caller)) {
+        match converse_in_window(&mut chan, |chan| self.unlock_conversation(chan, caller)) {
             Err(_) if !self.is_locked() => Ok(true),
             // Only the user's Cancel dismisses (§4). Anything else that ends
             // the conversation (prompter trouble: it timed out, closed or
@@ -1847,16 +1847,32 @@ fn converse(
     chan: &mut Channel,
     f: impl FnOnce(&mut Channel) -> Result<Option<String>>,
 ) -> Result<()> {
+    converse_with(chan, f, false)
+}
+
+/// `converse` for the Secret Service's own prompter window: prompter
+/// trouble (a timeout, a bad answer) has nothing to tell the person there,
+/// so the window just closes. (A terminal prompter prints the reason.)
+fn converse_in_window(
+    chan: &mut Channel,
+    f: impl FnOnce(&mut Channel) -> Result<Option<String>>,
+) -> Result<()> {
+    converse_with(chan, f, true)
+}
+
+fn converse_with(
+    chan: &mut Channel,
+    f: impl FnOnce(&mut Channel) -> Result<Option<String>>,
+    window: bool,
+) -> Result<()> {
     match f(chan) {
         Ok(message) => {
             chan.done(true, message);
             Ok(())
         }
         Err(e) => {
-            // Prompter trouble has nothing to tell the person: the window
-            // closes (if it is still there to be told).
             let message = match &e {
-                Error::Prompt(_) => None,
+                Error::Prompt(_) if window => None,
                 e => Some(e.to_string()),
             };
             chan.done(false, message);

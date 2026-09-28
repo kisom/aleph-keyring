@@ -109,6 +109,10 @@ pub const HYPRLAND_RULE_FILE: &str = "/usr/share/aleph/hyprland/aleph-prompt.lua
 pub const HYPRLAND_INCLUDE: &str = "\n-- Added by alephctl setup: float aleph's unlock prompt.\n\
      pcall(dofile, \"/usr/share/aleph/hyprland/aleph-prompt.lua\")\n";
 
+/// The include's working line: present, the rule is included (whatever
+/// became of the comment above it).
+const HYPRLAND_INCLUDE_LINE: &str = "pcall(dofile, \"/usr/share/aleph/hyprland/aleph-prompt.lua\")";
+
 /// The user's Hyprland configuration, if it is the Lua kind (Omarchy's).
 pub fn hyprland_config(config_home: &Path) -> Option<PathBuf> {
     let path = config_home.join("hypr/hyprland.lua");
@@ -116,7 +120,7 @@ pub fn hyprland_config(config_home: &Path) -> Option<PathBuf> {
 }
 
 pub fn hyprland_rule_included(config: &Path) -> bool {
-    std::fs::read_to_string(config).is_ok_and(|t| t.contains(HYPRLAND_INCLUDE))
+    std::fs::read_to_string(config).is_ok_and(|t| t.contains(HYPRLAND_INCLUDE_LINE))
 }
 
 /// Append the include (once), ending the file's last line first if it is
@@ -124,7 +128,7 @@ pub fn hyprland_rule_included(config: &Path) -> bool {
 pub fn include_hyprland_rule(config: &Path) -> Result<bool> {
     use std::io::Write;
     let text = std::fs::read_to_string(config).map_err(|e| format!("{}: {e}", config.display()))?;
-    if text.contains(HYPRLAND_INCLUDE) {
+    if text.contains(HYPRLAND_INCLUDE_LINE) {
         return Ok(false);
     }
     let sep = if text.is_empty() || text.ends_with('\n') {
@@ -329,6 +333,21 @@ mod tests {
         include_hyprland_rule(&config).unwrap();
         remove_hyprland_rule(dir.path()).unwrap();
         assert_eq!(std::fs::read_to_string(&config).unwrap(), "-- mine\n");
+    }
+
+    /// The include is recognized by its `pcall` line: a user who rewords
+    /// the comment above it does not get it added again.
+    #[test]
+    fn an_edited_comment_does_not_add_the_include_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("hyprland.lua");
+        std::fs::write(
+            &config,
+            "-- aleph's prompt (my words)\npcall(dofile, \"/usr/share/aleph/hyprland/aleph-prompt.lua\")\n",
+        )
+        .unwrap();
+        assert!(hyprland_rule_included(&config));
+        assert!(!include_hyprland_rule(&config).unwrap());
     }
 
     /// A symlinked configuration (a dotfiles repository) stays a symlink.

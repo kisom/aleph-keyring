@@ -9,6 +9,36 @@ made directly are marked as such.
 
 ## 2026-09-28: Plan 5a (the prompter), design
 
+### H4. The final review's minor findings, fixed (owner's request)
+
+Each with a test that failed first, except where noted:
+
+- `alephctl unlock` that times out prints why again: only the Secret
+  Service's own prompter window gets `Done` without a message
+  (`an_admin_conversation_that_times_out_says_so`).
+- A message from alephd the prompter cannot read closes the window
+  without answering, so the prompt waits
+  (`an_unreadable_message_closes_without_answering`).
+- Errors are cut to three rows, and closing messages to the rows above
+  their button (`a_long_error_never_pushes_the_buttons_off`).
+- A note after a successful unlock (a pending rotation) stays 6 seconds,
+  a failure's message 20 (`a_note_after_success_closes_sooner`).
+- An answer is written into one buffer of the line limit's size, never
+  grown; one that does not fit is refused
+  (`an_over_long_answer_is_refused`).
+- Enter in an empty PIN, previous-password, or recovery-key field leaves
+  the keyboard on it (`enter_in_an_empty_pin_field_keeps_the_keyboard`).
+- Every prompt a client may hold (16) may wait, not 8: none is dismissed
+  for want of room while the person is away
+  (`waiting_prompts_are_bounded_and_dropped_with_their_client`).
+- The Hyprland include is recognized by its `pcall` line, so a reworded
+  comment does not get it added again
+  (`an_edited_comment_does_not_add_the_include_again`); revert takes it
+  out only after the Secret Service is released (no test: making the
+  release fail in the CLI tests would need a new failure hook).
+- The display-name check's comment and H2 no longer claim it stops a
+  same-user proxy.
+
 ### H3. The pre-execution review of the Plan 5a document: fixes adopted
 
 An independent review of the plan and its prototype. Adopted, each with a
@@ -86,9 +116,9 @@ while prototyping") and pinned by a test that was seen to fail without it.
   the systemd user manager's `Environment` (uncached, 2 s limit), where the
   compositor exports the display, and uses its own environment only when
   the manager cannot be asked. No display there means no graphical session
-  now, and the prompt waits (§4), as before. Only a bare socket name is
-  accepted, never a path (any process of the user can set the manager's
-  environment).
+  now, and the prompt waits (§4), as before. Only a bare socket name in
+  the runtime directory is accepted, never a path elsewhere (this does not
+  stop a same-user process, which can create a socket there too).
 - **`~/.config/aleph/gui.toml`** holds the GUI's settings (`theme = "auto" |
   "neon"`, `scanlines`): alephd's `config.toml` refuses unknown keys and
   has no use for them. An unreadable file warns and uses the defaults.

@@ -425,6 +425,33 @@ fn a_prompter_that_ends_without_an_answer_leaves_the_unlock_waiting() {
     assert!(k.is_locked());
 }
 
+/// An admin conversation (`alephctl unlock`, answered in the terminal) that
+/// times out still says why: the terminal prints the reason. (Only the
+/// Secret Service's own prompter window is closed without a message.)
+#[test]
+fn an_admin_conversation_that_times_out_says_so() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+    let env = env();
+    let k = keyring(&env, MockKeys::default());
+    create_with_password(&k);
+    k.lock();
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let mut chan = aleph_daemon::prompt::Channel::new(ours, Duration::from_millis(300)).unwrap();
+    assert!(k.unlock(&mut chan, None).is_err());
+    drop(chan);
+    let last: ToPrompter = BufReader::new(theirs)
+        .lines()
+        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+        .last()
+        .unwrap();
+    assert!(
+        matches!(&last, ToPrompter::Done { ok: false, message: Some(m) } if m.contains("timed out")),
+        "{last:?}"
+    );
+}
+
 /// No refusal but the user's Cancel dismisses an unlock prompt: typing the
 /// wrong password until the attempt limit blocks the next (the right one)
 /// ends the conversation, but the unlock waits for one from elsewhere
