@@ -3,6 +3,7 @@
 pub mod admin;
 pub mod config;
 pub mod daemon;
+pub mod display;
 pub mod error;
 pub mod export;
 pub mod import;

@@ -367,11 +367,62 @@ fn a_waiting_prompter_is_released_when_the_vault_unlocks_elsewhere() {
         .expect("the conversation ended without waiting for the prompter");
     result.unwrap();
     let seen = prompter.join().unwrap();
+    // (No message: the window closes by itself.)
     assert!(
-        matches!(seen.last(), Some(ToPrompter::Done { ok: true, .. })),
+        matches!(
+            seen.last(),
+            Some(ToPrompter::Done {
+                ok: true,
+                message: None
+            })
+        ),
         "{:?}",
         seen.last()
     );
+}
+
+/// Prompter trouble is not the user's answer: a prompter that closes
+/// without answering (it could not open its window) or stays silent until
+/// the prompt timeout leaves the unlock waiting (`Ok(false)`, as with no
+/// prompter: spec §4), and is told `Done` without a message. Only Cancel
+/// dismisses.
+#[test]
+fn a_prompter_that_ends_without_an_answer_leaves_the_unlock_waiting() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+    let env = env();
+    let k = keyring(&env, MockKeys::default());
+    create_with_password(&k);
+    k.lock();
+    let closed = k.unlock_prompting(
+        || {
+            let (ours, theirs) = UnixStream::pair()?;
+            drop(theirs);
+            aleph_daemon::prompt::Channel::new(ours, Duration::from_secs(5))
+        },
+        None,
+    );
+    assert!(matches!(closed, Ok(false)), "{closed:?}");
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let silent = k.unlock_prompting(
+        || aleph_daemon::prompt::Channel::new(ours, Duration::from_millis(300)),
+        None,
+    );
+    assert!(matches!(silent, Ok(false)), "{silent:?}");
+    let last: ToPrompter = BufReader::new(theirs)
+        .lines()
+        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+        .last()
+        .unwrap();
+    assert_eq!(
+        last,
+        ToPrompter::Done {
+            ok: false,
+            message: None
+        }
+    );
+    assert!(k.is_locked());
 }
 
 /// A FIDO2 unlock waiting for its key to be plugged in is released by a

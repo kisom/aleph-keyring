@@ -194,18 +194,22 @@ pub trait Launcher: Send + Sync {
 
 /// Runs `<program> prompt` with its end of a socketpair as
 /// `ALEPH_PROMPT_FD` (via `std::process::Command`: fork and exec, with only
-/// an `fcntl` between them, never a bare fork).
+/// an `fcntl` between them, never a bare fork), on the session's current
+/// Wayland display.
 pub struct ProgramLauncher {
     /// Read at each launch, so `prompt.program` and `prompt.timeout`
     /// changes apply to the next prompt without a restart.
     pub config: std::sync::Arc<std::sync::Mutex<crate::config::Config>>,
+    /// Where the display comes from (the user manager, in alephd).
+    pub session: std::sync::Arc<dyn crate::display::Session>,
 }
 
 impl Launcher for ProgramLauncher {
     fn launch(&self) -> Result<Channel> {
-        if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        let Some(display) = self.session.wayland_display() else {
+            tracing::info!("no prompter: the session has no Wayland display");
             return Err(Error::NoPrompter);
-        }
+        };
         // Both ends close-on-exec.
         let (ours, theirs) = UnixStream::pair()?;
         let fd = theirs.as_raw_fd();
@@ -217,7 +221,10 @@ impl Launcher for ProgramLauncher {
             )
         };
         let mut command = std::process::Command::new(&program);
-        command.arg("prompt").env("ALEPH_PROMPT_FD", fd.to_string());
+        command
+            .arg("prompt")
+            .env("ALEPH_PROMPT_FD", fd.to_string())
+            .env("WAYLAND_DISPLAY", display);
         // The child's end must survive the exec, but become inheritable
         // only in the child: cleared here in the daemon, a child another
         // thread spawns meanwhile (a second prompter, PAM's helper) would
@@ -245,7 +252,10 @@ impl Launcher for ProgramLauncher {
                 });
                 Channel::new(ours, timeout)
             }
-            Err(e) if e.kind() == ErrorKind::NotFound => Err(Error::NoPrompter),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                tracing::info!("no prompter: {program} is not installed");
+                Err(Error::NoPrompter)
+            }
             Err(e) => Err(Error::Prompt(format!("cannot start {program}: {e}"))),
         }
     }

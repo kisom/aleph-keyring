@@ -452,6 +452,14 @@ impl Keyring {
         };
         match converse(&mut chan, |chan| self.unlock_conversation(chan, caller)) {
             Err(_) if !self.is_locked() => Ok(true),
+            // Prompter trouble (it timed out, closed or crashed before an
+            // answer, could not open its window) is not the user's no: the
+            // prompt waits for an unlock from elsewhere, as with no
+            // prompter (§4). Only Cancel dismisses.
+            Err(Error::Prompt(e)) => {
+                tracing::info!("the prompter ended without an answer: {e}");
+                Ok(false)
+            }
             other => other.map(|()| true),
         }
     }
@@ -476,9 +484,9 @@ impl Keyring {
             kek,
             reseal,
         } = match self.choose_and_open(chan, &locked) {
-            Err(Error::UnlockedElsewhere) => {
-                return Ok(Some("The keyring was unlocked meanwhile.".into()));
-            }
+            // (No message: the window just closes. A message would keep a
+            // pinned, focused window up until someone dismissed it.)
+            Err(Error::UnlockedElsewhere) => return Ok(None),
             other => other?,
         };
         let warning = self.install(vault, slot, kek.as_ref())?;
@@ -1842,7 +1850,13 @@ fn converse(
             Ok(())
         }
         Err(e) => {
-            chan.done(false, Some(e.to_string()));
+            // Prompter trouble has nothing to tell the person: the window
+            // closes (if it is still there to be told).
+            let message = match &e {
+                Error::Prompt(_) => None,
+                e => Some(e.to_string()),
+            };
+            chan.done(false, message);
             Err(e)
         }
     }

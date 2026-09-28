@@ -615,11 +615,12 @@ async fn unlock_prompts_share_one_prompter() {
     assert_eq!(s.svc.waiting_count(), 2);
 }
 
-/// Unlock prompts that joined a running conversation end with it when it
-/// is dismissed (cancelled, timed out, prompter gone), instead of waiting
-/// with no prompter for an unlock that may never come.
+/// A prompter that times out (or crashes) is not the user's answer: the
+/// unlock prompt that started it and those that joined it keep waiting
+/// (as with no prompter, spec §4), and complete, undismissed, when the
+/// vault is unlocked some other way. (Only Cancel dismisses.)
 #[tokio::test(flavor = "multi_thread")]
-async fn joined_unlock_prompts_end_when_the_conversation_is_dismissed() {
+async fn unlock_prompts_wait_when_the_prompter_times_out() {
     use futures_util::StreamExt;
     let (s, holding) = served_holding().await;
     s.svc.lock().await.unwrap();
@@ -651,7 +652,26 @@ async fn joined_unlock_prompts_end_when_the_conversation_is_dismissed() {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     assert_eq!(held(&holding), 1);
-    // The held conversation times out after 2 s: both prompts complete.
+    // The held conversation times out after 2 s: both prompts wait on.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    for (_, completed) in &mut prompts {
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), completed.next())
+                .await
+                .is_err(),
+            "a prompt completed after the prompter timed out"
+        );
+    }
+    assert_eq!(s.svc.waiting_count(), 2);
+    // "alephctl unlock" in a terminal: both complete, undismissed.
+    let keyring = s.svc.keyring.clone();
+    tokio::task::spawn_blocking(move || {
+        keyring.unlock(&mut Interactive::new(vec![password(PW)]).channel(), None)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    s.svc.unlocked().await.unwrap();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     for (_, completed) in &mut prompts {
         let msg = tokio::time::timeout_at(deadline, completed.next())
@@ -659,7 +679,7 @@ async fn joined_unlock_prompts_end_when_the_conversation_is_dismissed() {
             .expect("the prompt completes")
             .unwrap();
         let (dismissed, _): (bool, zbus::zvariant::OwnedValue) = msg.body().deserialize().unwrap();
-        assert!(dismissed);
+        assert!(!dismissed);
     }
     assert_eq!(s.svc.waiting_count(), 0);
     assert_eq!(held(&holding), 1);

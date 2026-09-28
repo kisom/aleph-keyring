@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use aleph_daemon::admin::BUS_NAME;
 use aleph_daemon::config::Config;
+use aleph_daemon::display::UserManager;
 use aleph_daemon::keyring::{Backends, Keyring};
 use aleph_daemon::password::PamCheck;
 use aleph_daemon::paths::Paths;
@@ -43,15 +44,19 @@ async fn run() -> Result<(), String> {
     };
     let keyring = Arc::new(Keyring::new(&paths, backends).map_err(|e| e.to_string())?);
     let config = Arc::new(std::sync::Mutex::new(config));
-    let launcher = Arc::new(ProgramLauncher {
-        config: config.clone(),
-    });
     let conn = zbus::connection::Builder::session()
         .and_then(|b| b.name(BUS_NAME))
         .map_err(|e| e.to_string())?
         .build()
         .await
         .map_err(|e| format!("cannot own {BUS_NAME} on the session bus: {e}"))?;
+    let launcher = Arc::new(ProgramLauncher {
+        config: config.clone(),
+        session: Arc::new(UserManager {
+            conn: conn.clone(),
+            runtime: tokio::runtime::Handle::current(),
+        }),
+    });
     let pam_socket = paths.pam_socket();
     let activation = paths
         .data_dir
