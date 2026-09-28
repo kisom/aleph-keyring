@@ -141,7 +141,8 @@ the TPM. The design keeps key custody separable for v2 (§10).
 | `aleph-daemon` (bin `alephd`) | bin | Secret Service and admin D-Bus interfaces, PAM socket, lock policy, prompter orchestration. | `aleph-core`, `aleph-unlock`, `aleph-prompt-proto`, `aleph-pam-proto`, `zbus`, `tokio`, `tracing`, `tracing-journald`, libpam |
 | `pam_aleph` | cdylib | PAM module: forwards passwords to `alephd` after dropping to the user's uid. Minimal, no async runtime. | `aleph-pam-proto`, PAM FFI, `libc` |
 | `aleph-cli` (bin `alephctl`) | bin | CLI. | `aleph-prompt-proto`, `zbus`, `clap` |
-| `aleph-gui` | bin | egui manager and prompter. | `eframe`, `egui`, `zbus`, `notify`, Wayland clipboard crate |
+| `aleph-gui` | bin | egui manager and prompter. | `aleph-prompt-proto`, `aleph-secret-session`, `eframe`, `egui`, `zbus`, `notify`, `wl-clipboard-rs` |
+| `aleph-secret-session` | lib | The Secret Service transfer sessions (`plain`, `dh-ietf1024-sha256-aes128-cbc-pkcs7`), server and client halves: alephd's Secret Service and its gnome-keyring import, and the manager. | `aes`, `cbc`, `hkdf`, `sha2`, `num-bigint`, `getrandom`, `zeroize` |
 
 **Seam for privilege separation:** only `KeyHandle` touches MK. Callers
 ask it to wrap, seal, open, and MAC. v2 can move `KeyHandle` into a
@@ -837,7 +838,9 @@ Verified against a stock Omarchy install on 2026-09-26.
   `GetConfig`, `SetConfig`, `Backup`, `Recover`, `RestoreBackup`,
   `RestoreFromBak`, `AcceptRollback`, `ImportGnomeKeyring`,
   `RemovedSinceImport`, `ExportToGnomeKeyring`, `ReleaseSecretService`,
-  `ThawWrites`. `Status` also names who owns `org.freedesktop.secrets`.
+  `ThawWrites`, `Reauth` (proves an enrolled method and changes nothing:
+  the manager's guard before it shows a secret). `Status` also names who
+  owns `org.freedesktop.secrets`.
 - **Methods that need the user take a prompter:** one end of a
   socketpair, passed as a Unix fd, speaking the prompter protocol. The
   CLI answers it in the terminal, `aleph-gui` in its windows. The call
@@ -1115,23 +1118,32 @@ alephctl restore [--from-bak | --accept-rollback] [<path>]
 
 **Manager (`aleph-gui`)**
 
-- **Secrets:** a collection list, a searchable item list, and a detail
-  pane (label, attributes, masked secret).
-  - Revealing a secret requires re-authentication (a UX guard, §6).
-  - Copying uses the Wayland clipboard with the MIME hint
-    `x-kde-passwordManagerHint: secret`, so clipboard-history tools skip
-    it, and clears the clipboard after 30 s.
-  - Items can be created, edited, and deleted.
-- **Keyslots:** a list with stale and unknown markers, enroll and remove
-  wizards, and recovery-key reissue.
-- **Settings:** lock policy, theme and scanlines, and prompt timeouts.
-- **Import and export**, and **Recover…**.
-- A `.desktop` entry makes it available in the Omarchy launcher, using the
-  icons in `assets/icons/` (§8).
+Designed in its own document,
+`docs/superpowers/specs/2026-09-28-aleph-manager-design.md`, and built in
+three plans (DECISIONS.md H7):
+
+- **The window and the secrets browser (Plan 5b):** `aleph-gui` with no
+  arguments; a Secret Service client like Seahorse (secrets reach it only
+  through `org.freedesktop.secrets`, over an encrypted session). Folders
+  and a searchable item list, a detail pane (label, attributes read-only,
+  dates, the secret masked); show and copy after a re-authentication that
+  holds for 5 minutes and not past a lock (a UX guard, §6); copies go to
+  the Wayland clipboard with the MIME hint `x-kde-passwordManagerHint:
+  secret`, so clipboard-history tools skip them, and are cleared after
+  30 s; items are created, renamed, given a new secret, and deleted;
+  folders are created and deleted (alephd confirms). A `.desktop` entry
+  puts it in the Omarchy launcher, with the icons in `assets/icons/` (§8).
+- **Settings (Plan 5c):** lock policy, prompt timeout, theme and
+  scanlines.
+- **Admin (Plan 5d):** the GUI equivalent of `alephctl`: status, lock and
+  unlock, keyslots, master-key rotation, recovery key, backup, restore and
+  recover.
+- Import and export stay in `alephctl setup` and `setup --revert`
+  (DECISIONS.md E3).
 
 ## 8. Packaging and distribution
 
-- **Repo:** one Cargo workspace (eight crates), plus `packaging/arch/`,
+- **Repo:** one Cargo workspace (eleven crates), plus `packaging/arch/`,
   `flake.nix`, `assets/`, and `docs/`. It targets current stable Rust.
 - **Arch / Omarchy:** `PKGBUILD` in-repo, published to the AUR as
   `aleph-keyring` and `aleph-keyring-git`.
@@ -1147,7 +1159,8 @@ alephctl restore [--from-bak | --accept-rollback] [<path>]
       written by setup)
     - `/usr/lib/systemd/user/alephd.{service,socket}`
     - `/usr/lib/systemd/system/aleph-tpmd.{service,socket}`
-    - the `.desktop` file and the icons:
+    - the `.desktop` file (`/usr/share/applications/aleph-gui.desktop`)
+      and the icons:
 
       | Source | Installed as |
       |---|---|

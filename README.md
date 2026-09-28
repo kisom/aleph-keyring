@@ -38,7 +38,8 @@ in place (Plan 4b). Design decisions made along the way are in
 | `aleph-daemon` | `alephd`: the Secret Service and the `io.aleph.Admin1` interface |
 | `pam_aleph` | PAM module that hands the login password to `alephd` |
 | `aleph-cli` | `alephctl`: the command-line client |
-| `aleph-gui` | `aleph-gui prompt`: the unlock prompt `alephd` opens (the manager window comes later) |
+| `aleph-gui` | The keyring manager (`aleph-gui`) and the unlock prompt `alephd` opens (`aleph-gui prompt`) |
+| `aleph-secret-session` | The Secret Service transfer sessions, shared by `alephd` and the manager |
 
 ## Development
 

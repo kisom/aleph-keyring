@@ -229,6 +229,39 @@ keyring. The client is `alephctl` (`aleph` on PATH is TeX's).
 Record the results, and the libsecret, Chromium, and NetworkManager
 versions, in `hardware-log.md`.
 
+### The manager (Plan 5b)
+
+After `make && make install` (the launcher entry and the icons are
+installed with it), on the account aleph serves:
+
+1. Open "aleph" from the Omarchy launcher (Super + Space): the manager
+   opens with the aleph icon, showing the folders and items (labels and
+   attributes only; no secret is fetched).
+2. Search: typing part of a label or an attribute value filters the list.
+3. Pick an item and SHOW: the confirmation appears inside the window
+   (login password, or a security key); after it, the secret shows. HIDE,
+   then SHOW again within 5 minutes: no confirmation. `alephctl lock`:
+   the window shows `VAULT SEALED` and hides the secret; UNLOCK opens the
+   usual prompt, and a SHOW then asks for the confirmation again.
+4. COPY: `COPIED`; paste it somewhere: it is the secret. Clipboard history
+   (`cliphist list`, if installed) does not list it. Switch to another
+   workspace (the manager hidden) and wait 30 s: the clipboard is empty.
+   (Closing the manager also clears a copy it served.)
+5. `+ ITEM` in a test folder (`+ FOLDER` first: alephd's prompt asks to
+   confirm): a label, a secret, an attribute; SAVE: it appears, and
+   `secret-tool lookup <key> <value>` prints the secret. EDIT its label
+   and (LOAD SECRET) its secret; SAVE; `secret-tool` prints the new one.
+   DELETE: it asks (No leaves it); Yes removes it. DELETE FOLDER on the
+   test folder: alephd's prompt asks.
+6. An application storing a secret meanwhile (`secret-tool store
+   --label=live service live-check`): it appears without a refresh.
+7. Switch the Omarchy theme: the manager re-themes.
+8. Restart alephd (`systemctl --user restart alephd.service`; the
+   keyring locks): the manager shows `VAULT SEALED`; unlock; SHOW and
+   `+ ITEM` still work (the manager opens a new session with the new
+   alephd). (Stopping alephd shows `LINK DOWN` only briefly: the manager's
+   own calls start it again, through D-Bus activation.)
+
 ## Emergency manual revert
 
 If login or the lock screen misbehaves after `sudo alephctl system apply`,

@@ -7,6 +7,110 @@ first. The spec (`docs/superpowers/specs/2026-09-26-aleph-design.md`)
 is updated to match wherever a decision changes it. Decisions the owner
 made directly are marked as such.
 
+## 2026-09-28: Plan 5b (the manager), design
+
+### H9. The pre-execution review of the Plan 5b document: fixes adopted
+
+An independent review of the plan and its prototype; no critical finding.
+Adopted, each with a test that failed without it:
+
+- **Sessions are their openers' (alephd).** alephd numbered sessions from
+  1 on every start and only checked that a session path existed, so after
+  a restart another client (Chromium, say) could be handed the manager's
+  cached path: the manager's shows then failed, and a save could store
+  garbage without an error. A session now serves only the client that
+  opened it (`NoSession` otherwise).
+- **The store follows alephd's restarts:** its session is tied to the
+  unique name that serves `org.freedesktop.secrets`, is closed and
+  replaced when a request that uses it fails, and that request is tried
+  once more.
+- **Deleting the default folder** (its alias goes with it) no longer shows
+  `LINK DOWN`: with the alias gone, the service answering means unlocked.
+- **The clipboard clears itself** on a timer thread 30 s after the copy
+  (if it is still that copy), not with the window's frames: a window on a
+  hidden workspace draws none.
+- **An edit saves only what changed:** a loaded secret is rewritten only
+  if it differs, and a secret that is not text cannot be loaded into the
+  editor (it would be mangled).
+- **A form stays until its save succeeds:** a failed save keeps what was
+  typed, with the error; a lock keeps a secret the person typed (a fetched
+  one must be fetched again).
+- **Only the store's loop lists,** so what it last sent is what the window
+  shows; a folder or item that vanishes mid-listing is skipped; a burst of
+  signals means one listing; signals are taken only from the service's
+  owner.
+- **Minor, adopted:** a secret asked for earlier no longer swallows the one
+  asked for last; Enter on the delete question answers No (a test);
+  "cannot fetch the secret" (not "cannot secret"); failures reach stderr
+  (operations and reasons, never secrets or labels); the embedded
+  confirmation paints no second set of scanlines, has a snapshot, and its
+  caveat is the manager's own line (it did not fit alephd's title).
+- **Left as they are:** a hostile item can carry attributes named
+  `created` or `modified`, shown above the real dates; a collection named
+  "X (default)" looks like the default (creating one needs alephd's
+  confirmation); the clipboard's "still ours" check and its clear are not
+  atomic (another program's copy in between is cleared); closing the
+  manager clears a copy it served (documented).
+
+### H8. Calls made while prototyping Plan 5b
+
+For the reviewers; each is argued in the plan
+(`docs/superpowers/plans/2026-09-28-aleph-manager.md`, "Decisions made
+while prototyping") and pinned by a test that was seen to fail without it.
+
+- **The lock state is polled as well as signalled, the lists are not.**
+  alephd signals a lock (`CollectionChanged` on the default alias), and the
+  store also reads one property (`Locked` on the default alias) every 2 s,
+  for a missed signal or an alephd restart; it lists every folder and item
+  only when that changes or a signal arrives: listing costs a few calls
+  per item.
+- **Each request runs on its own** on the store's thread: an unlock prompt
+  may wait for the person indefinitely (H5), and nothing else waits for
+  it. Only the session is shared, under a lock held just to encrypt or
+  decrypt.
+- **The confirmation reuses the prompter:** the prompt window's own code
+  (`PromptApp`), drawn inside the manager (`embedded`: it never closes or
+  resizes the window), on a socketpair whose other end goes to alephd's
+  `Reauth`.
+- **The copy is served by `wl-clipboard-rs`** (the wlr data-control
+  protocol, which Hyprland has) from a thread until another program takes
+  the clipboard (or the manager exits: the copy goes with it); "still
+  ours" is whether that thread is still serving. The served copy is the
+  crate's and is not zeroized.
+- **New items get `xdg:schema = org.freedesktop.Secret.Generic`** unless
+  one is typed; items are stored as `text/plain`.
+- **Dates are UTC calendar days;** a secret that is not UTF-8 shows as
+  "binary secret, N bytes".
+- **The folder marker is gone:** "▸" is not in the Omarchy theme's font
+  (it showed as a box); folders are bold, items indented.
+- **The manager's app id is `aleph`,** matching the launcher entry's
+  `StartupWMClass`; the entry's category is `Utility;Security;`.
+- **The binary tests never open a window on the real display:** with no
+  arguments `aleph-gui` is now the manager, so its test runs with a
+  display socket that does not exist, a private runtime directory, and no
+  session bus.
+- **The theme watcher is shared** by both windows (`theme::Watch`), and
+  now has a test.
+
+### H7. The manager: scope and approach — owner's decisions
+
+- **Three plans:** 5b the window, the secrets browser, and the launcher
+  entry (too small for a plan of its own); 5c settings (alephd's
+  `config.toml` and the GUI's `gui.toml`); 5d admin, the GUI equivalent
+  of `alephctl`.
+- **A Secret Service client:** the manager reaches secrets only through
+  `org.freedesktop.secrets`, like Seahorse, over an encrypted session. A
+  new admin method listing items or returning secrets was rejected: a
+  second, non-standard path to secrets for nothing gained. The session
+  code moved into `aleph-secret-session`, shared with alephd.
+- **Attributes are read-only** in the manager (applications find their
+  secrets by them); new items take the attributes typed.
+- **A reveal confirmation holds for 5 minutes,** and not past a lock (5c
+  may make the length a setting). It is the guard against a glance that
+  §6 describes, not security; the manager says so where it asks. alephd
+  gains `Reauth` for it.
+- **Import and export stay** in `alephctl setup` and `setup --revert`.
+
 ## 2026-09-28: Plan 5a (the prompter), design
 
 ### H6. The prompter's words and size — owner's decision
