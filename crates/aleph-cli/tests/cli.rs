@@ -400,8 +400,22 @@ async fn import_and_status_name_the_secret_service() {
 async fn setup_revert_hands_everything_back() {
     let d = daemon(true, vec![]).await;
     run(&d, &["store", "--label", "Mail", "service=mail"], "s3cret").await;
+    let hypr = d
+        .env
+        .paths
+        .data_dir
+        .parent()
+        .unwrap()
+        .join("home/config/hypr");
+    std::fs::create_dir_all(&hypr).unwrap();
+    let include = "\n-- Added by alephctl setup: float aleph's unlock prompt.\npcall(dofile, \"/usr/share/aleph/hyprland/aleph-prompt.lua\")\n";
+    std::fs::write(hypr.join("hyprland.lua"), format!("-- mine\n{include}")).unwrap();
     let (ok, _, err) = run(&d, &["setup", "--revert"], &format!("{PW}\n")).await;
     assert!(ok, "{err}");
+    assert_eq!(
+        std::fs::read_to_string(hypr.join("hyprland.lua")).unwrap(),
+        "-- mine\n"
+    );
     assert!(err.contains("Copied 1 item(s)"), "{err}");
     assert!(
         err.contains("gnome-keyring serves the Secret Service again"),
@@ -510,5 +524,38 @@ async fn a_setup_rerun_skips_the_root_step_once_applied() {
     assert!(
         log.contains("login and screen unlock already reach aleph"),
         "{log}"
+    );
+}
+
+/// On Hyprland (Lua configuration), setup offers the prompt's window rule
+/// and adds it once; unanswered, the offer takes its default (yes).
+#[tokio::test(flavor = "multi_thread")]
+async fn setup_adds_the_prompts_window_rule_to_hyprland_once() {
+    let d = daemon(false, vec![]).await;
+    let hypr = d
+        .env
+        .paths
+        .data_dir
+        .parent()
+        .unwrap()
+        .join("home/config/hypr");
+    std::fs::create_dir_all(&hypr).unwrap();
+    std::fs::write(hypr.join("hyprland.lua"), "-- mine\n").unwrap();
+    let log = setup(&d).await;
+    assert!(log.contains("Float the unlock prompt"), "{log}");
+    let text = std::fs::read_to_string(hypr.join("hyprland.lua")).unwrap();
+    assert!(text.starts_with("-- mine\n"), "{text}");
+    assert_eq!(
+        text.matches("pcall(dofile, \"/usr/share/aleph/hyprland/aleph-prompt.lua\")")
+            .count(),
+        1
+    );
+    // A re-run neither asks again nor adds it twice.
+    let (ok, _, log) = run(&d, &["setup"], "").await;
+    assert!(ok, "{log}");
+    assert!(!log.contains("Float the unlock prompt"), "{log}");
+    assert_eq!(
+        std::fs::read_to_string(hypr.join("hyprland.lua")).unwrap(),
+        text
     );
 }

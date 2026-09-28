@@ -273,6 +273,28 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 );
             }
             let mut term = prompter::Terminal::new();
+            if let Some(config) = wizard::hyprland_config(&dirs.config_home)
+                && !wizard::hyprland_rule_included(&config)
+            {
+                let answer = ask(
+                    &mut term,
+                    "Float the unlock prompt in the middle of the screen in Hyprland (adds two lines to hyprland.lua)? [Y/n] ",
+                )?;
+                if matches!(answer.trim(), "" | "y" | "Y" | "yes") {
+                    wizard::include_hyprland_rule(&config)?;
+                    eprintln!(
+                        "alephctl: {} now includes {}",
+                        config.display(),
+                        wizard::HYPRLAND_RULE_FILE
+                    );
+                    if !std::path::Path::new(wizard::HYPRLAND_RULE_FILE).exists() {
+                        eprintln!(
+                            "alephctl: {} is not installed yet (`make install` puts it there); until then the rule does nothing",
+                            wizard::HYPRLAND_RULE_FILE
+                        );
+                    }
+                }
+            }
             if tpm {
                 offer_lockout_auth(&mut term)?;
             }
@@ -646,6 +668,14 @@ async fn revert(c: &Client) -> Result<()> {
     }
     match wizard::remove_omarchy_hook(&dirs.config_home) {
         Ok(Some(hook)) => eprintln!("alephctl: removed {}", hook.display()),
+        Ok(None) => {}
+        Err(e) => eprintln!("alephctl: {e}"),
+    }
+    match wizard::remove_hyprland_rule(&dirs.config_home) {
+        Ok(Some(config)) => eprintln!(
+            "alephctl: took the prompt's window rule out of {}",
+            config.display()
+        ),
         Ok(None) => {}
         Err(e) => eprintln!("alephctl: {e}"),
     }

@@ -100,6 +100,64 @@ pub fn remove_omarchy_hook(config_home: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
+/// The window rule the package installs for the prompter (spec §7
+/// "Prompter": float, center, pin).
+pub const HYPRLAND_RULE_FILE: &str = "/usr/share/aleph/hyprland/aleph-prompt.lua";
+
+/// What setup adds to `hyprland.lua`. Through `pcall`, so a missing file
+/// (aleph uninstalled) never breaks Hyprland's configuration.
+pub const HYPRLAND_INCLUDE: &str = "\n-- Added by alephctl setup: float aleph's unlock prompt.\n\
+     pcall(dofile, \"/usr/share/aleph/hyprland/aleph-prompt.lua\")\n";
+
+/// The user's Hyprland configuration, if it is the Lua kind (Omarchy's).
+pub fn hyprland_config(config_home: &Path) -> Option<PathBuf> {
+    let path = config_home.join("hypr/hyprland.lua");
+    path.is_file().then_some(path)
+}
+
+pub fn hyprland_rule_included(config: &Path) -> bool {
+    std::fs::read_to_string(config).is_ok_and(|t| t.contains(HYPRLAND_INCLUDE))
+}
+
+/// Append the include (once), ending the file's last line first if it is
+/// unfinished. Appended in place: a symlinked dotfile stays a symlink.
+pub fn include_hyprland_rule(config: &Path) -> Result<bool> {
+    use std::io::Write;
+    let text = std::fs::read_to_string(config).map_err(|e| format!("{}: {e}", config.display()))?;
+    if text.contains(HYPRLAND_INCLUDE) {
+        return Ok(false);
+    }
+    let sep = if text.is_empty() || text.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(config)
+        .and_then(|mut f| f.write_all(format!("{sep}{HYPRLAND_INCLUDE}").as_bytes()))
+        .map_err(|e| format!("{}: {e}", config.display()))?;
+    Ok(true)
+}
+
+/// Take the include out again (revert), leaving the rest of the file as
+/// setup found it (with its last line ended); returns the file's path if
+/// the include was there.
+pub fn remove_hyprland_rule(config_home: &Path) -> Result<Option<PathBuf>> {
+    let Some(config) = hyprland_config(config_home) else {
+        return Ok(None);
+    };
+    let text =
+        std::fs::read_to_string(&config).map_err(|e| format!("{}: {e}", config.display()))?;
+    let Some(at) = text.find(HYPRLAND_INCLUDE) else {
+        return Ok(None);
+    };
+    let rest = format!("{}{}", &text[..at], &text[at + HYPRLAND_INCLUDE.len()..]);
+    // (Written through a symlink, like the append.)
+    std::fs::write(&config, rest).map_err(|e| format!("{}: {e}", config.display()))?;
+    Ok(Some(config))
+}
+
 /// The program that runs the root side (`sudo`; `ALEPH_SUDO` names another,
 /// for tests, which must never run the real one).
 fn sudo() -> std::ffi::OsString {
@@ -241,6 +299,85 @@ mod tests {
         std::fs::write(&path, OMARCHY_HOOK).unwrap();
         assert_eq!(remove_omarchy_hook(dir.path()).unwrap(), Some(path.clone()));
         assert!(!path.exists());
+    }
+
+    /// The include goes in once, after what is there, and revert takes out
+    /// exactly what setup added.
+    #[test]
+    fn the_hyprland_include_is_added_once_and_removed_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(hyprland_config(dir.path()), None);
+        assert_eq!(remove_hyprland_rule(dir.path()).unwrap(), None);
+        let config = dir.path().join("hypr/hyprland.lua");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let original = "require(\"hypr.bindings\")\n-- mine\n";
+        std::fs::write(&config, original).unwrap();
+        assert_eq!(hyprland_config(dir.path()), Some(config.clone()));
+        assert!(include_hyprland_rule(&config).unwrap());
+        assert!(!include_hyprland_rule(&config).unwrap());
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(text.starts_with(original), "{text}");
+        assert_eq!(text.matches(HYPRLAND_INCLUDE).count(), 1);
+        assert!(hyprland_rule_included(&config));
+        assert_eq!(
+            remove_hyprland_rule(dir.path()).unwrap(),
+            Some(config.clone())
+        );
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+        // An unfinished last line is ended, and stays ended.
+        std::fs::write(&config, "-- mine").unwrap();
+        include_hyprland_rule(&config).unwrap();
+        remove_hyprland_rule(dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), "-- mine\n");
+    }
+
+    /// A symlinked configuration (a dotfiles repository) stays a symlink.
+    #[test]
+    fn a_symlinked_hyprland_config_stays_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("dotfiles.lua");
+        std::fs::write(&real, "-- mine\n").unwrap();
+        let config = dir.path().join("hypr/hyprland.lua");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &config).unwrap();
+        include_hyprland_rule(&config).unwrap();
+        assert!(config.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(
+            std::fs::read_to_string(&real)
+                .unwrap()
+                .contains(HYPRLAND_INCLUDE)
+        );
+        remove_hyprland_rule(dir.path()).unwrap();
+        assert!(config.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "-- mine\n");
+    }
+
+    /// The include names the file the package installs, and both are valid
+    /// Lua (`luac -p`; Hyprland would refuse the whole configuration).
+    #[test]
+    fn the_hyprland_files_are_lua() {
+        assert!(HYPRLAND_INCLUDE.contains(HYPRLAND_RULE_FILE));
+        let dir = tempfile::tempdir().unwrap();
+        let include = dir.path().join("include.lua");
+        std::fs::write(&include, HYPRLAND_INCLUDE).unwrap();
+        let rule = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/hyprland/aleph-prompt.lua"
+        );
+        for file in [include.as_path(), Path::new(rule)] {
+            let out = std::process::Command::new("luac")
+                .arg("-p")
+                .arg(file)
+                .output()
+                .expect("luac (Arch: pacman -S lua)");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let text = std::fs::read_to_string(rule).unwrap();
+        assert!(text.contains("\"^aleph-prompt$\""), "{text}");
     }
 
     #[test]

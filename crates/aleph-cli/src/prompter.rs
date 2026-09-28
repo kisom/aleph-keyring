@@ -187,8 +187,7 @@ fn answer(
             })
         }
         ToPrompter::InsertKey { key } => {
-            // (The terminal cannot skip one key while waiting; Ctrl-C ends the
-            // whole operation. The GUI prompter offers "skip".)
+            // (Ctrl-C ends the whole operation, as Cancel does in the GUI.)
             eprintln!("alephctl: insert {key} (Ctrl-C cancels the whole operation)");
             None
         }

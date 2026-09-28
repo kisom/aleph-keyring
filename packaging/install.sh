@@ -18,17 +18,19 @@ fi
 
 case "${1:-install}" in
 install)
-    for f in "$R/alephctl" "$R/alephd" "$R/aleph-tpmd" "$R/libpam_aleph.so"; do
+    for f in "$R/alephctl" "$R/alephd" "$R/aleph-tpmd" "$R/aleph-gui" "$R/libpam_aleph.so"; do
         if [ ! -f "$f" ]; then
             echo "install.sh: $f is missing: run cargo build --release --workspace first" >&2
             exit 1
         fi
     done
     install -Dm755 "$R/alephctl" /usr/bin/alephctl
+    install -Dm755 "$R/aleph-gui" /usr/bin/aleph-gui
     install -Dm755 "$R/alephd" /usr/lib/aleph/alephd
     install -Dm755 "$R/aleph-tpmd" /usr/lib/aleph/aleph-tpmd
     install -Dm755 "$R/libpam_aleph.so" /usr/lib/security/pam_aleph.so
     install -Dm644 packaging/pam/aleph-check /etc/pam.d/aleph-check
+    install -Dm644 packaging/hyprland/aleph-prompt.lua /usr/share/aleph/hyprland/aleph-prompt.lua
     install -Dm644 -t /usr/lib/systemd/system \
         packaging/systemd/aleph-tpmd.service packaging/systemd/aleph-tpmd.socket
     install -Dm644 -t /usr/lib/systemd/user \
@@ -56,12 +58,13 @@ uninstall)
     fi
     systemctl --global disable alephd.socket || true
     systemctl disable --now aleph-tpmd.socket aleph-tpmd.service || true
-    rm -f /usr/bin/alephctl /usr/lib/aleph/alephd /usr/lib/aleph/aleph-tpmd \
+    rm -f /usr/bin/alephctl /usr/bin/aleph-gui /usr/lib/aleph/alephd /usr/lib/aleph/aleph-tpmd \
+        /usr/share/aleph/hyprland/aleph-prompt.lua \
         /usr/lib/security/pam_aleph.so /etc/pam.d/aleph-check \
         /usr/lib/systemd/system/aleph-tpmd.service /usr/lib/systemd/system/aleph-tpmd.socket \
         /usr/lib/systemd/user/alephd.service /usr/lib/systemd/user/alephd.socket \
         /usr/share/dbus-1/services/io.aleph.Keyring.service
-    rmdir /usr/lib/aleph 2>/dev/null || true
+    rmdir /usr/lib/aleph /usr/share/aleph/hyprland /usr/share/aleph 2>/dev/null || true
     systemctl daemon-reload
     echo "install.sh: uninstalled (the vault in ~/.local/share/aleph is left in place)"
     ;;
