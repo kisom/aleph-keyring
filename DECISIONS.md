@@ -4,7 +4,26 @@ Decisions made while the project owner was away, each proposed by the
 implementer and ruled on by an independent reviewer (a fresh model
 session with the spec and the code, and no part in writing them). Newest
 first. The spec (`docs/superpowers/specs/2026-09-26-aleph-design.md`)
-is updated to match wherever a decision changes it.
+is updated to match wherever a decision changes it. Decisions the owner
+made directly are marked as such.
+
+## 2026-09-27: Plan 4c (setup), design
+
+### G1. Omarchy's screen lock reaches alephd through an upstream `lock` hook — owner's decision
+
+Every Omarchy lock (key binding, menu, idle) runs the package-owned
+`/usr/bin/omarchy-system-lock`, which never tells logind (D13) but
+already locks 1Password. Omarchy runs user hooks from
+`~/.config/omarchy/hooks/<name>.d/` (`omarchy-hook`), with no `lock`
+hook yet.
+- aleph proposes upstream a one-line `omarchy-hook lock` in
+  `omarchy-system-lock` (drafted in Plan 4c's docs task, for the owner to
+  send).
+- Setup installs `~/.config/omarchy/hooks/lock.d/aleph`, running `aleph
+  lock`: inert until Omarchy ships the hook, and removed by revert.
+- Until then the idle timeout and sleep lock the vault. Rejected: a PATH
+  wrapper shadowing the package's script (fragile), and leaving it
+  unwired.
 
 ## 2026-09-27: Plan 4b split into custody (4b) and setup (4c)
 
