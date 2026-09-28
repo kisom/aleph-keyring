@@ -11,7 +11,7 @@ use aleph_gui::settings::{Settings, ThemeChoice};
 use aleph_prompt_proto::{Caller, FromPrompter, Method, Purpose, Secret, ToPrompter};
 use egui::Key;
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 
 /// alephd's side of a conversation with a prompt window.
 struct Daemon {
@@ -141,7 +141,7 @@ fn the_security_key_button_answers_fido2() {
     begin(&mut d, Purpose::Unlock, "Unlock the keyring");
     d.say(&ask(vec![Method::Password, Method::Fido2], None, None));
     settle(&mut h);
-    h.get_by_label("Use security key").click();
+    h.get_by_label("USE KEY").click();
     frames(&mut h);
     assert_eq!(d.heard(), FromPrompter::Fido2 {});
 }
@@ -364,7 +364,7 @@ fn a_long_error_never_pushes_the_buttons_off() {
         None,
     ));
     settle(&mut h);
-    let unlock = h.get_by_label("Unlock").rect();
+    let unlock = h.get_by_label("UNLOCK").rect();
     let field = h.get_by_label("Login password").rect();
     assert!(
         unlock.bottom() <= aleph_gui::screens::SIZE[1],
@@ -482,6 +482,87 @@ fn a_long_confirmation_never_covers_the_buttons() {
     assert!(
         text.bottom() <= no.top(),
         "the text {text:?} runs into the buttons {no:?}"
+    );
+}
+
+/// The unlock prompt's words: a tagline, the daemon's operation as the
+/// title, the caller, and the unlock flow's buttons. The field has no
+/// visible label, but keeps its name (screen readers, these tests).
+#[test]
+fn the_unlock_prompt_speaks_the_part() {
+    let (mut h, mut d) = window(ThemeChoice::Neon);
+    begin(&mut d, Purpose::Unlock, "Unlock the keyring");
+    d.say(&ask(
+        vec![Method::Password, Method::Fido2],
+        Some("wrong password"),
+        None,
+    ));
+    settle(&mut h);
+    h.get_by_label("ALEPH // UNLOCK VAULT");
+    h.get_by_label("Unlock the keyring");
+    h.get_by_label("REQUEST FROM secret-tool :: PID 4242");
+    h.get_by_label("ACCESS DENIED :: wrong password");
+    h.get_by_label("UNLOCK");
+    h.get_by_label("USE KEY");
+    h.get_by_label("ABORT");
+    let field = h.get_by_label("Login password");
+    assert_eq!(
+        field.accesskit_node().role(),
+        egui::accesskit::Role::PasswordInput
+    );
+}
+
+/// Confirmations keep plain words: a themed "yes" is the one wording that
+/// must never be misread.
+#[test]
+fn a_confirmation_keeps_plain_buttons() {
+    let (mut h, mut d) = window(ThemeChoice::Neon);
+    begin(&mut d, Purpose::Reauth, "Delete the collection 'work'?");
+    d.say(&ToPrompter::Confirm {
+        text: "Delete the collection 'work' and all its items?".into(),
+        default: false,
+    });
+    settle(&mut h);
+    h.get_by_label("ALEPH // IDENTITY CHECK");
+    h.get_by_label("Yes");
+    h.get_by_label("No");
+    h.get_by_label("Cancel");
+}
+
+/// The window is short for unlocking; the recovery key's screens ask for
+/// a taller one.
+#[test]
+fn the_recovery_key_screen_asks_for_a_taller_window() {
+    let (mut h, mut d) = window(ThemeChoice::Neon);
+    begin(&mut d, Purpose::Create, "Create the keyring");
+    d.say(&ToPrompter::ShowRecoveryKey {
+        key: Secret::new(KEY),
+        check: [3, 11],
+        error: None,
+    });
+    settle(&mut h);
+    let height = h.ctx.content_rect().height();
+    assert!(
+        height >= aleph_gui::screens::TALL[1] - 1.0,
+        "{height} < {:?}",
+        aleph_gui::screens::TALL
+    );
+}
+
+/// The changed-password screen's explanation, field, and buttons all fit
+/// (monospace Aleph neon is the widest).
+#[test]
+fn the_changed_password_screen_fits() {
+    let (mut h, mut d) = window(ThemeChoice::Neon);
+    begin(&mut d, Purpose::Unlock, "Unlock the keyring");
+    d.say(&ToPrompter::OldPassword { error: None });
+    settle(&mut h);
+    let field = h.get_by_label("Previous login password").rect();
+    let proceed = h.get_by_label("PROCEED").rect();
+    assert!(field.bottom() <= proceed.top(), "{field:?} {proceed:?}");
+    assert!(
+        proceed.bottom() <= h.ctx.content_rect().bottom(),
+        "{proceed:?}"
     );
 }
 

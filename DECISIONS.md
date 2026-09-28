@@ -9,6 +9,23 @@ made directly are marked as such.
 
 ## 2026-09-28: Plan 5a (the prompter), design
 
+### H6. The prompter's words and size — owner's decision
+
+After the first real run: less empty space, no "Login password" label,
+and words "that wouldn't be out of place in a movie", in both themes. The
+window is 460×210 for unlocking and confirming (250 for the changed
+password's explanation, 300 for the recovery key's screens, asked for as
+they appear). The field's label became a hint inside it (screen readers
+still get its name). The tagline is `ALEPH // UNLOCK VAULT` (the owner's
+words, over the proposed "ICE DETECTED"), the unlock button `UNLOCK` (over
+the proposed "JACK IN"); the rest of the copy is as proposed (spec §7).
+Confirmations and the recovery screens keep plain buttons (the
+implementer's call, not objected to: a themed yes must never be misread).
+Tests: `the_unlock_prompt_speaks_the_part`,
+`a_confirmation_keeps_plain_buttons`,
+`the_recovery_key_screen_asks_for_a_taller_window`,
+`the_changed_password_screen_fits`.
+
 ### H5. The unlock window waits for the person — owner's decision
 
 After `prompt.timeout` the unlock window closed and the request waited,

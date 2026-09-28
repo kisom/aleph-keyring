@@ -142,7 +142,7 @@ keyring. The client is `alephctl` (`aleph` on PATH is TeX's).
      the keyboard; then the right one.
    - Escape: the window closes and the lookup ends without a secret.
    - From a fullscreen window: the prompt still gets the keyboard.
-   - With a security key enrolled: "Use security key", then the PIN and
+   - With a security key enrolled: "USE KEY", then the PIN and
      touch screens.
    - Switch the Omarchy theme while the prompt is open: it re-themes.
    - Leave it unanswered past `prompt.timeout` (`alephctl config set

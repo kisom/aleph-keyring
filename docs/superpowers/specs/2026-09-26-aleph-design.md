@@ -1070,11 +1070,24 @@ alephctl restore [--from-bak | --accept-rollback] [<path>]
 - The GUI's settings are in `~/.config/aleph/gui.toml`: `theme = "auto"`
   (Omarchy's where there is one, else Aleph neon) or `"neon"`, and
   `scanlines = true|false`.
-- Section headers may use Gibson vocabulary. Buttons and labels stay plain.
+- Section headers may use Gibson vocabulary. In the prompter, in both
+  themes (DECISIONS.md H6): a tagline over the title (`ALEPH // UNLOCK
+  VAULT`, `IDENTITY CHECK`, `NEW CONSTRUCT`, `RECOVERY PROTOCOL`), the
+  caller as `REQUEST FROM <name> :: PID <pid>`, statuses (`ACCESS DENIED
+  :: …`, `COUNTERMEASURES ACTIVE :: retry in N s`, `DECRYPTING…`,
+  `AWAITING HARDWARE TOKEN`, `TOUCH <key> TO AUTHORIZE`), and the unlock
+  flow's buttons (`UNLOCK`, `USE KEY`, `PROCEED`, `ABORT`). The title is
+  always alephd's plain words for what is being done, and confirmations
+  and the recovery screens keep plain buttons (`Yes`, `No`, `Cancel`,
+  `Continue`): a themed yes is the one wording that must never be
+  misread. Fields have no visible label: a hint shows in them while
+  empty, and screen readers get their names.
 
 **Prompter (`aleph-gui prompt`)**
 
-- Fixed-size windows with app_id `aleph-prompt`.
+- Fixed-size windows with app_id `aleph-prompt`: 460×210 for unlocking
+  and confirming, taller for the few screens that need it (the changed
+  password's explanation, the recovery key's screens).
 - Screens:
   - the FIDO2 sequence (insert → PIN → touch)
   - login-password entry

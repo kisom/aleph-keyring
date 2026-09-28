@@ -11,8 +11,25 @@ use zeroize::Zeroizing;
 use crate::conversation::{Action, Conversation, Screen};
 use crate::theme::Palette;
 
-/// The window's fixed size.
-pub const SIZE: [f32; 2] = [460.0, 300.0];
+/// The window's size for unlocking and confirming (the prompts alephd
+/// opens), and the taller one the recovery key's screens ask for.
+pub const SIZE: [f32; 2] = [460.0, 210.0];
+pub const TALL: [f32; 2] = [460.0, 300.0];
+
+/// The size a screen needs.
+pub fn size_for(screen: &Screen) -> [f32; 2] {
+    match screen {
+        Screen::RecoveryKey { .. } | Screen::ShowRecoveryKey { .. } => TALL,
+        // (Its explanation takes three rows in monospace.)
+        Screen::OldPassword { .. } => [SIZE[0], 250.0],
+        _ => SIZE,
+    }
+}
+
+/// The unlock flow's words for a denial and for backing out (the
+/// confirmations and the recovery screens keep plain words).
+const DENIED: &str = "ACCESS DENIED";
+const ABORT: &str = "ABORT";
 
 /// Room kept for the row of buttons along the bottom.
 const BUTTON_ROW: f32 = 36.0;
@@ -93,7 +110,13 @@ impl PromptUi {
 
     fn header(&self, ui: &mut egui::Ui, p: &Palette) {
         let c = &self.conversation;
-        ui.label(RichText::new("aleph").small().color(p.accent));
+        let tagline = match c.purpose {
+            Some(Purpose::Unlock) | None => "ALEPH // UNLOCK VAULT",
+            Some(Purpose::Reauth) => "ALEPH // IDENTITY CHECK",
+            Some(Purpose::Create) => "ALEPH // NEW CONSTRUCT",
+            Some(Purpose::Recover) => "ALEPH // RECOVERY PROTOCOL",
+        };
+        ui.label(RichText::new(tagline).small().strong().color(p.accent));
         let title = if c.operation.is_empty() {
             "aleph keyring"
         } else {
@@ -102,9 +125,9 @@ impl PromptUi {
         ui.add(egui::Label::new(RichText::new(title).heading().strong()).truncate());
         if let Some(caller) = &c.caller {
             let who = match (&caller.name, caller.pid) {
-                (Some(n), Some(pid)) => format!("Requested by {n} (pid {pid})"),
-                (Some(n), None) => format!("Requested by {n}"),
-                (None, Some(pid)) => format!("Requested by pid {pid}"),
+                (Some(n), Some(pid)) => format!("REQUEST FROM {n} :: PID {pid}"),
+                (Some(n), None) => format!("REQUEST FROM {n}"),
+                (None, Some(pid)) => format!("REQUEST FROM PID {pid}"),
                 (None, None) => String::new(),
             };
             if !who.is_empty() {
@@ -117,11 +140,11 @@ impl PromptUi {
         }
     }
 
-    /// An error, cut to three rows: the field and the buttons below it
-    /// must stay on the window.
-    fn error(ui: &mut egui::Ui, p: &Palette, error: &Option<String>) {
+    /// An error after `prefix` ("ACCESS DENIED"), cut to three rows: the
+    /// field and the buttons below it must stay on the window.
+    fn error(ui: &mut egui::Ui, p: &Palette, prefix: &str, error: &Option<String>) {
         if let Some(e) = error {
-            ui.label(fitted(ui, e, ERROR_ROWS, p.error));
+            ui.label(fitted(ui, &format!("{prefix} :: {e}"), ERROR_ROWS, p.error));
         }
     }
 
@@ -136,31 +159,36 @@ impl PromptUi {
         ui.add_enabled(enabled, button).clicked()
     }
 
-    /// A masked, single-line secret field; true when Enter was pressed in it.
+    /// A single-line secret field, `masked` or not, with no visible label:
+    /// `hint` shows in it while it is empty, and `name` is what screen
+    /// readers (and the tests) call it. True when Enter was pressed in it.
     fn secret_field(
         ui: &mut egui::Ui,
         text: &mut String,
-        label: &str,
+        name: &str,
+        hint: &str,
         masked: bool,
         focus: bool,
     ) -> bool {
-        let l = ui.label(label);
-        let r = ui
-            .add(
-                TextEdit::singleline(text)
-                    .password(masked)
-                    .desired_width(f32::INFINITY),
-            )
-            .labelled_by(l.id);
+        let r = ui.add(
+            TextEdit::singleline(text)
+                .password(masked)
+                .hint_text(hint)
+                .desired_width(f32::INFINITY),
+        );
+        let name = name.to_string();
+        ui.ctx()
+            .accesskit_node_builder(r.id, move |node| node.set_label(name));
         if focus {
             r.request_focus();
         }
         r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))
     }
 
-    /// Buttons along the bottom, right to left: `Cancel` last.
+    /// Buttons along the bottom, right to left: `cancel` last.
     fn buttons(
         ui: &mut egui::Ui,
+        cancel: &str,
         add: impl FnOnce(&mut egui::Ui) -> Option<Action>,
     ) -> Option<Action> {
         let mut out = None;
@@ -168,7 +196,7 @@ impl PromptUi {
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     out = add(ui);
-                    if ui.button("Cancel").clicked() {
+                    if ui.button(cancel).clicked() {
                         out = Some(Action::Cancel);
                     }
                 });
@@ -199,15 +227,22 @@ impl PromptUi {
         let screen = std::mem::replace(&mut self.conversation.screen, Screen::Working);
         let action = match &screen {
             Screen::Working => {
-                self.spinner(ui, "Checking…");
-                Self::buttons(ui, |_| None)
+                self.spinner(
+                    ui,
+                    if unlocking {
+                        "DECRYPTING…"
+                    } else {
+                        "VERIFYING…"
+                    },
+                );
+                Self::buttons(ui, ABORT, |_| None)
             }
             Screen::Ask {
                 methods,
                 error,
                 retry_at,
             } => {
-                Self::error(ui, p, error);
+                Self::error(ui, p, DENIED, error);
                 let password = methods.contains(&Method::Password);
                 let key = methods.contains(&Method::Fido2);
                 let wait = retry_at
@@ -215,12 +250,18 @@ impl PromptUi {
                     .filter(|d| !d.is_zero());
                 let mut submit = false;
                 if password {
-                    submit =
-                        Self::secret_field(ui, &mut self.secret, "Login password", true, focus);
+                    submit = Self::secret_field(
+                        ui,
+                        &mut self.secret,
+                        "Login password",
+                        "enter passphrase_",
+                        true,
+                        focus,
+                    );
                     if let Some(d) = wait {
                         ui.label(
                             RichText::new(format!(
-                                "Try the password again in {} s",
+                                "COUNTERMEASURES ACTIVE :: retry in {} s",
                                 d.as_secs() + 1
                             ))
                             .color(p.warning),
@@ -228,30 +269,26 @@ impl PromptUi {
                         ui.ctx().request_repaint_after(Duration::from_millis(250));
                     }
                 } else {
-                    ui.label("Use your security key.");
+                    ui.label("HARDWARE TOKEN REQUIRED");
                 }
                 let ready = password && wait.is_none() && !self.secret.is_empty();
                 if submit && !ready {
                     // (Enter left the field: give it the keyboard back.)
                     self.focused_for = u64::MAX;
                 }
-                let label = if unlocking { "Unlock" } else { "Continue" };
+                let label = if unlocking { "UNLOCK" } else { "PROCEED" };
                 let mut clicked = None;
-                let bar = Self::buttons(ui, |ui| {
+                let bar = Self::buttons(ui, ABORT, |ui| {
                     if password && Self::primary(p, label, ready, ui) {
                         clicked = Some(true);
                     }
                     if key {
                         let b = if password {
-                            ui.button("Use security key")
+                            ui.button("USE KEY")
                         } else {
                             ui.add(
-                                Button::new(
-                                    RichText::new("Use security key")
-                                        .color(p.background)
-                                        .strong(),
-                                )
-                                .fill(p.accent),
+                                Button::new(RichText::new("USE KEY").color(p.background).strong())
+                                    .fill(p.accent),
                             )
                         };
                         if b.clicked() {
@@ -270,37 +307,44 @@ impl PromptUi {
             }
             Screen::OldPassword { error } => {
                 ui.label(
+                    RichText::new("CREDENTIALS OUT OF SYNC")
+                        .strong()
+                        .color(p.warning),
+                );
+                ui.label(
                     "Your login password was changed outside aleph. Enter the previous one to \
                      update the TPM keyslot (a wrong one costs a TPM attempt).",
                 );
-                Self::error(ui, p, error);
+                Self::error(ui, p, DENIED, error);
                 let submit = Self::secret_field(
                     ui,
                     &mut self.secret,
                     "Previous login password",
+                    "previous passphrase_",
                     true,
                     focus,
                 );
-                self.secret_answer(ui, p, submit, Action::Password)
+                self.secret_answer(ui, p, submit, Action::Password, ("PROCEED", ABORT))
             }
             Screen::Pin { key, error } => {
-                Self::error(ui, p, error);
+                Self::error(ui, p, DENIED, error);
                 let submit = Self::secret_field(
                     ui,
                     &mut self.secret,
                     &format!("PIN for {key}"),
+                    &format!("PIN for {key}_"),
                     true,
                     focus,
                 );
-                self.secret_answer(ui, p, submit, Action::Pin)
+                self.secret_answer(ui, p, submit, Action::Pin, ("PROCEED", ABORT))
             }
             Screen::InsertKey { key } => {
-                self.spinner(ui, &format!("Insert {key}."));
-                Self::buttons(ui, |_| None)
+                self.spinner(ui, &format!("AWAITING HARDWARE TOKEN :: insert {key}"));
+                Self::buttons(ui, ABORT, |_| None)
             }
             Screen::Touch { key } => {
-                self.spinner(ui, &format!("Touch {key} now."));
-                Self::buttons(ui, |_| None)
+                self.spinner(ui, &format!("TOUCH {key} TO AUTHORIZE"));
+                Self::buttons(ui, ABORT, |_| None)
             }
             Screen::Confirm { text, default } => {
                 // (Cut to the rows that fit above the buttons: the text may
@@ -312,7 +356,7 @@ impl PromptUi {
                     ui.visuals().text_color(),
                 ));
                 let mut answer = None;
-                let bar = Self::buttons(ui, |ui| {
+                let bar = Self::buttons(ui, "Cancel", |ui| {
                     // (Right to left: "Yes" rightmost.)
                     let yes = ui.button("Yes");
                     let no = ui.button("No");
@@ -334,16 +378,17 @@ impl PromptUi {
                 bar.or(answer.or(enter.then_some(*default)).map(Action::Confirm))
             }
             Screen::RecoveryKey { error } => {
-                Self::error(ui, p, error);
+                Self::error(ui, p, DENIED, error);
                 let submit = Self::secret_field(
                     ui,
                     &mut self.secret,
                     "Recovery key (14 groups of 4)",
+                    "recovery key (14 groups of 4)",
                     !self.show_recovery_key,
                     focus,
                 );
                 ui.checkbox(&mut self.show_recovery_key, "Show what I type");
-                self.secret_answer(ui, p, submit, Action::RecoveryKey)
+                self.secret_answer(ui, p, submit, Action::RecoveryKey, ("Continue", "Cancel"))
             }
             Screen::ShowRecoveryKey {
                 key,
@@ -351,7 +396,7 @@ impl PromptUi {
                 checking: false,
                 ..
             } => {
-                Self::error(ui, p, error);
+                Self::error(ui, p, "CHECK FAILED", error);
                 ui.label(
                     "Your new recovery key. Write it down and keep it somewhere safe: it is shown \
                      only this once, and it is the only way back in if every other method is lost.",
@@ -359,7 +404,7 @@ impl PromptUi {
                 ui.add_space(6.0);
                 key_grid(ui, p, key.expose());
                 let mut done = false;
-                let bar = Self::buttons(ui, |ui| {
+                let bar = Self::buttons(ui, "Cancel", |ui| {
                     done = Self::primary(p, "I have written it down", true, ui);
                     None
                 });
@@ -375,12 +420,13 @@ impl PromptUi {
                 checking: true,
                 ..
             } => {
-                Self::error(ui, p, error);
+                Self::error(ui, p, "CHECK FAILED", error);
                 let [a, b] = &mut self.groups;
                 let first = Self::secret_field(
                     ui,
                     a,
                     &format!("Group {} of your recovery key", check[0]),
+                    &format!("group {}", check[0]),
                     false,
                     focus,
                 );
@@ -388,12 +434,13 @@ impl PromptUi {
                     ui,
                     b,
                     &format!("Group {} of your recovery key", check[1]),
+                    &format!("group {}", check[1]),
                     false,
                     false,
                 );
                 let ready = !a.is_empty() && !b.is_empty();
                 let mut clicked = false;
-                let bar = Self::buttons(ui, |ui| {
+                let bar = Self::buttons(ui, "Cancel", |ui| {
                     clicked = Self::primary(p, "Continue", ready, ui);
                     None
                 });
@@ -429,6 +476,7 @@ impl PromptUi {
         p: &Palette,
         submit: bool,
         make: fn(Secret) -> Action,
+        (proceed, cancel): (&str, &str),
     ) -> Option<Action> {
         let ready = !self.secret.is_empty();
         if submit && !ready {
@@ -436,8 +484,8 @@ impl PromptUi {
             self.focused_for = u64::MAX;
         }
         let mut clicked = false;
-        let bar = Self::buttons(ui, |ui| {
-            clicked = Self::primary(p, "Continue", ready, ui);
+        let bar = Self::buttons(ui, cancel, |ui| {
+            clicked = Self::primary(p, proceed, ready, ui);
             None
         });
         bar.or(((clicked || submit) && ready).then(|| make(self.take_secret())))

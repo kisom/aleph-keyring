@@ -40,6 +40,8 @@ pub struct PromptApp {
     shown_at: Instant,
     /// When a closing message closes itself.
     close_at: Option<Instant>,
+    /// The window size last asked for.
+    size: [f32; 2],
 }
 
 /// Keys ignored after a screen appears.
@@ -73,6 +75,7 @@ impl PromptApp {
             note_for: NOTE_FOR,
             shown_at: Instant::now(),
             close_at: None,
+            size: crate::screens::SIZE,
         }
     }
 
@@ -128,6 +131,15 @@ impl PromptApp {
                     }
                     self.ui.screen_changed();
                     self.shown_at = now;
+                    // (The recovery key's screens need a taller window.)
+                    let size = crate::screens::size_for(&self.ui.conversation.screen);
+                    if size != self.size {
+                        self.size = size;
+                        let size = egui::Vec2::from(size);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(size));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                    }
                 }
                 // alephd is done with us: nothing more to answer. A
                 // closing message stays up until it is read.
