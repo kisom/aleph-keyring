@@ -1,1 +1,5 @@
 /target
+# egui_kittest writes these next to a snapshot that failed or was updated.
+*.new.png
+*.diff.png
+*.old.png
