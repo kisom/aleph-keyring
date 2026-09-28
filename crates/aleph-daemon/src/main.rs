@@ -68,7 +68,7 @@ async fn run() -> Result<(), String> {
     let claim = aleph_daemon::daemon::claims_at_start(activation.as_deref());
     if !claim {
         tracing::info!(
-            "serving {BUS_NAME}; not claiming {SECRETS_NAME} (aleph setup has not switched over)"
+            "serving {BUS_NAME}; not claiming {SECRETS_NAME} (alephctl setup has not switched over)"
         );
     }
     match if claim {
@@ -81,7 +81,7 @@ async fn run() -> Result<(), String> {
         // After setup switched over, nothing else should hold it.
         Ok(false) if activation.as_ref().is_some_and(|a| a.exists()) => {
             tracing::warn!(
-                "another program owns {SECRETS_NAME} although aleph setup switched over (gnome-keyring started outside systemd?); alephd waits in the queue"
+                "another program owns {SECRETS_NAME} although alephctl setup switched over (gnome-keyring started outside systemd?); alephd waits in the queue"
             )
         }
         Ok(false) => tracing::info!(

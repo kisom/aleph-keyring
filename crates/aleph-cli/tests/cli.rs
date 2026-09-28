@@ -22,7 +22,7 @@ fn aleph(d: &Daemon, args: &[&str]) -> Command {
         .unwrap();
         std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aleph"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_alephctl"));
     cmd.args(args)
         .env("DBUS_SESSION_BUS_ADDRESS", &d.bus.address)
         .env("HOME", &home)
@@ -74,7 +74,7 @@ fn read_until(child: &mut Child, seen: &mut String, needle: &str) {
     }
 }
 
-/// `aleph setup`, answering the recovery-key check by reading the key it
+/// `alephctl setup`, answering the recovery-key check by reading the key it
 /// shows, as a person would.
 async fn setup(d: &Daemon) -> String {
     let mut cmd = aleph(d, &["setup"]);
@@ -137,7 +137,7 @@ async fn setup_creates_the_keyring_and_status_shows_it() {
     assert!(log.contains("TPM: usable"), "{log}");
     assert!(log.contains("gnome-keyring is not running"), "{log}");
     assert!(log.contains("alephd serves the Secret Service"), "{log}");
-    assert!(log.contains("sudo aleph system apply --user"), "{log}");
+    assert!(log.contains("sudo alephctl system apply --user"), "{log}");
     assert!(log.contains("setup is done"), "{log}");
     let home = d.env.paths.data_dir.parent().unwrap().join("home");
     assert!(
@@ -286,7 +286,7 @@ async fn get_needs_attributes() {
     );
 }
 
-/// The recovery key `aleph setup` showed (in its output).
+/// The recovery key `alephctl setup` showed (in its output).
 fn recovery_key_in(log: &str) -> String {
     log.lines()
         .map(str::trim)
@@ -295,9 +295,9 @@ fn recovery_key_in(log: &str) -> String {
         .to_string()
 }
 
-/// `aleph backup` writes a file holding only the recovery slot, never over
+/// `alephctl backup` writes a file holding only the recovery slot, never over
 /// an existing file without `--force`, never inside aleph's own directory;
-/// `aleph restore <file>` restores it with the recovery key.
+/// `alephctl restore <file>` restores it with the recovery key.
 #[tokio::test(flavor = "multi_thread")]
 async fn backup_and_restore_through_the_cli() {
     let d = daemon(false, vec![]).await;
@@ -377,8 +377,8 @@ async fn restore_says_when_there_is_nothing_to_do() {
     assert!(!ok && err.contains("not a regular file"), "{err}");
 }
 
-/// `aleph import gnome-keyring` says when there is nothing to import, and
-/// `aleph status` names who serves the Secret Service.
+/// `alephctl import gnome-keyring` says when there is nothing to import, and
+/// `alephctl status` names who serves the Secret Service.
 #[tokio::test(flavor = "multi_thread")]
 async fn import_and_status_name_the_secret_service() {
     let d = daemon(true, vec![]).await;
@@ -391,7 +391,7 @@ async fn import_and_status_name_the_secret_service() {
     );
 }
 
-/// `aleph setup --revert` copies the keyring to gnome-keyring (the login
+/// `alephctl setup --revert` copies the keyring to gnome-keyring (the login
 /// password unlocks it), verifies it, and lets go of the Secret Service.
 #[tokio::test(flavor = "multi_thread")]
 async fn setup_revert_hands_everything_back() {

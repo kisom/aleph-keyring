@@ -19,7 +19,7 @@ Requirements:
 - **`tpm2-tss`**, **`libfido2`**, and **`pam`**: build-time libraries.
 - **`dbus`** (`dbus-daemon`) and **`libsecret`** (`secret-tool`): the
   daemon and CLI tests run `alephd`'s interfaces on a private session bus
-  and drive them with the real libsecret client and the real `aleph`
+  and drive them with the real libsecret client and the real `alephctl`
   binary. They never touch your session bus or keyring.
 - PAM is exercised for real through a private service directory
   (`pam_start_confdir`, Linux-PAM 1.4+): `pam_unix` rejecting a wrong
@@ -100,7 +100,7 @@ does (DynamicUser, the seccomp filter, threads). As root:
    `systemctl status aleph-tpmd.service` must show it active, with no
    seccomp (`SIGSYS`) kills, and `journalctl -u aleph-tpmd` must be
    quiet. (A full seal and unseal through the service waits for Plan 3's
-   `aleph status`.)
+   `alephctl status`.)
 4. Undo: `systemctl disable --now aleph-tpmd.socket aleph-tpmd.service`
    and remove the installed files.
 
@@ -112,29 +112,33 @@ once: `install -Dm644 packaging/pam/aleph-check /etc/pam.d/aleph-check`.
 Then, with gnome-keyring stopped (`systemctl --user stop
 gnome-keyring-daemon.service gnome-keyring-daemon.socket`):
 
-1. Run `target/debug/alephd` in one terminal and `target/debug/aleph setup`
+1. Run `target/debug/alephd` in one terminal and `target/debug/alephctl setup`
    in another; choose the TPM (or a key) and confirm the recovery key.
 2. `secret-tool store --label=t service aleph-check` (type a secret), then
    `secret-tool lookup service aleph-check` prints it.
-3. `aleph lock`, then `secret-tool lookup service aleph-check`: it waits
-   (no graphical prompter yet). In the other terminal, `aleph unlock`: the
+3. `alephctl lock`, then `secret-tool lookup service aleph-check`: it waits
+   (no graphical prompter yet). In the other terminal, `alephctl unlock`: the
    lookup then prints the secret.
 4. **Chromium:** start it with `--password-store=gnome-libsecret`, save a
-   site password, quit, `aleph lock`, start Chromium again, and
-   `aleph unlock` when it waits. Saved passwords must still be there
+   site password, quit, `alephctl lock`, start Chromium again, and
+   `alephctl unlock` when it waits. Saved passwords must still be there
    (Chromium did not create a new safe-storage key).
 5. **NetworkManager:** with `nmcli` and a Wi-Fi network whose password is
    stored for the user ("Store the password only for this user"), lock,
    reconnect, and unlock when asked: the connection must come up without
    asking for the Wi-Fi password again.
 6. **Setup and login unlock** (Plan 4c), on a test account with
-   gnome-keyring running and a few items in it (Seahorse):
-   - `aleph setup`: it reports the TPM, creates the keyring, imports the
+   gnome-keyring running and a few items in it (Seahorse). Install first:
+   `cargo build --release --workspace`, then `sudo packaging/install.sh`,
+   then as the user `systemctl --user daemon-reload` and `systemctl
+   --user start alephd.socket` (the next login starts it by itself).
+   The client is `alephctl`: `aleph` on PATH is TeX's (texlive-bin).
+   - `alephctl setup`: it reports the TPM, creates the keyring, imports the
      items (`secret-tool lookup` finds them through aleph), switches over
-     (`aleph status` says alephd serves the Secret Service;
+     (`alephctl status` says alephd serves the Secret Service;
      `systemctl --user is-enabled gnome-keyring-daemon.socket` says
      masked), and offers the root step: answer yes, and `sudo` runs
-     `aleph system apply`, which asks the login password once and checks
+     `alephctl system apply`, which asks the login password once and checks
      the lock screen and the login with it.
    - Keep a root shell open until the lock screen has been tried: a TTY
      login is the way back in (`system-login`, `system-auth`, and `login`
@@ -145,38 +149,38 @@ gnome-keyring-daemon.service gnome-keyring-daemon.socket`):
      the vault locks with the screen only once Omarchy runs
      `omarchy-hook lock` (DECISIONS.md G1); until then idle and sleep lock
      it.
-   - `aleph setup` again changes nothing.
+   - `alephctl setup` again changes nothing.
    - If the root step was skipped: log out and in, and check that no
      `gnome-keyring-daemon` runs (`pgrep -a gnome-keyring`) and that
-     `aleph status` still says alephd serves the Secret Service (sddm's
+     `alephctl status` still says alephd serves the Secret Service (sddm's
      `pam_gnome_keyring auto_start` can start one).
-   - `sudo aleph system apply` runs the login password through the login
+   - `sudo alephctl system apply` runs the login password through the login
      and lock-screen stacks as root: after it, check the lock screen
      itself (it runs as you) before walking away.
-   - `aleph setup --revert`: it asks the login password, copies
+   - `alephctl setup --revert`: it asks the login password, copies
      everything back, and gnome-keyring serves the Secret Service again
-     (with the items stored in aleph meanwhile); `sudo aleph system
+     (with the items stored in aleph meanwhile); `sudo alephctl system
      revert` restores the PAM files byte for byte.
-7. `aleph status` shows the keyslots; `journalctl --user` (or the
+7. `alephctl status` shows the keyslots; `journalctl --user` (or the
    terminal) shows no secrets.
 8. **Backup and restore** (Plan 4b):
-   - `aleph backup ~/aleph.bak` (re-authenticate): the file is mode
+   - `alephctl backup ~/aleph.bak` (re-authenticate): the file is mode
      `0600`, and running it again refuses to overwrite it.
    - On a second test account (or after moving `~/.local/share/aleph/`
-     and `~/.local/state/aleph/` aside), `aleph restore ~/aleph.bak`: type
+     and `~/.local/state/aleph/` aside), `alephctl restore ~/aleph.bak`: type
      the recovery key, choose an unlock method, and decline or accept a
      new recovery key. `secret-tool lookup service aleph-check` prints the
-     secret; `aleph status` shows one unlock method and the recovery slot.
+     secret; `alephctl status` shows one unlock method and the recovery slot.
    - Back on the first account, copy an older `vault.aleph` over the
      current one (daemon stopped): the next unlock reports a rollback and
-     `aleph status` says writes are refused. `aleph restore
+     `alephctl status` says writes are refused. `alephctl restore
      --accept-rollback` accepts it, after re-authentication and the login
      password, keeping the
      previous `.bak` as `vault.aleph.bak-<time>`.
-   - Truncate `vault.aleph` (daemon stopped): `aleph restore --from-bak`
+   - Truncate `vault.aleph` (daemon stopped): `alephctl restore --from-bak`
      brings back the previous version, keeping the broken file as
      `vault.aleph.corrupt-<time>`.
-   - Move `vault.aleph` away (daemon stopped) and `aleph restore` another
+   - Move `vault.aleph` away (daemon stopped) and `alephctl restore` another
      account's backup: it asks for the login password before the recovery
      key. Delete the kept `vault.aleph.*-<time>` files afterwards (they
      still open with the old recovery key).
@@ -186,10 +190,10 @@ versions, in `hardware-log.md`.
 
 ## Emergency manual revert
 
-If login or the lock screen misbehaves after `sudo aleph system apply`,
+If login or the lock screen misbehaves after `sudo alephctl system apply`,
 from a TTY (Ctrl-Alt-F3) or a root shell:
 
-1. `sudo aleph system revert`; or by hand, for each of `sddm`,
+1. `sudo alephctl system revert`; or by hand, for each of `sddm`,
    `sddm-autologin`, `omarchy-lock-password`, and `passwd` in
    `/etc/pam.d/`: `mv <name>.aleph-orig <name>` where a backup exists;
    where none does, take out the `pam_aleph` lines by hand (and, in `sddm`
@@ -208,5 +212,5 @@ from a TTY (Ctrl-Alt-F3) or a root shell:
    (`~/.local/share/aleph`). To copy them back, stop gnome-keyring again
    (`systemctl --user stop gnome-keyring-daemon.service
    gnome-keyring-daemon.socket`; revert refuses while it runs), then run
-   `aleph setup --revert` (`aleph restore` if the vault itself needs
+   `alephctl setup --revert` (`alephctl restore` if the vault itself needs
    recovery).

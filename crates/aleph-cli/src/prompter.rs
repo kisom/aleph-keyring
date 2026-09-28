@@ -125,7 +125,7 @@ fn answer(
                 Purpose::Create => "",
                 Purpose::Recover => " (with the recovery key)",
             };
-            eprintln!("aleph: {operation}{why}");
+            eprintln!("alephctl: {operation}{why}");
             None
         }
         ToPrompter::Ask {
@@ -135,8 +135,10 @@ fn answer(
         } => {
             if let Some(e) = error {
                 match retry_after {
-                    Some(s) if !e.contains("retry in") => eprintln!("aleph: {e} (retry in {s} s)"),
-                    _ => eprintln!("aleph: {e}"),
+                    Some(s) if !e.contains("retry in") => {
+                        eprintln!("alephctl: {e} (retry in {s} s)")
+                    }
+                    _ => eprintln!("alephctl: {e}"),
                 }
             }
             let method = if methods.len() > 1 {
@@ -158,9 +160,9 @@ fn answer(
         }
         ToPrompter::OldPassword { error } => {
             match error {
-                Some(e) => eprintln!("aleph: {e}"),
+                Some(e) => eprintln!("alephctl: {e}"),
                 None => eprintln!(
-                    "aleph: your login password was changed without aleph; enter the previous \
+                    "alephctl: your login password was changed without aleph; enter the previous \
                      one to update the TPM keyslot (a wrong one costs a TPM attempt)"
                 ),
             }
@@ -170,7 +172,7 @@ fn answer(
         }
         ToPrompter::RecoveryKey { error } => {
             if let Some(e) = error {
-                eprintln!("aleph: {e}");
+                eprintln!("alephctl: {e}");
             }
             Some(FromPrompter::RecoveryKey {
                 key: term.secret("Recovery key (14 groups of 4): ")?,
@@ -178,7 +180,7 @@ fn answer(
         }
         ToPrompter::Fido2Pin { key, error } => {
             if let Some(e) = error {
-                eprintln!("aleph: {e}");
+                eprintln!("alephctl: {e}");
             }
             Some(FromPrompter::Pin {
                 pin: term.secret(&format!("PIN for {key}: "))?,
@@ -187,11 +189,11 @@ fn answer(
         ToPrompter::InsertKey { key } => {
             // (The terminal cannot skip one key while waiting; Ctrl-C ends the
             // whole operation. The GUI prompter offers "skip".)
-            eprintln!("aleph: insert {key} (Ctrl-C cancels the whole operation)");
+            eprintln!("alephctl: insert {key} (Ctrl-C cancels the whole operation)");
             None
         }
         ToPrompter::Touch { key } => {
-            eprintln!("aleph: touch {key}");
+            eprintln!("alephctl: touch {key}");
             None
         }
         ToPrompter::Confirm { text, default } => Some(FromPrompter::Confirm {
@@ -199,7 +201,7 @@ fn answer(
         }),
         ToPrompter::ShowRecoveryKey { key, check, error } => {
             if let Some(e) = error {
-                eprintln!("aleph: {e}");
+                eprintln!("alephctl: {e}");
             }
             eprintln!("\nYour recovery key. Write it down and keep it somewhere safe;");
             eprintln!("it is shown only this once, and it is the only way back in");

@@ -68,7 +68,7 @@ pub fn autologin_user(config: &SddmConfig) -> Option<String> {
 
 /// The hook Omarchy's lock runs once it calls `omarchy-hook lock` (G1).
 pub const OMARCHY_HOOK: &str =
-    "# Installed by aleph setup: lock the keyring with the screen.\naleph lock\n";
+    "# Installed by alephctl setup: lock the keyring with the screen.\nalephctl lock\n";
 
 fn omarchy_hook(config_home: &Path) -> PathBuf {
     config_home.join("omarchy/hooks/lock.d/aleph")
@@ -111,7 +111,7 @@ fn sudo() -> std::ffi::OsString {
 pub fn run_as_root(args: &[&str]) -> Result<()> {
     // Before sudo: running a user-writable binary as root trusts its writer.
     if let Some(w) = crate::system::writable_binary_warning() {
-        eprintln!("aleph: {w}");
+        eprintln!("alephctl: {w}");
     }
     let status = std::process::Command::new(sudo())
         .args(args)
@@ -218,6 +218,15 @@ mod tests {
 
     /// The hook goes in only for Omarchy users, once, and revert removes
     /// it only while it is still ours.
+    #[test]
+    fn the_omarchy_hook_runs_alephctl() {
+        // (`aleph` on PATH is TeX's, from texlive-bin.)
+        assert!(
+            OMARCHY_HOOK.lines().any(|l| l == "alephctl lock"),
+            "{OMARCHY_HOOK}"
+        );
+    }
+
     #[test]
     fn the_omarchy_hook_is_installed_once_and_removed_only_if_ours() {
         let dir = tempfile::tempdir().unwrap();

@@ -9,6 +9,20 @@ made directly are marked as such.
 
 ## 2026-09-27: Plan 4c (setup), design
 
+### G5. The CLI is `alephctl` (owner's decision)
+
+texlive-bin installs `/usr/bin/aleph` (the TeX engine): the first real
+`aleph setup` ran it, and it crashed. A package could not own that path
+either. The CLI binary is now `alephctl`, and so are the commands in its
+messages, the Omarchy lock hook (which would otherwise have run TeX), and
+the docs. The project, the crates, `alephd`, the vault's paths, and the
+cryptographic labels (`"aleph recovery v1"` and the like, part of the
+vault format) keep `aleph`. The first real run also showed that nothing
+installed aleph: `packaging/install.sh` lays it out as the package will,
+and the spec's install list now names `alephd`'s place
+(`/usr/lib/aleph/`), the `io.aleph.Keyring` activation file,
+`/etc/pam.d/aleph-check`, and the global enabling of `alephd.socket`.
+
 ### G4. The final review of the executed Plan 4c branch: fixes
 
 Nothing critical: the forward path (`aleph setup`, then `sudo aleph

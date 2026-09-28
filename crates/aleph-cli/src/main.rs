@@ -20,7 +20,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use client::{Args, Client, Result};
 
 #[derive(Parser)]
-#[command(name = "aleph", version, about = "The aleph keyring")]
+#[command(name = "alephctl", version, about = "The aleph keyring")]
 struct Cli {
     /// Machine-readable output.
     #[arg(long, global = true)]
@@ -191,7 +191,7 @@ fn print_json(v: &impl serde::Serialize) -> Result<()> {
 fn outcome(o: prompter::Outcome) -> Result<()> {
     match (o.ok, o.message) {
         (true, Some(m)) => {
-            eprintln!("aleph: {m}");
+            eprintln!("alephctl: {m}");
             Ok(())
         }
         (true, None) => Ok(()),
@@ -201,7 +201,12 @@ fn outcome(o: prompter::Outcome) -> Result<()> {
 
 async fn run(cli: Cli) -> Result<ExitCode> {
     if let Cmd::Completions { shell } = cli.cmd {
-        clap_complete::generate(shell, &mut Cli::command(), "aleph", &mut std::io::stdout());
+        clap_complete::generate(
+            shell,
+            &mut Cli::command(),
+            "alephctl",
+            &mut std::io::stdout(),
+        );
         return Ok(ExitCode::SUCCESS);
     }
     // The root side: no session bus, no user configuration.
@@ -216,7 +221,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let status = c.status().await?;
             let tpm = status.tpm.unwrap_or(false);
             eprintln!(
-                "aleph: TPM: {}",
+                "alephctl: TPM: {}",
                 match status.tpm {
                     Some(true) => "usable",
                     Some(false) => "not usable (a login-password keyslot is used instead)",
@@ -226,11 +231,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let autologin = wizard::autologin_user(&wizard::SddmConfig::system());
             if let Some(user) = &autologin {
                 eprintln!(
-                    "aleph: SDDM logs {user} in automatically: there is no password at login, so the keyring stays locked until first use, then asks for a security key or your login password"
+                    "alephctl: SDDM logs {user} in automatically: there is no password at login, so the keyring stays locked until first use, then asks for a security key or your login password"
                 );
             }
             if status.vault {
-                eprintln!("aleph: a keyring already exists; checking the rest of setup");
+                eprintln!("alephctl: a keyring already exists; checking the rest of setup");
             } else {
                 create_keyring(&c, tpm, autologin.is_some()).await?;
             }
@@ -240,16 +245,16 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 outcome(c.converse("Unlock", Args::None).await?)?;
             }
             let summary = c.import_gnome_keyring().await?;
-            eprintln!("aleph: {summary}");
+            eprintln!("alephctl: {summary}");
             if summary.contains("Not imported:") {
                 let mut term = prompter::Terminal::new();
                 let answer = ask(
                     &mut term,
-                    "Those collections stay in gnome-keyring, out of reach once aleph takes over (until `aleph setup --revert`). Take over anyway? [y/N] ",
+                    "Those collections stay in gnome-keyring, out of reach once aleph takes over (until `alephctl setup --revert`). Take over anyway? [y/N] ",
                 )?;
                 if !matches!(answer.trim(), "y" | "Y" | "yes") {
                     eprintln!(
-                        "aleph: stopped before taking over: unlock them in gnome-keyring (Seahorse), then run `aleph setup` again"
+                        "alephctl: stopped before taking over: unlock them in gnome-keyring (Seahorse), then run `alephctl setup` again"
                     );
                     return Ok(ExitCode::SUCCESS);
                 }
@@ -259,11 +264,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             for step in
                 switchover::switch_over(c.bus(), &switchover::Systemctl, &dirs, &mut record).await?
             {
-                eprintln!("aleph: {step}");
+                eprintln!("alephctl: {step}");
             }
             if let Some(hook) = wizard::install_omarchy_hook(&dirs.config_home)? {
                 eprintln!(
-                    "aleph: installed {}: the keyring locks with the screen once Omarchy's lock runs `omarchy-hook lock`",
+                    "alephctl: installed {}: the keyring locks with the screen once Omarchy's lock runs `omarchy-hook lock`",
                     hook.display()
                 );
             }
@@ -282,14 +287,16 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             )?;
             if matches!(answer.trim(), "" | "y" | "Y" | "yes") {
                 if let Err(e) = wizard::run_as_root(&apply) {
-                    eprintln!("aleph: {e}; run `sudo aleph system apply --user {user}` later");
-                    eprintln!("aleph: {ROOT_STEP_PENDING}");
+                    eprintln!(
+                        "alephctl: {e}; run `sudo alephctl system apply --user {user}` later"
+                    );
+                    eprintln!("alephctl: {ROOT_STEP_PENDING}");
                 }
             } else {
-                eprintln!("aleph: later: `sudo aleph system apply --user {user}`");
-                eprintln!("aleph: {ROOT_STEP_PENDING}");
+                eprintln!("alephctl: later: `sudo alephctl system apply --user {user}`");
+                eprintln!("alephctl: {ROOT_STEP_PENDING}");
             }
-            eprintln!("aleph: setup is done (`aleph status` shows the keyring)");
+            eprintln!("alephctl: setup is done (`alephctl status` shows the keyring)");
         }
 
         Cmd::Status => {
@@ -298,7 +305,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 print_json(&s)?;
             } else {
                 let state = match (s.vault, s.locked) {
-                    (false, _) => "none (run `aleph setup`)",
+                    (false, _) => "none (run `alephctl setup`)",
                     (true, true) => "locked",
                     (true, false) => "unlocked",
                 };
@@ -316,7 +323,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 }
                 if s.rotation_pending {
                     println!(
-                        "warning: after a password change the master key still needs rotating: run `aleph keyslot rotate-master`"
+                        "warning: after a password change the master key still needs rotating: run `alephctl keyslot rotate-master`"
                     );
                 }
                 print_slots(&s.keyslots);
@@ -340,7 +347,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             KeyslotCmd::Add(AddCmd::Fido2 { touch_only }) => {
                 if touch_only {
                     eprintln!(
-                        "aleph: warning: anyone holding a touch-only key can unlock the keyring"
+                        "alephctl: warning: anyone holding a touch-only key can unlock the keyring"
                     );
                 }
                 outcome(c.converse("EnrollFido2", Args::Bool(touch_only)).await?)?;
@@ -467,7 +474,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Config(ConfigCmd::Set { key, value }) => {
             if key == "lock.on_suspend" && value == "false" {
                 eprintln!(
-                    "aleph: warning: the keyring will stay unlocked through suspend and hibernation; \
+                    "alephctl: warning: the keyring will stay unlocked through suspend and hibernation; \
                      the master key can then be written to a hibernation image (keep swap encrypted)"
                 );
             }
@@ -477,7 +484,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `aleph backup`: the CLI creates the file (never following a symlink,
+/// `alephctl backup`: the CLI creates the file (never following a symlink,
 /// never replacing one without `--force`, which writes a temporary file and
 /// renames it over the target once the daemon is done) and passes it.
 async fn backup(c: &Client, path: &std::path::Path, force: bool) -> Result<()> {
@@ -500,7 +507,7 @@ async fn backup(c: &Client, path: &std::path::Path, force: bool) -> Result<()> {
         .map_err(|e| {
             if force && e.kind() == std::io::ErrorKind::AlreadyExists {
                 format!(
-                    "{}: left by an interrupted `aleph backup --force`; remove it and try again",
+                    "{}: left by an interrupted `alephctl backup --force`; remove it and try again",
                     target.display()
                 )
             } else {
@@ -516,8 +523,8 @@ async fn backup(c: &Client, path: &std::path::Path, force: bool) -> Result<()> {
     }
     outcome(result?)?;
     eprintln!(
-        "aleph: note: copies of ~/.local/share/aleph made any other way hold every keyslot \
-         (including a login-password slot on machines without a TPM); `aleph backup` holds only the recovery slot"
+        "alephctl: note: copies of ~/.local/share/aleph made any other way hold every keyslot \
+         (including a login-password slot on machines without a TPM); `alephctl backup` holds only the recovery slot"
     );
     Ok(())
 }
@@ -525,20 +532,20 @@ async fn backup(c: &Client, path: &std::path::Path, force: bool) -> Result<()> {
 /// What stays until the root step runs.
 const ROOT_STEP_PENDING: &str = "until then, logging in does not unlock the keyring, and the login's PAM service can still start gnome-keyring behind aleph";
 
-/// `aleph system ...`, as root (DECISIONS.md E4–E6).
+/// `alephctl system ...`, as root (DECISIONS.md E4–E6).
 fn run_system(action: SystemCmd) -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
-        return Err("run it as root: sudo aleph system ...".into());
+        return Err("run it as root: sudo alephctl system ...".into());
     }
     if let Some(w) = system::writable_binary_warning() {
-        eprintln!("aleph: {w}");
+        eprintln!("alephctl: {w}");
     }
     let root = system::Root::system();
     match action {
         SystemCmd::Apply { user } => {
             if std::path::Path::new("/etc/NIXOS").exists() {
                 eprintln!(
-                    "aleph: NixOS manages /etc/pam.d: add to your configuration, for each of the login and lock-screen services,
+                    "alephctl: NixOS manages /etc/pam.d: add to your configuration, for each of the login and lock-screen services,
   security.pam.services.<name>.text lines: `{}` (and for the login `{}`; for passwd `{}`)",
                     system::AUTH,
                     system::SESSION,
@@ -556,9 +563,9 @@ fn run_system(action: SystemCmd) -> Result<()> {
             );
             let report = system::apply_checked(&root, &user, &password, system::verify)?;
             for m in &report.manual {
-                eprintln!("aleph: by hand: {m}");
+                eprintln!("alephctl: by hand: {m}");
             }
-            eprintln!("aleph: login and screen unlock now reach aleph");
+            eprintln!("alephctl: login and screen unlock now reach aleph");
         }
         SystemCmd::Verify { user } => {
             let password = zeroize::Zeroizing::new(
@@ -566,18 +573,18 @@ fn run_system(action: SystemCmd) -> Result<()> {
                     .map_err(|e| e.to_string())?,
             );
             system::verify(&root, &user, &password)?;
-            eprintln!("aleph: the login and lock-screen services accept the password");
+            eprintln!("alephctl: the login and lock-screen services accept the password");
         }
         SystemCmd::Revert => {
             for line in system::revert(&root)? {
-                eprintln!("aleph: {line}");
+                eprintln!("alephctl: {line}");
             }
         }
     }
     Ok(())
 }
 
-/// `aleph setup --revert` (DECISIONS.md E3): copy the keyring back to
+/// `alephctl setup --revert` (DECISIONS.md E3): copy the keyring back to
 /// gnome-keyring and verify it, then switch back and let go of the name.
 async fn revert(c: &Client) -> Result<()> {
     let installed = std::env::var_os("PATH").is_some_and(|path| {
@@ -601,7 +608,7 @@ async fn revert(c: &Client) -> Result<()> {
         let mut delete = false;
         if !removed.is_empty() {
             eprintln!(
-                "aleph: imported from gnome-keyring and deleted in aleph since: {}",
+                "alephctl: imported from gnome-keyring and deleted in aleph since: {}",
                 removed.join(", ")
             );
             let mut term = prompter::Terminal::new();
@@ -627,13 +634,13 @@ async fn revert(c: &Client) -> Result<()> {
             }
         };
         for step in steps {
-            eprintln!("aleph: {step}");
+            eprintln!("alephctl: {step}");
         }
     }
     match wizard::remove_omarchy_hook(&dirs.config_home) {
-        Ok(Some(hook)) => eprintln!("aleph: removed {}", hook.display()),
+        Ok(Some(hook)) => eprintln!("alephctl: removed {}", hook.display()),
         Ok(None) => {}
-        Err(e) => eprintln!("aleph: {e}"),
+        Err(e) => eprintln!("alephctl: {e}"),
     }
     if let Err(e) = c.release_secret_service().await {
         let _ = c.thaw_writes().await;
@@ -642,13 +649,13 @@ async fn revert(c: &Client) -> Result<()> {
     record.revert_phase = None;
     record.save(&dirs)?;
     eprintln!(
-        "aleph: gnome-keyring serves the Secret Service again; the aleph vault is left in place"
+        "alephctl: gnome-keyring serves the Secret Service again; the aleph vault is left in place"
     );
     // The root side last (E3).
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.to_string_lossy();
     if let Err(e) = wizard::run_as_root(&[exe.as_ref(), "system", "revert"]) {
-        eprintln!("aleph: {e}; run `sudo aleph system revert` to undo the PAM changes");
+        eprintln!("alephctl: {e}; run `sudo alephctl system revert` to undo the PAM changes");
     }
     Ok(())
 }
@@ -665,7 +672,7 @@ fn offer_lockout_auth(term: &mut prompter::Terminal) -> Result<()> {
         "Protect the TPM's dictionary-attack lockout with a password of its own (recommended if nobody set one)? [y/N] ",
     )?;
     if !matches!(answer.trim(), "y" | "Y" | "yes") {
-        eprintln!("aleph: later: {command}");
+        eprintln!("alephctl: later: {command}");
         return Ok(());
     }
     let value = zeroize::Zeroizing::new(wizard::lockout_value()?);
@@ -676,12 +683,12 @@ fn offer_lockout_auth(term: &mut prompter::Terminal) -> Result<()> {
     let typed = zeroize::Zeroizing::new(term_line(term, "Type it back to confirm: ")?);
     if !wizard::lockout_matches(&value, &typed) {
         eprintln!(
-            "aleph: that does not match; the lockout password was not set (later: {command})"
+            "alephctl: that does not match; the lockout password was not set (later: {command})"
         );
         return Ok(());
     }
     if let Err(e) = wizard::set_lockout_auth(&value) {
-        eprintln!("aleph: {e}");
+        eprintln!("alephctl: {e}");
     }
     Ok(())
 }
@@ -796,7 +803,7 @@ async fn main() -> ExitCode {
     match run(cli).await {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("aleph: {e}");
+            eprintln!("alephctl: {e}");
             ExitCode::FAILURE
         }
     }

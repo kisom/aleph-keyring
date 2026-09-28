@@ -82,7 +82,7 @@ impl Paths {
         self.state_dir.join("vault-id")
     }
 
-    /// The items `aleph setup` imported from gnome-keyring (for revert).
+    /// The items `alephctl setup` imported from gnome-keyring (for revert).
     pub fn imported(&self) -> PathBuf {
         self.state_dir.join("imported.json")
     }

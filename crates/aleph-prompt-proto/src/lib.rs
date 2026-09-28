@@ -48,7 +48,7 @@ pub enum Purpose {
     Reauth,
     /// Create the vault.
     Create,
-    /// Recover the vault with the recovery key (`aleph restore`, the GUI's
+    /// Recover the vault with the recovery key (`alephctl restore`, the GUI's
     /// "Recover…"): the only conversation that asks for it.
     Recover,
 }

@@ -31,11 +31,11 @@ pub const ACTIVATION: [(&str, &str); 3] = [
     ),
     (
         "org.gnome.keyring.service",
-        "# Disabled by aleph setup (aleph serves the Secret Service).\n[D-BUS Service]\nName=org.gnome.keyring\nExec=/bin/false\n",
+        "# Disabled by alephctl setup (aleph serves the Secret Service).\n[D-BUS Service]\nName=org.gnome.keyring\nExec=/bin/false\n",
     ),
     (
         "org.freedesktop.impl.portal.Secret.service",
-        "# Disabled by aleph setup (aleph serves the Secret Service).\n[D-BUS Service]\nName=org.freedesktop.impl.portal.Secret\nExec=/bin/false\n",
+        "# Disabled by alephctl setup (aleph serves the Secret Service).\n[D-BUS Service]\nName=org.freedesktop.impl.portal.Secret\nExec=/bin/false\n",
     ),
 ];
 

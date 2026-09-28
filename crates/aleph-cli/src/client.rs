@@ -213,7 +213,7 @@ impl Client {
     pub async fn ensure_unlocked(&self) -> Result<()> {
         let status = self.status().await?;
         if !status.vault {
-            return Err("no keyring yet; run `aleph setup`".into());
+            return Err("no keyring yet; run `alephctl setup`".into());
         }
         if status.locked {
             let outcome = self.converse("Unlock", Args::None).await?;

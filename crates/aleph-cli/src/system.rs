@@ -1,4 +1,4 @@
-//! The root side of setup: `sudo aleph system apply | verify | revert`
+//! The root side of setup: `sudo alephctl system apply | verify | revert`
 //! (spec §6 "PAM integration"; DECISIONS.md E4–E6).
 //!
 //! Small on purpose: it reads no user configuration, no D-Bus, and no

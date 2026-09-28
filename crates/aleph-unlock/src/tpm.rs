@@ -73,7 +73,7 @@ impl TpmClient {
         }
     }
 
-    /// TPM state for `aleph setup`.
+    /// TPM state for `alephctl setup`.
     pub fn status(&self) -> Result<Status> {
         match self.call(&Request::Status {})? {
             Response::Status(s) => Ok(s),

@@ -589,11 +589,11 @@ impl UnlockedVault {
             .ok_or(Error::GenerationOverflow)
     }
 
-    /// A copy for `aleph backup`: the current generation with only the
+    /// A copy for `alephctl backup`: the current generation with only the
     /// recovery slot(s), so a leaked backup exposes no login-password
     /// slot to offline guessing. It carries the live file's mark (same
     /// generation and MK), so swapped in for the live file it reads as
-    /// `Current`: restore it with `aleph restore`, which rotates MK, never
+    /// `Current`: restore it with `alephctl restore`, which rotates MK, never
     /// by copying it over the vault.
     pub fn to_backup_bytes(&self) -> Result<Vec<u8>> {
         let recovery: Vec<SlotEntry> = self

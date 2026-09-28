@@ -57,7 +57,7 @@ pub struct WrappedKey {
 struct LockedPage {
     page: *mut u8,
     len: usize,
-    /// Whether `mlock` succeeded (best effort; `aleph status` reports it).
+    /// Whether `mlock` succeeded (best effort; `alephctl status` reports it).
     mlocked: bool,
 }
 

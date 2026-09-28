@@ -21,7 +21,7 @@
 //!
 //! No method waits for the user. An unlock prompt with no prompter to run
 //! (no graphical session) is not dismissed: it waits until the vault is
-//! unlocked some other way (`aleph unlock`, PAM), then completes.
+//! unlocked some other way (`alephctl unlock`, PAM), then completes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -393,7 +393,7 @@ impl SecretService {
         self.announce_all().await
     }
 
-    /// The vault was unlocked (by a prompt, `aleph unlock`, or PAM): serve
+    /// The vault was unlocked (by a prompt, `alephctl unlock`, or PAM): serve
     /// its objects and complete every waiting unlock prompt.
     pub async fn unlocked(self: &Arc<Self>) -> zbus::Result<()> {
         self.sync().await?;

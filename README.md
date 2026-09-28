@@ -13,14 +13,14 @@ gnome-keyring's secrets store; libsecret applications work unmodified.
 [`docs/superpowers/specs/2026-09-26-aleph-design.md`](docs/superpowers/specs/2026-09-26-aleph-design.md).
 
 Login and screen unlock (`pam_aleph`), `passwd` changes, and locking on
-sleep, screen lock, or idle are in place (Plan 4a). `aleph setup` creates the
+sleep, screen lock, or idle are in place (Plan 4a). `alephctl setup` creates the
 keyring,
 imports gnome-keyring's items, takes over the Secret Service from it, and
-(with `sudo aleph system apply`) sets up login and screen unlock; `aleph
+(with `sudo alephctl system apply`) sets up login and screen unlock; `aleph
 setup --revert` hands everything back (Plan 4c; see
 [docs/testing.md](docs/testing.md), including an emergency manual revert). If
 the login password is changed outside aleph, the next unlock asks for the
-previous one to update the TPM keyslot. `aleph backup` and `aleph restore`
+previous one to update the TPM keyslot. `alephctl backup` and `alephctl restore`
 (with the recovery key, from `.bak`, or accepting a rolled-back file) are
 in place (Plan 4b). Design decisions made along the way are in
 [DECISIONS.md](DECISIONS.md).
@@ -37,7 +37,7 @@ in place (Plan 4b). Design decisions made along the way are in
 | `aleph-pam-proto` | Protocol between `pam_aleph` and `alephd`'s `pam.sock` |
 | `aleph-daemon` | `alephd`: the Secret Service and the `io.aleph.Admin1` interface |
 | `pam_aleph` | PAM module that hands the login password to `alephd` |
-| `aleph-cli` | `aleph`: the command-line client |
+| `aleph-cli` | `alephctl`: the command-line client |
 
 ## Development
 

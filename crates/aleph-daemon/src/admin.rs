@@ -154,7 +154,7 @@ impl Admin {
     ) -> zbus::fdo::Result<String> {
         if self.keyring.is_locked() {
             return Err(zbus::fdo::Error::Failed(
-                "the keyring is locked: unlock it first (`aleph unlock`)".into(),
+                "the keyring is locked: unlock it first (`alephctl unlock`)".into(),
             ));
         }
         let Some(importer) = crate::import::Importer::connect(conn, IMPORT_PROMPT_TIMEOUT)
@@ -209,7 +209,7 @@ impl Admin {
             .collect())
     }
 
-    /// Copy the keyring back to gnome-keyring for `aleph setup --revert`
+    /// Copy the keyring back to gnome-keyring for `alephctl setup --revert`
     /// (DECISIONS.md E3), deleting there the items deleted in aleph since
     /// the import if `delete_removed`. Writes stay paused afterwards.
     async fn export_to_gnome_keyring(
@@ -337,13 +337,13 @@ impl Admin {
         self.converse(prompter, |k, chan| k.reissue_recovery(chan))
     }
 
-    /// Recover the current vault with the recovery key (`aleph restore`).
+    /// Recover the current vault with the recovery key (`alephctl restore`).
     async fn recover(&self, prompter: zbus::zvariant::OwnedFd) -> zbus::fdo::Result<()> {
         self.converse(prompter, |k, chan| k.recover(chan, None))
     }
 
     /// Restore the backup file `file` (opened by the caller) with its
-    /// recovery key (`aleph restore <file>`).
+    /// recovery key (`alephctl restore <file>`).
     async fn restore_backup(
         &self,
         prompter: zbus::zvariant::OwnedFd,
@@ -357,13 +357,13 @@ impl Admin {
     }
 
     /// Replace an unreadable vault file with its backup copy
-    /// (`aleph restore --from-bak`).
+    /// (`alephctl restore --from-bak`).
     async fn restore_from_bak(&self, prompter: zbus::zvariant::OwnedFd) -> zbus::fdo::Result<()> {
         self.converse(prompter, |k, chan| k.restore_from_bak(chan))
     }
 
     /// Accept a rolled-back, replaced, or different vault file
-    /// (`aleph restore --accept-rollback`).
+    /// (`alephctl restore --accept-rollback`).
     async fn accept_rollback(&self, prompter: zbus::zvariant::OwnedFd) -> zbus::fdo::Result<()> {
         self.converse(prompter, |k, chan| k.accept_rollback(chan))
     }

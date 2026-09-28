@@ -1,4 +1,4 @@
-//! Copying the keyring back to gnome-keyring, for `aleph setup --revert`
+//! Copying the keyring back to gnome-keyring, for `alephctl setup --revert`
 //! (spec §6; DECISIONS.md E3).
 //!
 //! alephd runs its own gnome-keyring on a private bus over the keyring

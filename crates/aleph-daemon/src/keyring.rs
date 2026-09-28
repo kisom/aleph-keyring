@@ -94,7 +94,7 @@ pub struct Status {
     pub tpm: Option<bool>,
     pub keyslots: Vec<SlotInfo>,
     /// A password change replaced slots without rotating MK (FIDO2 slots
-    /// need a touch): `aleph keyslot rotate-master` should follow.
+    /// need a touch): `alephctl keyslot rotate-master` should follow.
     pub rotation_pending: bool,
     /// Who owns `org.freedesktop.secrets` (`alephd`, `another program`,
     /// `nobody`); filled in by the admin interface.
@@ -375,7 +375,7 @@ impl Keyring {
         }
     }
 
-    /// Copy the keyring back to gnome-keyring (`aleph setup --revert`,
+    /// Copy the keyring back to gnome-keyring (`alephctl setup --revert`,
     /// DECISIONS.md E3): after the login password (checked with PAM; it
     /// also unlocks gnome-keyring's login keyring), writes are paused and
     /// `run` gets the password and a copy of the body. A failure resumes
@@ -486,7 +486,7 @@ impl Keyring {
             if !lock(&self.inner).state.rotation_pending() {
                 return message;
             }
-            let note = "a password change still needs the master key rotated: run `aleph keyslot rotate-master`";
+            let note = "a password change still needs the master key rotated: run `alephctl keyslot rotate-master`";
             Some(match message {
                 Some(m) => format!("{m}; {note}"),
                 None => note.into(),
@@ -1308,7 +1308,7 @@ impl Keyring {
     /// (spec §5 "Password change"). MK rotates when that needs no one
     /// (every other slot is a recovery slot). Otherwise, since FIDO2 slots
     /// need a touch, the old slots are removed keeping MK, and a rotation
-    /// is marked pending for `aleph keyslot rotate-master`. Sealing comes
+    /// is marked pending for `alephctl keyslot rotate-master`. Sealing comes
     /// first, so a TPM refusal changes nothing. The caller holds `ops`, and
     /// the vault is unlocked.
     fn replace_password_slots(&self, new: &str) -> Result<String> {
@@ -1390,7 +1390,7 @@ impl Keyring {
             Ok("the keyslots now use the new login password; the master key was rotated".into())
         } else {
             Ok(
-                "the keyslots now use the new login password; run `aleph keyslot rotate-master` \
+                "the keyslots now use the new login password; run `alephctl keyslot rotate-master` \
                 to finish (it needs your security keys)"
                     .into(),
             )
@@ -1656,7 +1656,9 @@ impl Keyring {
             let (kek, slot) = {
                 let hw = lock(&self.hw);
                 if !hw.tpm.usable() {
-                    return Err(Error::Invalid("no usable TPM (see `aleph status`)".into()));
+                    return Err(Error::Invalid(
+                        "no usable TPM (see `alephctl status`)".into(),
+                    ));
                 }
                 // Re-authentication may have used a login-password slot,
                 // whose password could be outdated: seal only the current

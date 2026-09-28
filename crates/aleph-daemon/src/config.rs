@@ -1,7 +1,7 @@
 //! `~/.config/aleph/config.toml` (spec §6 "Lock policy").
 //!
 //! Unknown keys are errors, so a typo is reported rather than silently
-//! ignored. `aleph config get|set` addresses values as `section.key`.
+//! ignored. `alephctl config get|set` addresses values as `section.key`.
 
 use std::path::Path;
 

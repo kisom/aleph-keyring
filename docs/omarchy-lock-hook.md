@@ -19,6 +19,6 @@ omarchy-hook lock &
 
 (`&`: a slow hook must never delay the lock.)
 
-`aleph setup` installs `~/.config/omarchy/hooks/lock.d/aleph`, which runs
-`aleph lock`; it does nothing until Omarchy runs the hook (DECISIONS.md
+`alephctl setup` installs `~/.config/omarchy/hooks/lock.d/aleph`, which runs
+`alephctl lock`; it does nothing until Omarchy runs the hook (DECISIONS.md
 G1).

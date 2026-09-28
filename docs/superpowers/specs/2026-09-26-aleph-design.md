@@ -6,8 +6,9 @@
 
 > *Aleph*: in Gibson's *Mona Lisa Overdrive*, a biochip holding an entire
 > world, sealed away. The crate is published as `aleph-keyring` (the `aleph`
-> name on crates.io is held by a placeholder); binaries and the project are
-> `aleph`.
+> name on crates.io is held by a placeholder); the project is `aleph`, and
+> its command-line client is `alephctl` (texlive-bin already installs
+> `/usr/bin/aleph`, the TeX engine).
 
 **Revision 2 changes**, driven by the design review (review finding
 numbers in brackets):
@@ -45,7 +46,7 @@ password) or by a FIDO2 security key. A recovery key is the escape hatch.
    `git-credential-libsecret`, NetworkManager, `secret-tool`) works
    unmodified against `alephd`. Flatpak apps are out of scope (see
    non-goals).
-2. On Omarchy with **password login**, after `aleph setup` and one
+2. On Omarchy with **password login**, after `alephctl setup` and one
    re-login, the vault unlocks at login with no extra interaction (TPM +
    login password). With **autologin** there is no password at login, so
    the vault stays locked until first use and then prompts for a FIDO2
@@ -54,7 +55,7 @@ password) or by a FIDO2 security key. A recovery key is the escape hatch.
 4. Existing gnome-keyring secrets are migrated during setup.
 5. A vault can be restored on a new machine from a backup file plus the
    recovery key alone.
-6. `aleph setup --revert` restores gnome-keyring, with every item that was
+6. `alephctl setup --revert` restores gnome-keyring, with every item that was
    created or changed under aleph exported back into it first. Revert
    refuses to run if the export fails.
 
@@ -79,8 +80,8 @@ attacker holds.
 
 | Attacker holds | Outcome |
 |---|---|
-| **A copy of the vault file only** (a backup, a sync peer, a stolen disk image after LUKS) | Nothing, as long as the recovery key has not also leaked. Hardware slots are useless without this machine's TPM or the enrolled FIDO2 key. The login-password slot, which exists only on machines without a TPM, is left out of `aleph backup` copies. Generic backups of the live file do contain it, and `aleph backup` warns about this (§7). |
-| **The vault file and this machine, powered off** (LUKS unlocked by some other means, or a pre-boot evil maid) | TPM slots: security reduces to the strength of the login password, unless the TPM's `lockoutAuth` is set. With an empty `lockoutAuth`, which is the Linux default, anyone with raw TPM access can reset dictionary-attack protection and guess at about one TPM round-trip per guess. `aleph setup` reports whether `lockoutAuth` is set and what the lockout parameters are (§5). FIDO2 slots: the attacker also needs the key and its PIN (PIN/UV is the default, §5). |
+| **A copy of the vault file only** (a backup, a sync peer, a stolen disk image after LUKS) | Nothing, as long as the recovery key has not also leaked. Hardware slots are useless without this machine's TPM or the enrolled FIDO2 key. The login-password slot, which exists only on machines without a TPM, is left out of `alephctl backup` copies. Generic backups of the live file do contain it, and `alephctl backup` warns about this (§7). |
+| **The vault file and this machine, powered off** (LUKS unlocked by some other means, or a pre-boot evil maid) | TPM slots: security reduces to the strength of the login password, unless the TPM's `lockoutAuth` is set. With an empty `lockoutAuth`, which is the Linux default, anyone with raw TPM access can reset dictionary-attack protection and guess at about one TPM round-trip per guess. `alephctl setup` reports whether `lockoutAuth` is set and what the lockout parameters are (§5). FIDO2 slots: the attacker also needs the key and its PIN (PIN/UV is the default, §5). |
 | **This machine while suspended** (LUKS key and aleph MK in RAM) | aleph locks and zeroizes MK before suspend, holding a logind delay inhibitor until that is done (§6). Secrets that clients have already fetched (browser safe-storage keys, NetworkManager, cached git credentials) are out of aleph's reach. The attacker then holds the file and the machine, and the row above applies. |
 | **A same-user process, briefly** (malware that runs once) | While the vault is unlocked it can read every secret, as with gnome-keyring. Enrolling a new slot, changing configuration, or removing a slot requires re-authentication, so the process cannot turn brief access into permanent access (§6). Removing a slot rotates MK, which revokes any keyslot the process added (§4). |
 | **A different local user** | No secrets. The TPM helper binds sealed objects to the caller's uid (§5), and the vault file is mode `0600`. By guessing wrong passwords from two or more uids they can spend the helper's share of the TPM's failure budget and keep TPM unlock unavailable to everyone for as long as they keep guessing; FIDO2, recovery, and password fallback still work. They cannot drive the TPM into lockout, which would also block TPM disk unlock and survive reboot (§5, rate limiting). |
@@ -139,7 +140,7 @@ the TPM. The design keeps key custody separable for v2 (§10).
 | `aleph-pam-proto` | lib | The `pam.sock` protocol between `pam_aleph` and `alephd`: length-prefixed binary frames, strict decoding, a reply check that does not allocate. | `zeroize` |
 | `aleph-daemon` (bin `alephd`) | bin | Secret Service and admin D-Bus interfaces, PAM socket, lock policy, prompter orchestration. | `aleph-core`, `aleph-unlock`, `aleph-prompt-proto`, `aleph-pam-proto`, `zbus`, `tokio`, `tracing`, `tracing-journald`, libpam |
 | `pam_aleph` | cdylib | PAM module: forwards passwords to `alephd` after dropping to the user's uid. Minimal, no async runtime. | `aleph-pam-proto`, PAM FFI, `libc` |
-| `aleph-cli` (bin `aleph`) | bin | CLI. | `aleph-prompt-proto`, `zbus`, `clap` |
+| `aleph-cli` (bin `alephctl`) | bin | CLI. | `aleph-prompt-proto`, `zbus`, `clap` |
 | `aleph-gui` | bin | egui manager and prompter. | `eframe`, `egui`, `zbus`, `notify`, Wayland clipboard crate |
 
 **Seam for privilege separation:** only `KeyHandle` touches MK. Callers
@@ -175,7 +176,7 @@ holds every decrypted secret. Separation protects MK, not the secrets.
   silently replacing the link with a regular file.
 - If `vault.aleph` fails to parse or authenticate and `vault.aleph.bak`
   opens, `alephd` does not switch over automatically. It reports the
-  problem and offers `aleph restore --from-bak`.
+  problem and offers `alephctl restore --from-bak`.
 - A file that a restore or `--from-bak` replaces is kept as
   `vault.aleph.replaced-<time>` (or `.corrupt-<time>` if it could not be
   read), never deleted. It is linked under that name before the write,
@@ -183,7 +184,7 @@ holds every decrypted secret. Separation protects MK, not the secrets.
   kept the same way (`vault.aleph.bak-<time>`) before every custody
   write, since the write replaces it and it may be the only good copy.
   Kept files still open with the old recovery key and the old unlock
-  methods; `aleph` names them and says to delete them once the keyring
+  methods; `alephctl` names them and says to delete them once the keyring
   has been checked.
 
 ### Layout
@@ -220,8 +221,8 @@ backups and sync do not carry it. The value is only raised, never lowered.
 
 On unlock:
 - **Lower `generation`:** the file has been rolled back. The daemon
-  reports this in the prompter and in `aleph status`, and refuses to write
-  until the user confirms, either with `aleph restore --accept-rollback`
+  reports this in the prompter and in `alephctl status`, and refuses to write
+  until the user confirms, either with `alephctl restore --accept-rollback`
   or by accepting it in the GUI.
 - **Same `generation` but a different `mk_id`:** the file has been
   replaced. Same handling.
@@ -234,7 +235,7 @@ On unlock:
 the first unlock if missing). A vault with a different ID at the path is
 not trusted, with the same handling, even with no mark for its ID. (A
 crash between a restore's write and recording its ID makes the next
-unlock report a different vault; `aleph restore --accept-rollback`
+unlock report a different vault; `alephctl restore --accept-rollback`
 settles it.)
 
 A restore or an acceptance writes the vault at generation
@@ -317,9 +318,9 @@ every slot is re-wrapped:
 - **when a keyslot is removed.** Otherwise anyone holding an old copy of
   the file and the removed credential could recover the MK that decrypts
   every later copy.
-- **on `aleph restore`**
+- **on `alephctl restore`**
 - **when the login password changes** (together with a fresh TPM seal, §5)
-- **on `aleph keyslot rotate-master`**
+- **on `alephctl keyslot rotate-master`**
 
 Re-wrapping needs a KEK for every slot. The daemon never keeps
 passwords, so the KEKs come from these sources (each is checked to
@@ -386,7 +387,7 @@ classic case) create a new key that orphans their existing data.
 - No method call ever blocks waiting for the user. `Unlock()` returns a
   prompt with no reply timeout. If no prompter can start (no graphical
   session), the prompt is not dismissed: it waits until the vault is
-  unlocked some other way (`aleph unlock`, PAM), then completes. At
+  unlocked some other way (`alephctl unlock`, PAM), then completes. At
   most 8 prompts per client, and 128 in all, may wait; a prompt starts
   once; while one unlock conversation runs, other unlock prompts wait for
   it instead of opening more prompter windows (if it is cancelled, they
@@ -411,7 +412,7 @@ classic case) create a new key that orphans their existing data.
 What is guaranteed:
 
 - MK lives in its own page. The page is `mlock`ed when permitted (best
-  effort; `aleph status` reports whether it succeeded), marked
+  effort; `alephctl status` reports whether it succeeded), marked
   `MADV_DONTDUMP` and `MADV_WIPEONFORK`, and zeroized on drop.
 - `alephd` calls `prctl(PR_SET_DUMPABLE, 0)` at startup.
 - The body is encoded into an exactly sized buffer that is zeroized after
@@ -437,7 +438,7 @@ that is wiped as it is consumed, but when a password or PIN contains a
 JSON escape, serde_json decodes it through a scratch buffer that is freed
 without being zeroized. `mlock` does not keep pages out of a hibernation image
 (§6 locks before hibernate). Swap should be encrypted or zram-only, and
-`aleph setup` warns if it is neither.
+`alephctl setup` warns if it is neither.
 
 ## 5. Unlock methods
 
@@ -487,7 +488,7 @@ without being zeroized. `mlock` does not keep pages out of a hibernation image
     keeps the post-quantum margin of §2.
   - If `ownerAuth` is set, which makes that impossible, it falls back to
     the persistent TCG standard SRK at `0x81000001`. That key uses
-    AES-128-CFB, and `aleph status` reports it.
+    AES-128-CFB, and `alephctl status` reports it.
   - If neither is possible, `Status` says so and TPM enrollment is refused.
   - A primary created from a fixed template on a given TPM always has the
     same Name. Whichever parent is used, its Name is recorded in the slot
@@ -544,7 +545,7 @@ without being zeroized. `mlock` does not keep pages out of a hibernation image
     `NoParent`, `Malformed`, `Tpm`) marks the slot stale; the prompter
     reports them.
 - **`Status` and setup:**
-  - `aleph setup` displays `lockout_auth_set`, `max_tries`, and the
+  - `alephctl setup` displays `lockout_auth_set`, `max_tries`, and the
     recovery times.
   - If `lockoutAuth` is empty, setup explains the consequence (§2) and
     offers to set it to a random value that is printed for the user to
@@ -560,8 +561,8 @@ without being zeroized. `mlock` does not keep pages out of a hibernation image
     password and old blobs open nothing written from then on.
   - FIDO2 slots need a touch, which `passwd` cannot give. In that case
     the old slots are removed keeping MK, and a **pending rotation** is
-    recorded. `aleph status` and every unlock say so until a rotation is
-    run (`aleph keyslot rotate-master`, which needs the keys). Until then,
+    recorded. `alephctl status` and every unlock say so until a rotation is
+    run (`alephctl keyslot rotate-master`, which needs the keys). Until then,
     an old copy of the file, plus the old password, plus this machine's
     TPM, still yields an MK that opens newer files.
   - A locked vault is never unlocked for this: a copy is opened with the
@@ -646,14 +647,14 @@ without being zeroized. `mlock` does not keep pages out of a hibernation image
   shows the key once, then asks the user to type back two randomly chosen
   groups to confirm it was recorded.
 - **Recovery is its own flow,** not a button on every prompt:
-  - `aleph restore` for a new machine or a broken vault
+  - `alephctl restore` for a new machine or a broken vault
   - "Recover…" in the GUI
 
   Keeping the root credential off routine prompts makes fake prompts less
   useful for phishing.
 - **After recovery:**
   - MK rotates
-  - `aleph` offers to issue a new recovery key, in case the old one was
+  - `alephctl` offers to issue a new recovery key, in case the old one was
     exposed while it was typed
 
 A backup is the vault file plus the recovery key. Losing both loses the
@@ -665,7 +666,7 @@ data.
 |---|---|
 | Password login or lock-screen unlock (password from PAM) | `tpm`, then `login-password` (no-TPM machines). Stale slots are skipped. |
 | First use: locked vault, autologin, FIDO2 users | The prompter offers every enrolled method: a FIDO2 touch, or the login password (which unlocks `tpm` or `login-password`). |
-| Recovery | Only via `aleph restore` or "Recover…" |
+| Recovery | Only via `alephctl restore` or "Recover…" |
 
 ## 6. Daemon (`alephd`)
 
@@ -684,9 +685,9 @@ data.
   activation file exists (setup asks the running alephd to claim it once
   it has written that file): before setup, and after a revert, the Secret
   Service stays gnome-keyring's even if `pam.sock` starts alephd.
-  `aleph status` says who serves it. After setup switched over, a queued
+  `alephctl status` says who serves it. After setup switched over, a queued
   alephd logs a warning.
-- `aleph setup` (Arch/Omarchy), each step checking the real state, so a
+- `alephctl setup` (Arch/Omarchy), each step checking the real state, so a
   re-run does only what is still undone (E10):
   1. reports the TPM (§5) and detects SDDM autologin (E5: advisory; it
      picks the default unlock method and the summary)
@@ -702,7 +703,7 @@ data.
      gnome-keyring's pkcs11 component goes away with it.
   5. installs Omarchy's lock hook (G1), and offers to set the TPM's
      lockoutAuth (D9)
-  6. last and optional, the root side through sudo: `sudo aleph system
+  6. last and optional, the root side through sudo: `sudo alephctl system
      apply --user <you>` (below); declined or failed, setup says how to
      run it later, and that until then logging in does not unlock the
      keyring and the login's PAM service can still start gnome-keyring
@@ -710,7 +711,7 @@ data.
   A gnome-keyring collection that stayed locked (its unlock dismissed)
   stops setup before step 4, unless the user says to go on: its items
   would be out of reach once aleph takes over.
-- `aleph setup --revert` (E3), refused if gnome-keyring is not installed:
+- `alephctl setup --revert` (E3), refused if gnome-keyring is not installed:
   1. lists items imported from gnome-keyring and deleted in aleph since,
      offering to delete them there too
   2. with the login password, alephd pauses writes and runs its own
@@ -722,7 +723,7 @@ data.
      bus reloaded; gnome-keyring's units unmasked and restored as
      recorded; the Omarchy hook removed; alephd lets go of the name, which
      the bus hands to gnome-keyring
-  4. last, `sudo aleph system revert`
+  4. last, `sudo alephctl system revert`
 
   If the export fails, nothing changes and writes resume. A revert that
   stops after step 3's switch back resumes at the release on a re-run.
@@ -745,7 +746,7 @@ Verified against a stock Omarchy install on 2026-09-26.
   -password  optional  pam_aleph.so
   ```
 
-- **Which services get them**, edited by `sudo aleph system apply` (E4),
+- **Which services get them**, edited by `sudo alephctl system apply` (E4),
   each keeping an `.aleph-orig` backup:
 
   | Service | Change |
@@ -874,7 +875,7 @@ idle_timeout = 0         # seconds without secret access; 0 = disabled
   logind does not say whether a suspend or a hibernation is coming, and
   suspend-then-hibernate moves on to hibernating without another signal.
   So `on_suspend` covers both. With it off, the master key can reach a
-  hibernation image, and `aleph config set lock.on_suspend false` warns
+  hibernation image, and `alephctl config set lock.on_suspend false` warns
   about this (swap must be encrypted, §4).
 - **Screen lock:** logind's `Session.Lock` for a session of this user
   (`loginctl lock-session`, which hypridle sends), sent by logind itself
@@ -882,10 +883,10 @@ idle_timeout = 0         # seconds without secret access; 0 = disabled
   directed signal). Omarchy's own lock (`omarchy-system-lock`, a Quickshell
   session lock, used by its idle service and key binding) does not tell
   logind. Setup installs an Omarchy hook,
-  `~/.config/omarchy/hooks/lock.d/aleph` (running `aleph lock`), which
+  `~/.config/omarchy/hooks/lock.d/aleph` (running `alephctl lock`), which
   takes effect once Omarchy's lock runs `omarchy-hook lock` (proposed
   upstream; DECISIONS.md G1). Until then the vault locks on idle
-  (`lock.idle_timeout`) and sleep, and `aleph lock` can be bound next to
+  (`lock.idle_timeout`) and sleep, and `alephctl lock` can be bound next to
   the lock.
 - **Idle:** no secret read or written for `idle_timeout` seconds.
 - Without a system bus or logind, `alephd` runs without the sleep and
@@ -905,7 +906,7 @@ idle_timeout = 0         # seconds without secret access; 0 = disabled
   not spawn gets nothing, because secrets only ever travel over a
   socketpair, never in D-Bus message bodies.
 - With no Wayland display, Secret Service prompts wait (§4), and
-  `aleph unlock` unlocks in the terminal, in the style of
+  `alephctl unlock` unlocks in the terminal, in the style of
   `systemd-ask-password`. With `ALEPH_NO_TTY=1` its answers are lines of
   standard input (scripts, tests).
 - The prompter settings are `prompt.program` and `prompt.timeout`
@@ -919,34 +920,34 @@ implementations and a lint test.
 
 ## 7. Clients
 
-### CLI (`aleph`, clap)
+### CLI (`alephctl`, clap)
 
 ```
-aleph setup [--revert]
-aleph status | lock | unlock
-aleph keyslot list
-aleph keyslot add tpm                      # TPM + login password
-aleph keyslot add fido2 [--touch-only]
-aleph keyslot remove <slot-id>             # rotates MK
-aleph keyslot rotate-master
-aleph keyslot retry <slot-id>              # try a stale slot again
-aleph recovery reissue                     # new recovery key; old one stops working
-aleph get attr=val…                        # secret-tool compatible semantics
-aleph search attr=val…
-aleph store --label L attr=val…            # secret read from stdin, never argv
-aleph delete attr=val…
-aleph ls [collection]
-aleph import gnome-keyring
-sudo aleph system apply --user <you> | verify --user <you> | revert
-aleph config get|set <key> [value]
-aleph backup [--force] <path>
-aleph restore [--from-bak | --accept-rollback] [<path>]
+alephctl setup [--revert]
+alephctl status | lock | unlock
+alephctl keyslot list
+alephctl keyslot add tpm                      # TPM + login password
+alephctl keyslot add fido2 [--touch-only]
+alephctl keyslot remove <slot-id>             # rotates MK
+alephctl keyslot rotate-master
+alephctl keyslot retry <slot-id>              # try a stale slot again
+alephctl recovery reissue                     # new recovery key; old one stops working
+alephctl get attr=val…                        # secret-tool compatible semantics
+alephctl search attr=val…
+alephctl store --label L attr=val…            # secret read from stdin, never argv
+alephctl delete attr=val…
+alephctl ls [collection]
+alephctl import gnome-keyring
+sudo alephctl system apply --user <you> | verify --user <you> | revert
+alephctl config get|set <key> [value]
+alephctl backup [--force] <path>
+alephctl restore [--from-bak | --accept-rollback] [<path>]
 ```
 
 - Global flags: `--json`. Shell completions are generated for bash, zsh,
-  and fish (`aleph completions <shell>`). Keyslot ids may be given as a
-  unique prefix, as `aleph status` shows them.
-- **`aleph setup`** is an interactive wizard:
+  and fish (`alephctl completions <shell>`). Keyslot ids may be given as a
+  unique prefix, as `alephctl status` shows them.
+- **`alephctl setup`** is an interactive wizard:
   1. TPM status (§5)
   2. unlock method: TPM + login password (the default when a TPM is
      usable) or FIDO2
@@ -964,7 +965,7 @@ aleph restore [--from-bak | --accept-rollback] [<path>]
   gnome-keyring's own prompt, and are skipped (with a message) if it is
   dismissed. It is idempotent and never overwrites (E2); what it added is
   recorded in `$XDG_STATE_HOME/aleph/imported.json` for revert.
-- **`sudo aleph system apply --user <you>`** edits the PAM services above
+- **`sudo alephctl system apply --user <you>`** edits the PAM services above
   as pure text transformations, atomically, refusing symlinks, files that
   are not regular, and files not owned by root (manual mode: it prints
   what to add; E6), then authenticates `<you>` through the edited
@@ -982,18 +983,18 @@ aleph restore [--from-bak | --accept-rollback] [<path>]
   no user configuration or D-Bus, and warns if its own binary is not
   root-owned and root-only-writable. On NixOS it prints the configuration
   to add instead.
-- **`aleph backup <path>`** writes a re-headered copy containing **only
+- **`alephctl backup <path>`** writes a re-headered copy containing **only
   the recovery slot**, with its MK wrap. It also warns that generic backups
   of `~/.local/share/aleph/` contain every slot, including
   `login-password` on machines without a TPM.
-- **`aleph backup <path>`** needs re-authentication. The CLI creates the
+- **`alephctl backup <path>`** needs re-authentication. The CLI creates the
   file (new, mode `0600`, never following a symlink; with `--force`, a
   temporary file renamed over `<path>` once the backup is written) and
   hands the descriptor to `alephd`, which writes to it only if it is an
   empty regular file outside aleph's data and state directories; the
   daemon never opens a path it was given, and reads a restore file only
   if it is a regular file.
-- **`aleph restore`** goes through `alephd`. The daemon opens the backup
+- **`alephctl restore`** goes through `alephd`. The daemon opens the backup
   (a descriptor, as above), or with no path the current vault (or `.bak`
   if the vault cannot be read), with the recovery key. It keeps only the
   recovery slot, enrolls one fresh unlock method for this machine,
@@ -1026,11 +1027,11 @@ aleph restore [--from-bak | --accept-rollback] [<path>]
 - If a restore succeeds but the new recovery key cannot be installed
   (cancelled, or failed), the restore is still reported, with a note
   that the old key still works.
-- **`aleph restore --from-bak`** replaces the vault with `.bak`, opened
+- **`alephctl restore --from-bak`** replaces the vault with `.bak`, opened
   with the normal methods, after a question naming its generation and
   the one this machine last recorded; a `.bak` that is not the recorded
   vault under its recorded master key, at most one write behind, also
-  needs the login password. **`aleph restore --accept-rollback`**
+  needs the login password. **`alephctl restore --accept-rollback`**
   accepts the unlocked, untrusted vault as current, after
   re-authentication, the login password (an untrusted vault is never the
   expected one, and an older copy may hold a since-removed key), and an
@@ -1093,9 +1094,12 @@ aleph restore [--from-bak | --accept-rollback] [<path>]
   - `provides=(org.freedesktop.secrets)`. It does not conflict with
     `gnome-keyring`; setup switches between them.
   - Installs:
-    - binaries to `/usr/bin`, plus `aleph-tpmd` to `/usr/lib/aleph/`
-    - `/usr/lib/security/pam_aleph.so`
-    
+    - `alephctl` to `/usr/bin`; `alephd` and `aleph-tpmd` to
+      `/usr/lib/aleph/`
+    - `/usr/lib/security/pam_aleph.so`, and `/etc/pam.d/aleph-check`
+    - `/usr/share/dbus-1/services/io.aleph.Keyring.service` (only that
+      name: the Secret Service name's activation file is the user's,
+      written by setup)
     - `/usr/lib/systemd/user/alephd.{service,socket}`
     - `/usr/lib/systemd/system/aleph-tpmd.{service,socket}`
     - the `.desktop` file and the icons:
@@ -1108,7 +1112,9 @@ aleph restore [--from-bak | --accept-rollback] [<path>]
       | `assets/icons/aleph-symbolic.svg` | `hicolor/symbolic/apps/aleph-symbolic.svg` |
 
     - `/usr/share/aleph/hypr/aleph.conf`
-  - A post-install hook enables `aleph-tpmd.socket`.
+  - A post-install hook enables `aleph-tpmd.socket`, and `alephd.socket`
+    for every user (`systemctl --global enable`). `packaging/install.sh`
+    does the same from a release build, until there is a package.
 - **NixOS:** the flake exposes a package (built with `crane`) and a NixOS
   module `services.aleph`. The module:
   - installs the package, the user units, and `aleph-tpmd` as a system
@@ -1118,7 +1124,7 @@ aleph restore [--from-bak | --accept-rollback] [<path>]
     display manager, the lock screen, and `passwd`
   - asserts `services.gnome.gnome-keyring.enable = false`
 
-  On NixOS, `aleph setup` detects the read-only `/etc/pam.d`, skips the
+  On NixOS, `alephctl setup` detects the read-only `/etc/pam.d`, skips the
   system changes, and prints the module configuration instead. Keyslots,
   the recovery key, and import work as on Arch.
 - **CI (GitHub Actions):**

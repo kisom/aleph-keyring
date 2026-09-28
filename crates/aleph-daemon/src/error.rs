@@ -19,7 +19,7 @@ pub enum Error {
     #[error("another alephd already owns this vault")]
     AlreadyRunning,
 
-    #[error("no vault yet; run `aleph setup`")]
+    #[error("no vault yet; run `alephctl setup`")]
     NoVault,
 
     #[error("a vault already exists")]
@@ -74,7 +74,7 @@ pub enum Error {
     Sleeping,
 
     #[error(
-        "writes are paused while the keyring is copied back to gnome-keyring (aleph setup --revert)"
+        "writes are paused while the keyring is copied back to gnome-keyring (alephctl setup --revert)"
     )]
     Frozen,
 
@@ -83,7 +83,9 @@ pub enum Error {
     )]
     RecoveryNotInstalled(Box<Error>),
 
-    #[error("no prompter is available (no graphical session?); run `aleph unlock` in a terminal")]
+    #[error(
+        "no prompter is available (no graphical session?); run `alephctl unlock` in a terminal"
+    )]
     NoPrompter,
 
     #[error(
@@ -133,13 +135,13 @@ mod tests {
     }
 
     /// Final-review minor 11: advice names only what exists now (`aleph
-    /// restore` does not yet, and `aleph setup` only creates the vault).
+    /// restore` does not yet, and `alephctl setup` only creates the vault).
     #[test]
     fn advice_names_only_what_exists() {
         let rollback = Error::Untrusted("rolled back to an older version").to_string();
-        assert!(!rollback.contains("aleph restore"), "{rollback}");
+        assert!(!rollback.contains("alephctl restore"), "{rollback}");
         let pam = Error::PasswordCheckUnavailable.to_string();
-        assert!(!pam.contains("aleph setup"), "{pam}");
+        assert!(!pam.contains("alephctl setup"), "{pam}");
         assert!(pam.contains("packaging/pam/aleph-check"), "{pam}");
     }
 }

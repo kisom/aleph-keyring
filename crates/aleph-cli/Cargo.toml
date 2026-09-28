@@ -7,7 +7,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "aleph"
+name = "alephctl"
 path = "src/main.rs"
 
 [dependencies]

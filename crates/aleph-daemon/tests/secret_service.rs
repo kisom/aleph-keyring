@@ -177,7 +177,7 @@ async fn without_a_prompter_a_locked_lookup_waits_for_an_unlock_elsewhere() {
     };
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert!(!lookup.is_finished(), "the lookup should be waiting");
-    // "aleph unlock" in a terminal: unlock through another channel.
+    // "alephctl unlock" in a terminal: unlock through another channel.
     let keyring = s.svc.keyring.clone();
     tokio::task::spawn_blocking(move || {
         keyring.unlock(&mut Interactive::new(vec![password(PW)]).channel(), None)
@@ -666,7 +666,7 @@ async fn joined_unlock_prompts_end_when_the_conversation_is_dismissed() {
 }
 
 /// Final-review minor 11: while an admin conversation runs (here an
-/// `aleph unlock` whose user has not answered), a Secret Service unlock
+/// `alephctl unlock` whose user has not answered), a Secret Service unlock
 /// does not open a prompter window onto the queue; it starts one once the
 /// admin conversation is over.
 #[tokio::test(flavor = "multi_thread")]

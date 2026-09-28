@@ -123,7 +123,7 @@ fn the_client_retries_while_the_helper_is_busy() {
 }
 
 /// `status_now` asks once: while the helper is busy it says so at once
-/// instead of waiting the helper out (for `aleph status`).
+/// instead of waiting the helper out (for `alephctl status`).
 #[test]
 fn status_now_does_not_wait_out_a_busy_helper() {
     use std::io::Write;

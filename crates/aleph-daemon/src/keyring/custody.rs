@@ -1,5 +1,5 @@
 //! Custody (spec §4 "File", "Generation and high-water mark"; §5 "Recovery
-//! key"; §7 `aleph backup`, `aleph restore`): recovering with the recovery
+//! key"; §7 `alephctl backup`, `alephctl restore`): recovering with the recovery
 //! key, restoring a backup, falling back to the backup copy, accepting a
 //! rolled-back or replaced file, and writing backups.
 //!
@@ -21,7 +21,7 @@ const RECOVERY_ATTEMPTS: usize = 3;
 impl Keyring {
     /// Recover with the recovery key: the current vault (or, if it cannot be
     /// read, its backup copy) when `backup` is `None`, else a backup file's
-    /// bytes (`aleph restore [<file>]`). Every slot but the recovery slot is
+    /// bytes (`alephctl restore [<file>]`). Every slot but the recovery slot is
     /// replaced by one fresh unlock method, and MK rotates; then a new
     /// recovery key is offered.
     pub fn recover(&self, chan: &mut Channel, backup: Option<&[u8]>) -> Result<()> {
@@ -43,7 +43,7 @@ impl Keyring {
                     if !self.is_locked() && lock(&self.inner).untrusted.is_none() {
                         return Err(Error::Invalid(
                             "the keyring is unlocked and in order: nothing to recover \
-                             (`aleph keyslot` changes unlock methods)"
+                             (`alephctl keyslot` changes unlock methods)"
                                 .into(),
                         ));
                     }
@@ -131,7 +131,7 @@ impl Keyring {
                     tracing::info!("new recovery key not installed: {e}");
                     (
                         false,
-                        " The new recovery key was not installed; the old one still works (`aleph recovery reissue` issues a new one).",
+                        " The new recovery key was not installed; the old one still works (`alephctl recovery reissue` issues a new one).",
                     )
                 }
             };
@@ -142,7 +142,7 @@ impl Keyring {
     }
 
     /// Replace a vault file that does not open (or should not) with its
-    /// backup copy (`aleph restore --from-bak`), opened with the normal
+    /// backup copy (`alephctl restore --from-bak`), opened with the normal
     /// unlock methods.
     pub fn restore_from_bak(&self, chan: &mut Channel) -> Result<()> {
         let _op = self.begin(chan)?;
@@ -222,7 +222,7 @@ impl Keyring {
     }
 
     /// Accept the unlocked vault file as current although it was rolled
-    /// back, replaced, or re-keyed elsewhere (`aleph restore
+    /// back, replaced, or re-keyed elsewhere (`alephctl restore
     /// --accept-rollback`): after re-authentication and an explicit yes, it
     /// is written past the recorded generation, and writes are allowed
     /// again.
@@ -281,7 +281,7 @@ impl Keyring {
         })
     }
 
-    /// Write a backup (`aleph backup`) through `write`, after
+    /// Write a backup (`alephctl backup`) through `write`, after
     /// re-authentication: a copy with only the recovery slot, checked to
     /// parse before it is written.
     pub fn backup(
@@ -388,7 +388,7 @@ impl Keyring {
         };
         let bak = match lock(&self.inner).store.read_bak() {
             Ok(b) if b.vault_id() == id && b.mark().generation > backup => format!(
-                " vault.aleph.bak is generation {} and may be the better choice (`aleph restore --from-bak`).",
+                " vault.aleph.bak is generation {} and may be the better choice (`alephctl restore --from-bak`).",
                 b.mark().generation
             ),
             _ => String::new(),

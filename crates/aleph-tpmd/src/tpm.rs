@@ -219,7 +219,7 @@ impl Tpm {
         Ok(kek)
     }
 
-    /// TPM state for `aleph setup` (spec §5).
+    /// TPM state for `alephctl setup` (spec §5).
     pub fn status(&mut self) -> Result<Status> {
         let prop = |ctx: &mut Context, tag| property(ctx, tag);
         let permanent = prop(&mut self.ctx, PropertyTag::Permanent)?;
