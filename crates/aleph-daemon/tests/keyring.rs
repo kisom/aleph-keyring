@@ -574,6 +574,52 @@ fn stopping_closes_an_open_unlock_window() {
     );
 }
 
+/// An unlock through the prompt is logged (the keyslot that opened the
+/// vault, and who asked), like one from the login stack; the password
+/// never is.
+#[test]
+fn an_unlock_through_the_prompt_is_logged() {
+    use std::sync::{Arc, Mutex};
+    #[derive(Clone, Default)]
+    struct Log(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Log {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let log = Log::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer({
+            let log = log.clone();
+            move || log.clone()
+        })
+        .with_ansi(false)
+        .finish();
+    let env = env();
+    let k = keyring(&env, MockKeys::default());
+    create_with_password(&k);
+    k.lock();
+    let p = Interactive::new(vec![password(PW)]);
+    let caller = aleph_daemon::prompt::Caller {
+        name: Some("secret-tool".into()),
+        pid: Some(4242),
+    };
+    let r = tracing::subscriber::with_default(subscriber, || {
+        k.unlock_prompting(|| Ok(p.channel()), Some(caller))
+    });
+    assert!(matches!(r, Ok(true)), "{r:?}");
+    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        text.contains("unlocked with the tpm keyslot, for secret-tool (pid 4242)"),
+        "{text}"
+    );
+    assert!(!text.contains(PW), "{text}");
+}
+
 /// An admin conversation (`alephctl unlock`, answered in the terminal) that
 /// times out still says why: the terminal prints the reason. (Only the
 /// Secret Service's own prompter window is closed without a message.)

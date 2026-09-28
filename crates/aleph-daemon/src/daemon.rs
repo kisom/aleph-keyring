@@ -80,6 +80,22 @@ pub async fn serve(
     Ok(secrets)
 }
 
+/// Serve everything, then own `io.aleph.Keyring`: in that order, so the
+/// call that D-Bus activation started alephd for (an `alephctl` command)
+/// never arrives before the interface it is for. (The Secret Service name
+/// is requested separately, queued: [`request_secrets_name`].)
+pub async fn start(
+    conn: &Connection,
+    keyring: Arc<Keyring>,
+    launcher: Arc<dyn Launcher>,
+    config: Arc<Mutex<Config>>,
+    paths: Paths,
+) -> zbus::Result<Arc<SecretService>> {
+    let secrets = serve(conn, keyring, launcher, config, paths).await?;
+    conn.request_name(crate::admin::BUS_NAME).await?;
+    Ok(secrets)
+}
+
 #[cfg(test)]
 mod claim_tests {
     /// alephd claims the Secret Service at start only while setup's

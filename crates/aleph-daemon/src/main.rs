@@ -44,12 +44,12 @@ async fn run() -> Result<(), String> {
     };
     let keyring = Arc::new(Keyring::new(&paths, backends).map_err(|e| e.to_string())?);
     let config = Arc::new(std::sync::Mutex::new(config));
+    // (The name is owned once everything is served: `daemon::start`.)
     let conn = zbus::connection::Builder::session()
-        .and_then(|b| b.name(BUS_NAME))
         .map_err(|e| e.to_string())?
         .build()
         .await
-        .map_err(|e| format!("cannot own {BUS_NAME} on the session bus: {e}"))?;
+        .map_err(|e| format!("cannot connect to the session bus: {e}"))?;
     let launcher = Arc::new(ProgramLauncher {
         config: config.clone(),
         session: Arc::new(UserManager {
@@ -63,9 +63,9 @@ async fn run() -> Result<(), String> {
         .parent()
         .map(|data| data.join("dbus-1/services/org.freedesktop.secrets.service"));
     let secrets =
-        aleph_daemon::daemon::serve(&conn, keyring.clone(), launcher, config.clone(), paths)
+        aleph_daemon::daemon::start(&conn, keyring.clone(), launcher, config.clone(), paths)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("cannot own {BUS_NAME} on the session bus: {e}"))?;
     // Queued behind gnome-keyring until it lets go (DECISIONS.md E1), and
     // only while setup's activation file is in place: before setup (which
     // claims it through the admin interface) and after a revert, the

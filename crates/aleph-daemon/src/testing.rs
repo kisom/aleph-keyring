@@ -385,7 +385,7 @@ pub async fn daemon_with(
     let bus = bus();
     let conn = connect_as_daemon(&bus).await;
     let launcher = Arc::new(InteractiveLauncher::new(prompts));
-    let secrets = crate::daemon::serve(
+    let secrets = crate::daemon::start(
         &conn,
         keyring.clone(),
         launcher,
@@ -404,12 +404,10 @@ pub async fn daemon_with(
     }
 }
 
-/// A connection owning `io.aleph.Keyring` on `bus` (the Secret Service
-/// name is requested, queued, once served).
+/// alephd's connection on `bus` (it owns `io.aleph.Keyring` once served,
+/// `daemon::start`; the Secret Service name is requested, queued, after).
 async fn connect_as_daemon(bus: &Bus) -> zbus::Connection {
     zbus::connection::Builder::address(bus.address.as_str())
-        .unwrap()
-        .name(crate::admin::BUS_NAME)
         .unwrap()
         .build()
         .await
@@ -430,7 +428,7 @@ pub async fn daemon_on(bus: Bus, create: bool) -> Daemon {
         create_with_password(&keyring);
     }
     let conn = connect_as_daemon(&bus).await;
-    let secrets = crate::daemon::serve(
+    let secrets = crate::daemon::start(
         &conn,
         keyring.clone(),
         Arc::new(InteractiveLauncher::new(vec![])),

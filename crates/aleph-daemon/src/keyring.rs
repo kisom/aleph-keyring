@@ -531,6 +531,16 @@ impl Keyring {
         chan: &mut Channel,
         caller: Option<Caller>,
     ) -> Result<Option<String>> {
+        // (For the log: who asked. `alephctl unlock` names no caller.)
+        let who = match &caller {
+            Some(Caller {
+                name: Some(n),
+                pid: Some(pid),
+            }) => format!("{n} (pid {pid})"),
+            Some(Caller { name: Some(n), .. }) => n.clone(),
+            Some(Caller { pid: Some(pid), .. }) => format!("pid {pid}"),
+            _ => "alephctl".into(),
+        };
         chan.send(&ToPrompter::Begin {
             purpose: Purpose::Unlock,
             operation: "Unlock the keyring".into(),
@@ -551,7 +561,12 @@ impl Keyring {
             Err(Error::UnlockedElsewhere) => return Ok(None),
             other => other?,
         };
+        let kind = vault
+            .keyslots()
+            .find(|k| k.id == slot)
+            .map_or_else(|| "unknown".into(), |k| kind_name(&k.kind));
         let warning = self.install(vault, slot, kek.as_ref())?;
+        tracing::info!("unlocked with the {kind} keyslot, for {who}");
         let pending = |message: Option<String>| -> Option<String> {
             if !lock(&self.inner).state.rotation_pending() {
                 return message;
