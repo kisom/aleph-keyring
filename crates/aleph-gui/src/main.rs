@@ -1,19 +1,71 @@
-//! `aleph-gui prompt`: the prompter alephd starts, with its end of a
-//! socketpair as `ALEPH_PROMPT_FD` (spec §6 "Prompter orchestration").
+//! `aleph-gui`: the manager window (the manager spec); `aleph-gui prompt`:
+//! the prompter alephd starts, with its end of a socketpair as
+//! `ALEPH_PROMPT_FD` (spec §6 "Prompter orchestration").
 
 use std::process::ExitCode;
 
-use aleph_gui::{app, link, screens, settings};
+use aleph_gui::{app, clipboard, link, manager, screens, settings, store};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        [] => manage(),
         ["prompt"] => prompt(),
         _ => {
-            eprintln!(
-                "usage: aleph-gui prompt   (alephd starts it; the manager window comes later)"
-            );
+            eprintln!("usage: aleph-gui            the keyring manager");
+            eprintln!("       aleph-gui prompt     (alephd starts it)");
             ExitCode::from(2)
+        }
+    }
+}
+
+/// The settings, reduced motion, and home, for either window.
+fn look() -> (settings::Settings, bool, Option<std::path::PathBuf>) {
+    let (settings, warning) = match settings::config_home() {
+        Some(dir) => settings::Settings::load(&settings::path(&dir)),
+        None => (settings::Settings::default(), None),
+    };
+    if let Some(w) = warning {
+        eprintln!("aleph-gui: {w}");
+    }
+    (settings, settings::reduced_motion(), settings::home())
+}
+
+fn manage() -> ExitCode {
+    // It shows and copies secrets: no core dumps, no ptrace by other
+    // processes of the user.
+    // SAFETY: prctl with these arguments only sets a process flag.
+    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    let (settings, still, home) = look();
+    let viewport = egui::ViewportBuilder::default()
+        .with_app_id("aleph")
+        .with_title("aleph")
+        .with_inner_size(manager::SIZE);
+    let options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
+    let result = eframe::run_native(
+        "aleph",
+        options,
+        Box::new(move |cc| {
+            let ctx = cc.egui_ctx.clone();
+            let store = store::DbusStore::start(None, move || ctx.request_repaint());
+            let mut app =
+                manager::Manager::new(store, clipboard::Wayland::default(), settings, home, still);
+            aleph_gui::theme::apply(&cc.egui_ctx, &app.palette);
+            if still {
+                cc.egui_ctx.all_styles_mut(|s| s.animation_time = 0.0);
+            }
+            app.watch_theme(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
+    );
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("aleph-gui: cannot open the window: {e}");
+            ExitCode::FAILURE
         }
     }
 }

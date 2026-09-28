@@ -51,10 +51,32 @@ fn without_alephd_it_explains_and_exits() {
     );
 
     let o = Command::new(env!("CARGO_BIN_EXE_aleph-gui"))
+        .arg("frobnicate")
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(2));
     assert!(stderr(&o).contains("usage"), "{}", stderr(&o));
+}
+
+/// With no arguments it is the manager; with no display to open, it says
+/// so and exits. (Never the real display: a socket name that does not
+/// exist, a private runtime directory, and no session bus.)
+#[test]
+fn the_manager_without_a_display_exits() {
+    let dir = tempfile::tempdir().unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_aleph-gui"))
+        .env("XDG_RUNTIME_DIR", dir.path())
+        .env("WAYLAND_DISPLAY", "aleph-test-no-such-display")
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
+        .env_remove("DISPLAY")
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("cannot open the window"),
+        "{}",
+        stderr(&o)
+    );
 }
 
 /// Only a socket is taken: not a standard stream, not a file.

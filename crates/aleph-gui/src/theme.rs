@@ -185,6 +185,41 @@ pub fn paint_scanlines(ctx: &egui::Context, p: &Palette) {
     }
 }
 
+/// Follows the Omarchy theme (spec §7): `changed` turns true once, after
+/// any change under `~/.local/state/omarchy/current` (Omarchy rewrites the
+/// theme's files in place), and the window is asked to repaint.
+pub struct Watch {
+    changed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    _watcher: notify::RecommendedWatcher,
+}
+
+impl Watch {
+    /// `None` where there is nothing to watch (no Omarchy theme).
+    pub fn start(home: &Path, ctx: &egui::Context) -> Option<Self> {
+        use notify::Watcher;
+        let changed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (flag, ctx) = (changed.clone(), ctx.clone());
+        let mut watcher = notify::recommended_watcher(move |_: notify::Result<notify::Event>| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            ctx.request_repaint();
+        })
+        .ok()?;
+        watcher
+            .watch(&omarchy_current(home), notify::RecursiveMode::Recursive)
+            .ok()?;
+        Some(Self {
+            changed,
+            _watcher: watcher,
+        })
+    }
+
+    /// Whether the theme changed since the last call.
+    pub fn changed(&self) -> bool {
+        self.changed
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +250,31 @@ mod tests {
                 .is_err()
         );
         assert!(parse_colors("foreground = \"#000000\"\n").is_err());
+    }
+
+    /// A theme switch (Omarchy rewrites the files) is seen.
+    #[test]
+    fn a_theme_switch_is_seen() {
+        let home = tempfile::tempdir().unwrap();
+        let file = omarchy_colors(home.path());
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, NORD).unwrap();
+        let watch = Watch::start(home.path(), &egui::Context::default()).unwrap();
+        // (Events from the setup above may still arrive: let them.)
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        watch.changed();
+        std::fs::write(&file, NORD.replace("#2e3440", "#101010")).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !watch.changed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the change was not seen"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Nothing to watch without an Omarchy theme.
+        let bare = tempfile::tempdir().unwrap();
+        assert!(Watch::start(bare.path(), &egui::Context::default()).is_none());
     }
 
     #[test]

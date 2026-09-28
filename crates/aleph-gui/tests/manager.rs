@@ -1,0 +1,614 @@
+//! The manager window, driven as a person would (egui_kittest), against a
+//! stand-in store and clipboard; snapshots of its views in both themes.
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+use aleph_daemon::prompt::{Channel, FromPrompter, Method, Purpose, ToPrompter};
+use aleph_gui::clipboard::Backend;
+use aleph_gui::manager::{Manager, SIZE};
+use aleph_gui::settings::{Settings, ThemeChoice};
+use aleph_gui::store::{Collection, Item, Request, Store, StoreEvent, Vault};
+use egui_kittest::Harness;
+use egui_kittest::kittest::{NodeT, Queryable};
+use zeroize::Zeroizing;
+
+/// The store's stand-in: requests are recorded, events are queued by the
+/// test.
+#[derive(Clone, Default)]
+struct Fake {
+    requests: Rc<RefCell<Vec<Request>>>,
+    events: Rc<RefCell<Vec<StoreEvent>>>,
+}
+
+impl Store for Fake {
+    fn request(&self, r: Request) {
+        self.requests.borrow_mut().push(r);
+    }
+    fn events(&self) -> Vec<StoreEvent> {
+        self.events.borrow_mut().drain(..).collect()
+    }
+}
+
+impl Fake {
+    fn send(&self, e: StoreEvent) {
+        self.events.borrow_mut().push(e);
+    }
+    fn take(&self) -> Vec<Request> {
+        self.requests.borrow_mut().drain(..).collect()
+    }
+}
+
+#[derive(Clone, Default)]
+struct Clip(std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>);
+
+impl Backend for Clip {
+    fn offer(&mut self, secret: Zeroizing<Vec<u8>>) -> Result<(), String> {
+        *self.0.lock().unwrap() = Some(secret.to_vec());
+        Ok(())
+    }
+    fn still_ours(&self) -> bool {
+        self.0.lock().unwrap().is_some()
+    }
+    fn clear(&mut self) {
+        *self.0.lock().unwrap() = None;
+    }
+}
+
+type Window = Harness<'static, Manager<Fake, Clip>>;
+
+fn item(path: &str, label: &str, attrs: &[(&str, &str)]) -> Item {
+    Item {
+        path: path.into(),
+        label: label.into(),
+        attributes: attrs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        created: 1_790_553_600,
+        modified: 1_790_553_600,
+    }
+}
+
+fn vault() -> Vault {
+    Vault::Unlocked(vec![
+        Collection {
+            path: "/c/login".into(),
+            label: "Login".into(),
+            is_default: true,
+            items: vec![
+                item(
+                    "/c/login/1",
+                    "GitHub token",
+                    &[("service", "github.com"), ("user", "kyle")],
+                ),
+                item(
+                    "/c/login/2",
+                    "Mail app password",
+                    &[("service", "imap.example.org")],
+                ),
+            ],
+        },
+        Collection {
+            path: "/c/work".into(),
+            label: "work".into(),
+            is_default: false,
+            items: vec![item("/c/work/1", "VPN", &[("service", "vpn")])],
+        },
+    ])
+}
+
+fn window(theme: ThemeChoice, v: Vault) -> (Window, Fake, Clip) {
+    let store = Fake::default();
+    let clip = Clip::default();
+    let home = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/home");
+    let settings = Settings {
+        theme,
+        scanlines: true,
+    };
+    let mut m = Manager::new(store.clone(), clip.clone(), settings, Some(home), true);
+    m.confirm_guard = Duration::ZERO;
+    let palette = m.palette.clone();
+    store.send(StoreEvent::Vault(v));
+    let mut h = Harness::builder()
+        .with_size(egui::Vec2::from(SIZE))
+        .build_ui_state(|ui, m: &mut Manager<Fake, Clip>| m.frame(ui), m);
+    aleph_gui::theme::apply(&h.ctx, &palette);
+    frames(&mut h);
+    (h, store, clip)
+}
+
+fn frames(h: &mut Window) {
+    h.run_steps(4);
+}
+
+/// Let the reader thread deliver (the confirmation is asynchronous).
+fn settle(h: &mut Window) {
+    for _ in 0..40 {
+        h.step();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn type_into(h: &mut Window, label: &str, text: &str) {
+    h.get_by_label(label).focus();
+    frames(h);
+    h.get_by_label(label).type_text(text);
+    frames(h);
+}
+
+/// Play alephd on the confirmation's socket: ask for the password, and
+/// answer whether it was `pw`.
+fn alephd_confirms(fd: std::os::fd::OwnedFd, pw: &'static str) -> std::thread::JoinHandle<bool> {
+    std::thread::spawn(move || {
+        let mut chan = Channel::from_fd(fd, Duration::from_secs(10)).unwrap();
+        chan.send(&ToPrompter::Begin {
+            purpose: Purpose::Reauth,
+            operation: "Confirm it is you".into(),
+            caller: None,
+        })
+        .unwrap();
+        let reply = chan
+            .ask(&ToPrompter::Ask {
+                methods: vec![Method::Password],
+                error: None,
+                retry_after: None,
+            })
+            .unwrap();
+        let ok = matches!(reply, FromPrompter::Password { password } if password.expose() == pw);
+        chan.done(ok, None);
+        ok
+    })
+}
+
+fn only(requests: Vec<Request>) -> Request {
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    requests.into_iter().next().unwrap()
+}
+
+#[test]
+fn folders_and_items_are_listed_and_searched() {
+    let (mut h, _, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("Login (default)");
+    h.get_by_label("GitHub token");
+    h.get_by_label("VPN");
+    type_into(&mut h, "Search", "imap");
+    assert!(h.query_by_label("GitHub token").is_none());
+    h.get_by_label("Mail app password");
+}
+
+/// Showing a secret confirms it is you first, then fetches it; within 5
+/// minutes a second show does not ask again.
+#[test]
+fn a_secret_is_shown_after_the_confirmation() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("GitHub token").click();
+    frames(&mut h);
+    h.get_by_label("SHOW").click();
+    frames(&mut h);
+    let Request::Reauth(fd) = only(store.take()) else {
+        panic!("no confirmation");
+    };
+    let alephd = alephd_confirms(fd, "hunter2");
+    settle(&mut h);
+    type_into(&mut h, "Login password", "hunter2");
+    h.key_press(egui::Key::Enter);
+    frames(&mut h);
+    assert!(alephd.join().unwrap());
+    settle(&mut h);
+    match only(store.take()) {
+        Request::Secret(p) => assert_eq!(p, "/c/login/1"),
+        other => panic!("{other:?}"),
+    }
+    store.send(StoreEvent::Secret {
+        path: "/c/login/1".into(),
+        secret: Zeroizing::new(b"ghp_s3cret".to_vec()),
+        content_type: "text/plain".into(),
+    });
+    frames(&mut h);
+    h.get_by_label("ghp_s3cret");
+    h.get_by_label("HIDE").click();
+    frames(&mut h);
+    assert!(h.query_by_label("ghp_s3cret").is_none());
+    // Within 5 minutes: fetched at once.
+    h.get_by_label("SHOW").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Secret(_)));
+}
+
+/// A refused confirmation fetches nothing.
+#[test]
+fn a_refused_confirmation_fetches_nothing() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("GitHub token").click();
+    frames(&mut h);
+    h.get_by_label("SHOW").click();
+    frames(&mut h);
+    let Request::Reauth(fd) = only(store.take()) else {
+        panic!("no confirmation");
+    };
+    let alephd = alephd_confirms(fd, "hunter2");
+    settle(&mut h);
+    type_into(&mut h, "Login password", "wrong");
+    h.key_press(egui::Key::Enter);
+    frames(&mut h);
+    assert!(!alephd.join().unwrap());
+    settle(&mut h);
+    assert!(store.take().is_empty());
+}
+
+/// A copy goes to the clipboard (and nowhere on screen).
+#[test]
+fn a_copy_goes_to_the_clipboard() {
+    let (mut h, store, clip) = window(ThemeChoice::Neon, vault());
+    h.state_mut().reauth.confirmed(Instant::now());
+    h.get_by_label("GitHub token").click();
+    frames(&mut h);
+    h.get_by_label("COPY").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Secret(_)));
+    store.send(StoreEvent::Secret {
+        path: "/c/login/1".into(),
+        secret: Zeroizing::new(b"ghp_s3cret".to_vec()),
+        content_type: "text/plain".into(),
+    });
+    frames(&mut h);
+    assert_eq!(clip.0.lock().unwrap().as_deref(), Some(&b"ghp_s3cret"[..]));
+    assert!(h.query_by_label("ghp_s3cret").is_none());
+    h.get_by_label_contains("COPIED");
+}
+
+/// Editing the label saves only the label (the secret was never loaded).
+#[test]
+fn an_edited_label_is_saved() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("GitHub token").click();
+    frames(&mut h);
+    h.get_by_label("EDIT").click();
+    frames(&mut h);
+    type_into(&mut h, "Label", " (work)");
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    match only(store.take()) {
+        Request::SetLabel { path, label } => {
+            assert_eq!(path, "/c/login/1");
+            assert_eq!(label, "GitHub token (work)");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A new item goes to the selected folder, with the attributes typed.
+#[test]
+fn a_new_item_is_created_in_the_folder() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("work").click();
+    frames(&mut h);
+    h.get_by_label("+ ITEM").click();
+    frames(&mut h);
+    type_into(&mut h, "Label", "Router");
+    type_into(&mut h, "Secret", "admin123");
+    h.get_by_label("+ ATTRIBUTE").click();
+    frames(&mut h);
+    type_into(&mut h, "Attribute 1 key", "host");
+    type_into(&mut h, "Attribute 1 value", "192.168.1.1");
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    match only(store.take()) {
+        Request::CreateItem {
+            collection,
+            label,
+            attributes,
+            secret,
+        } => {
+            assert_eq!(collection, "/c/work");
+            assert_eq!(label, "Router");
+            assert_eq!(
+                attributes,
+                BTreeMap::from([("host".into(), "192.168.1.1".into())])
+            );
+            assert_eq!(&secret[..], b"admin123");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Delete asks first; No deletes nothing.
+#[test]
+fn delete_asks_first() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("VPN").click();
+    frames(&mut h);
+    h.get_by_label("DELETE").click();
+    frames(&mut h);
+    h.get_by_label("Delete 'VPN'?");
+    h.get_by_label("No").click();
+    frames(&mut h);
+    assert!(store.take().is_empty());
+    h.get_by_label("DELETE").click();
+    frames(&mut h);
+    h.get_by_label("Yes").click();
+    frames(&mut h);
+    match only(store.take()) {
+        Request::DeleteItem(p) => assert_eq!(p, "/c/work/1"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A lock hides what is shown and forgets the confirmation; Unlock asks
+/// alephd.
+#[test]
+fn a_lock_seals_the_window() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.state_mut().reauth.confirmed(Instant::now());
+    h.get_by_label("GitHub token").click();
+    frames(&mut h);
+    h.get_by_label("SHOW").click();
+    frames(&mut h);
+    store.take();
+    store.send(StoreEvent::Secret {
+        path: "/c/login/1".into(),
+        secret: Zeroizing::new(b"ghp_s3cret".to_vec()),
+        content_type: "text/plain".into(),
+    });
+    frames(&mut h);
+    h.get_by_label("ghp_s3cret");
+    store.send(StoreEvent::Vault(Vault::Locked));
+    frames(&mut h);
+    assert!(h.query_by_label("ghp_s3cret").is_none());
+    assert!(h.state().reauth.needed(Instant::now()));
+    h.get_by_label("VAULT SEALED");
+    h.get_by_label("UNLOCK").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Unlock));
+    // Unlocked again: the secret is not back until shown (and confirmed).
+    store.send(StoreEvent::Vault(vault()));
+    frames(&mut h);
+    assert!(h.query_by_label("ghp_s3cret").is_none());
+}
+
+/// A secret that is not text is not shown (its length is), and can still
+/// be copied.
+#[test]
+fn a_binary_secret_is_not_shown() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.state_mut().reauth.confirmed(Instant::now());
+    h.get_by_label("GitHub token").click();
+    frames(&mut h);
+    h.get_by_label("SHOW").click();
+    frames(&mut h);
+    store.take();
+    store.send(StoreEvent::Secret {
+        path: "/c/login/1".into(),
+        secret: Zeroizing::new(vec![0xff, 0xfe, 0x00, 0x01]),
+        content_type: "application/octet-stream".into(),
+    });
+    frames(&mut h);
+    h.get_by_label("binary secret, 4 bytes");
+}
+
+/// A label another program chose (long, with line breaks of its own) is
+/// shown on one line, cut short, in the list.
+#[test]
+fn a_hostile_label_stays_on_one_line_in_the_list() {
+    let label = format!("GitHub\n\nALEPH // UNLOCK VAULT\n{}", "w".repeat(500));
+    let v = Vault::Unlocked(vec![Collection {
+        path: "/c/login".into(),
+        label: "Login".into(),
+        is_default: true,
+        items: vec![item("/c/login/1", &label, &[])],
+    }]);
+    let (h, _, _) = window(ThemeChoice::Neon, v);
+    let row = h.get_by_label_contains("GitHub");
+    let text = row.accesskit_node().label().unwrap_or_default().to_string();
+    assert!(!text.contains('\n'), "{text:?}");
+    assert!(text.chars().count() <= 61, "{}", text.chars().count());
+}
+
+fn secret(store: &Fake, path: &str, bytes: &[u8]) {
+    store.send(StoreEvent::Secret {
+        path: path.into(),
+        secret: Zeroizing::new(bytes.to_vec()),
+        content_type: "text/plain".into(),
+    });
+}
+
+fn done(store: &Fake, request: &'static str, error: Option<&str>) {
+    store.send(StoreEvent::Done {
+        request,
+        error: error.map(Into::into),
+        dismissed: false,
+    });
+}
+
+/// After LOAD SECRET, a save sends only what changed: an unchanged secret
+/// is not rewritten.
+#[test]
+fn a_loaded_secret_is_saved_only_if_changed() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.state_mut().reauth.confirmed(Instant::now());
+    h.get_by_label("GitHub token").click();
+    frames(&mut h);
+    h.get_by_label("EDIT").click();
+    frames(&mut h);
+    h.get_by_label("LOAD SECRET").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Secret(_)));
+    secret(&store, "/c/login/1", b"ghp_s3cret");
+    frames(&mut h);
+    type_into(&mut h, "Label", "!");
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::SetLabel { .. }));
+}
+
+/// A secret that is not text is not loaded into the editor.
+#[test]
+fn a_binary_secret_is_not_editable() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.state_mut().reauth.confirmed(Instant::now());
+    h.get_by_label("GitHub token").click();
+    frames(&mut h);
+    h.get_by_label("EDIT").click();
+    frames(&mut h);
+    h.get_by_label("LOAD SECRET").click();
+    frames(&mut h);
+    store.take();
+    secret(&store, "/c/login/1", &[0xff, 0xfe]);
+    frames(&mut h);
+    assert!(h.query_by_label("Secret").is_none());
+    h.get_by_label_contains("not editable");
+}
+
+/// A save that fails keeps the form, with what was typed; one that
+/// succeeds closes it.
+#[test]
+fn a_failed_save_keeps_the_form() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("+ ITEM").click();
+    frames(&mut h);
+    type_into(&mut h, "Label", "Router");
+    type_into(&mut h, "Secret", "admin123");
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::CreateItem { .. }));
+    h.get_by_label("SAVING…");
+    done(
+        &store,
+        "create the item",
+        Some("org.freedesktop.Secret.Error.IsLocked"),
+    );
+    frames(&mut h);
+    assert_eq!(h.get_by_label("Label").value().as_deref(), Some("Router"));
+    h.get_by_label_contains("cannot create the item");
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::CreateItem { .. }));
+    done(&store, "create the item", None);
+    frames(&mut h);
+    assert!(h.query_by_label("Label").is_none());
+}
+
+/// A secret typed into the editor survives a lock, and is saved after the
+/// unlock.
+#[test]
+fn a_typed_secret_survives_a_lock() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.state_mut().reauth.confirmed(Instant::now());
+    h.get_by_label("GitHub token").click();
+    frames(&mut h);
+    h.get_by_label("EDIT").click();
+    frames(&mut h);
+    h.get_by_label("LOAD SECRET").click();
+    frames(&mut h);
+    store.take();
+    secret(&store, "/c/login/1", b"old");
+    frames(&mut h);
+    type_into(&mut h, "Secret", "new");
+    store.send(StoreEvent::Vault(Vault::Locked));
+    frames(&mut h);
+    store.send(StoreEvent::Vault(vault()));
+    frames(&mut h);
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    match only(store.take()) {
+        Request::SetSecret { secret, .. } => assert_eq!(&secret[..], b"oldnew"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Enter on the delete question answers its default: No.
+#[test]
+fn enter_on_the_delete_question_says_no() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("VPN").click();
+    frames(&mut h);
+    h.get_by_label("DELETE").click();
+    frames(&mut h);
+    h.key_press(egui::Key::Enter);
+    frames(&mut h);
+    assert!(store.take().is_empty());
+    assert!(h.query_by_label("Delete 'VPN'?").is_none());
+}
+
+#[test]
+fn without_alephd_the_link_is_down() {
+    let (h, _, _) = window(ThemeChoice::Neon, Vault::Unreachable("no such name".into()));
+    h.get_by_label("LINK DOWN");
+}
+
+/// Every view, in both themes.
+#[test]
+fn snapshots() {
+    let mut failures = Vec::new();
+    for (theme, suffix) in [(ThemeChoice::Neon, "neon"), (ThemeChoice::Auto, "omarchy")] {
+        let mut shot = |h: &mut Window, name: &str| {
+            if let Err(e) = h.try_snapshot(format!("manager_{name}_{suffix}")) {
+                failures.push(e.to_string());
+            }
+        };
+        let (mut h, store, _) = window(theme, vault());
+        shot(&mut h, "empty");
+        h.get_by_label("GitHub token").click();
+        frames(&mut h);
+        shot(&mut h, "item");
+        h.state_mut().reauth.confirmed(Instant::now());
+        h.get_by_label("SHOW").click();
+        frames(&mut h);
+        store.take();
+        store.send(StoreEvent::Secret {
+            path: "/c/login/1".into(),
+            secret: Zeroizing::new(b"ghp_s3cret".to_vec()),
+            content_type: "text/plain".into(),
+        });
+        frames(&mut h);
+        shot(&mut h, "shown");
+        h.get_by_label("EDIT").click();
+        frames(&mut h);
+        shot(&mut h, "edit");
+        h.get_by_label("CANCEL").click();
+        frames(&mut h);
+        h.get_by_label("+ ITEM").click();
+        frames(&mut h);
+        shot(&mut h, "new");
+        // The confirmation, drawn inside the window (alephd has asked).
+        let (mut h, store, _) = window(theme, vault());
+        h.get_by_label("GitHub token").click();
+        frames(&mut h);
+        h.get_by_label("SHOW").click();
+        frames(&mut h);
+        let Request::Reauth(fd) = only(store.take()) else {
+            panic!("no confirmation");
+        };
+        let alephd = std::thread::spawn(move || {
+            let mut chan = Channel::from_fd(fd, Duration::from_secs(10)).unwrap();
+            chan.send(&ToPrompter::Begin {
+                purpose: Purpose::Reauth,
+                operation: "Confirm it is you".into(),
+                caller: None,
+            })
+            .unwrap();
+            chan.send(&ToPrompter::Ask {
+                methods: vec![Method::Password],
+                error: None,
+                retry_after: None,
+            })
+            .unwrap();
+            chan
+        });
+        let chan = alephd.join().unwrap();
+        settle(&mut h);
+        shot(&mut h, "confirm");
+        drop(chan);
+        let (mut h, _, _) = window(theme, Vault::Locked);
+        shot(&mut h, "locked");
+        let (mut h, _, _) = window(
+            theme,
+            Vault::Unreachable("org.freedesktop.secrets has no owner".into()),
+        );
+        shot(&mut h, "unreachable");
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}

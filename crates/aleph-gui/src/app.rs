@@ -2,8 +2,6 @@
 
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
@@ -24,8 +22,7 @@ pub struct PromptApp {
     /// Scanlines drawn (the setting, unless reduced motion is asked for).
     scanlines: bool,
     /// Set by the theme watcher.
-    theme_changed: Arc<AtomicBool>,
-    _watcher: Option<notify::RecommendedWatcher>,
+    watch: Option<theme::Watch>,
     /// The window was told to close.
     pub closed: bool,
     /// How long keys are ignored after a screen appears, so the end of
@@ -42,6 +39,9 @@ pub struct PromptApp {
     close_at: Option<Instant>,
     /// The window size last asked for.
     size: [f32; 2],
+    /// Drawn inside another window (the manager's confirmation): closing
+    /// ends the conversation, never the window, which it never resizes.
+    pub embedded: bool,
 }
 
 /// Keys ignored after a screen appears.
@@ -67,8 +67,7 @@ impl PromptApp {
             scanlines: settings.scanlines && !still,
             settings,
             home,
-            theme_changed: Arc::default(),
-            _watcher: None,
+            watch: None,
             closed: false,
             input_guard: INPUT_GUARD,
             message_for: MESSAGE_FOR,
@@ -76,34 +75,24 @@ impl PromptApp {
             shown_at: Instant::now(),
             close_at: None,
             size: crate::screens::SIZE,
+            embedded: false,
         }
     }
 
     /// Re-theme live when the Omarchy theme changes (spec §7).
     pub fn watch_theme(&mut self, ctx: &egui::Context) {
-        use notify::Watcher;
-        let Some(home) = &self.home else { return };
-        let flag = self.theme_changed.clone();
-        let ctx = ctx.clone();
-        let watcher = notify::recommended_watcher(move |_: notify::Result<notify::Event>| {
-            flag.store(true, Ordering::SeqCst);
-            ctx.request_repaint();
-        });
-        if let Ok(mut w) = watcher
-            && w.watch(
-                &theme::omarchy_current(home),
-                notify::RecursiveMode::Recursive,
-            )
-            .is_ok()
-        {
-            self._watcher = Some(w);
-        }
+        self.watch = self
+            .home
+            .as_deref()
+            .and_then(|home| theme::Watch::start(home, ctx));
     }
 
     fn close(&mut self, ctx: &egui::Context) {
         if !self.closed {
             self.closed = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            if !self.embedded {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
     }
 
@@ -119,7 +108,7 @@ impl PromptApp {
     pub fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let now = Instant::now();
-        if self.theme_changed.swap(false, Ordering::SeqCst) {
+        if self.watch.as_ref().is_some_and(theme::Watch::changed) {
             self.ui.palette = theme::resolve(&self.settings, self.home.as_deref());
             theme::apply(&ctx, &self.ui.palette);
         }
@@ -133,7 +122,7 @@ impl PromptApp {
                     self.shown_at = now;
                     // (The recovery key's screens need a taller window.)
                     let size = crate::screens::size_for(&self.ui.conversation.screen);
-                    if size != self.size {
+                    if size != self.size && !self.embedded {
                         self.size = size;
                         let size = egui::Vec2::from(size);
                         ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
@@ -162,7 +151,7 @@ impl PromptApp {
                 }
             }
         }
-        if ctx.input(|i| i.viewport().close_requested()) && !self.closed {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.closed && !self.embedded {
             // Closed by the window manager.
             if !self.ui.conversation.finished() {
                 let _ = link::send(&self.stream, &FromPrompter::Cancel {});
@@ -214,7 +203,8 @@ impl PromptApp {
             ctx.request_repaint_after(self.shown_at + self.input_guard - now);
         }
         let action = self.ui.show(ui, now);
-        if self.scanlines {
+        // (Embedded, the window around it paints them.)
+        if self.scanlines && !self.embedded {
             theme::paint_scanlines(&ctx, &self.ui.palette);
         }
         match action {
