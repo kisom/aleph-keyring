@@ -57,8 +57,8 @@ pub enum Shown {
 
 /// The list panel, and the least width it and the detail get.
 const LIST: &str = "aleph-list";
-const LIST_MIN: f32 = 160.0;
-const DETAIL_MIN: f32 = 240.0;
+const LIST_MIN: f32 = 140.0;
+const DETAIL_MIN: f32 = 140.0;
 
 /// The most of a shown secret's height the pane gives it (it scrolls).
 const SECRET_HEIGHT: f32 = 220.0;

@@ -36,7 +36,8 @@ Adopted, each with a test that failed without it:
   sized beforehand (parsing it into values would leave unzeroized copies);
   COPY and EDIT use the secret as stored.
 - **The list and the detail share the width by a proportion,** evenly at
-  first: the divider drags (the list at least 160 px, the detail 240 px),
+  first: the divider drags (each keeps at least 140 px: a higher floor for the detail stopped
+  the divider at once at half a screen),
   and the share it leaves holds when the window is retiled. A fixed
   280 px list left the detail too narrow at half a screen (Hyprland's
   side-by-side tiling).

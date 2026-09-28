@@ -754,38 +754,53 @@ fn a_narrow_window_splits_list_and_detail_evenly() {
     );
 }
 
+/// Drag the divider from where it is by `dx`.
+fn drag_divider(h: &mut Window, dx: f32) {
+    let x = list_edge(h) + 8.0;
+    let y = 300.0;
+    let press = |x: f32, pressed| egui::Event::PointerButton {
+        pos: egui::pos2(x, y),
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    h.event(egui::Event::PointerMoved(egui::pos2(x, y)));
+    frames(h);
+    h.event(press(x, true));
+    frames(h);
+    for step in 1..=6 {
+        h.event(egui::Event::PointerMoved(egui::pos2(
+            x + dx * step as f32 / 6.0,
+            y,
+        )));
+        h.step();
+    }
+    h.event(press(x + dx, false));
+    frames(h);
+}
+
+/// At half a screen the divider drags right too (a long label wants a
+/// wider list): the detail's floor must not stop it at once.
+#[test]
+fn the_list_widens_at_half_a_screen() {
+    let (mut h, _, _) = window_sized(ThemeChoice::Neon, vault(), [620.0, 560.0]);
+    frames(&mut h);
+    let before = list_edge(&h);
+    drag_divider(&mut h, 60.0);
+    let after = list_edge(&h);
+    assert!(
+        after > before + 40.0,
+        "the list ended at {before}, now {after}"
+    );
+}
+
 /// The divider between the list and the detail drags.
 #[test]
 fn the_list_divider_drags() {
     let (mut h, _, _) = window_sized(ThemeChoice::Neon, vault(), [640.0, 560.0]);
     frames(&mut h);
     let before = list_edge(&h);
-    let x = before + 8.0;
-    let y = 300.0;
-    let button = |pressed| egui::Event::PointerButton {
-        pos: egui::pos2(x - 60.0, y),
-        button: egui::PointerButton::Primary,
-        pressed,
-        modifiers: egui::Modifiers::NONE,
-    };
-    h.event(egui::Event::PointerMoved(egui::pos2(x, y)));
-    frames(&mut h);
-    h.event(egui::Event::PointerButton {
-        pos: egui::pos2(x, y),
-        button: egui::PointerButton::Primary,
-        pressed: true,
-        modifiers: egui::Modifiers::NONE,
-    });
-    frames(&mut h);
-    for step in 1..=6 {
-        h.event(egui::Event::PointerMoved(egui::pos2(
-            x - 10.0 * step as f32,
-            y,
-        )));
-        h.step();
-    }
-    h.event(button(false));
-    frames(&mut h);
+    drag_divider(&mut h, -60.0);
     let after = list_edge(&h);
     assert!(
         after < before - 40.0,
