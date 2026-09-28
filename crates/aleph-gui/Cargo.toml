@@ -1,0 +1,21 @@
+[package]
+name = "aleph-gui"
+description = "aleph-gui: the aleph keyring's prompter (and, later, its manager)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aleph-prompt-proto = { path = "../aleph-prompt-proto" }
+eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland"] }
+egui = "0.36"
+libc.workspace = true
+notify = "8"
+serde.workspace = true
+serde_json.workspace = true
+toml = "1"
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
