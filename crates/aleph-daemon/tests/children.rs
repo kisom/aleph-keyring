@@ -19,3 +19,19 @@ fn a_test_bus_inherits_no_descriptors() {
         .collect();
     assert!(!held.contains(&socket), "dbus-daemon holds {socket:?}");
 }
+
+/// A test bus leaves no socket behind: it is killed, so it cannot remove
+/// its own (thousands piled up in /tmp).
+#[test]
+fn a_test_bus_leaves_no_socket() {
+    let bus = aleph_daemon::testing::bus();
+    let path = bus
+        .address
+        .split(',')
+        .find_map(|p| p.strip_prefix("unix:path="))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| panic!("not a socket path: {}", bus.address));
+    assert!(path.exists());
+    drop(bus);
+    assert!(!path.exists(), "{path:?} is left behind");
+}

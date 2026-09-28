@@ -330,7 +330,7 @@ pub fn bus() -> Bus {
     // started on a test bus.)
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("bus.conf");
-    std::fs::write(&config, crate::export::PRIVATE_BUS_CONFIG).unwrap();
+    std::fs::write(&config, crate::export::private_bus_config(dir.path())).unwrap();
     let mut child = no_inherited_fds(&mut std::process::Command::new("dbus-daemon"))
         .arg(format!("--config-file={}", config.display()))
         .args(["--nofork", "--nopidfile", "--print-address=1"])

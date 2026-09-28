@@ -55,12 +55,16 @@ pub async fn gnome_keyring_active(session: &Connection) -> bool {
 }
 
 /// A private session bus's configuration: no service directories, so
-/// nothing (a prompter, a second gnome-keyring) is ever started on it.
-pub const PRIVATE_BUS_CONFIG: &str = r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+/// nothing (a prompter, a second gnome-keyring) is ever started on it. It
+/// listens in `dir` (its owner's temporary directory): the bus is killed,
+/// so it never removes its socket, and the socket goes with the directory.
+pub fn private_bus_config(dir: &Path) -> String {
+    format!(
+        r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
 <busconfig>
   <type>session</type>
-  <listen>unix:tmpdir=/tmp</listen>
+  <listen>unix:dir={}</listen>
   <auth>EXTERNAL</auth>
   <policy context="default">
     <allow send_destination="*" eavesdrop="true"/>
@@ -68,7 +72,10 @@ pub const PRIVATE_BUS_CONFIG: &str = r#"<!DOCTYPE busconfig PUBLIC "-//freedeskt
     <allow own="*"/>
   </policy>
 </busconfig>
-"#;
+"#,
+        dir.display()
+    )
+}
 
 /// Let a child inherit nothing above stderr: alephd's own descriptors (its
 /// TPM connection, `pam.sock`) must not live on in a long-running child.
@@ -111,7 +118,7 @@ impl Private {
         std::fs::set_permissions(&run, std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .map_err(gk)?;
         let config = dirs.path().join("bus.conf");
-        std::fs::write(&config, PRIVATE_BUS_CONFIG).map_err(gk)?;
+        std::fs::write(&config, private_bus_config(dirs.path())).map_err(gk)?;
         let mut bus = no_inherited_fds(&mut std::process::Command::new("dbus-daemon"))
             .arg(format!("--config-file={}", config.display()))
             .args(["--nofork", "--nopidfile", "--print-address=1"])
