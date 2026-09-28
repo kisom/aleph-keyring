@@ -117,6 +117,8 @@ pub fn removed_since(imported: &[ImportedItem], body: &Body) -> Vec<ImportedItem
 pub struct Summary {
     pub imported: usize,
     pub unchanged: usize,
+    /// Imported items gnome-keyring changed since (followed).
+    pub updated: usize,
     /// Items skipped because a different secret is already here.
     pub conflicts: Vec<String>,
     /// Collections skipped, with the reason.
@@ -146,8 +148,23 @@ impl std::fmt::Display for Summary {
     }
 }
 
+/// An item already in the target collection: id, label, attributes, secret.
+type Before = (uuid::Uuid, String, BTreeMap<String, String>, Vec<u8>);
+
 /// Merge `fetched` into `body` (see the module comment for the rules).
 pub fn merge(body: &mut Body, fetched: Vec<FetchedCollection>, summary: &mut Summary) {
+    merge_following(body, fetched, summary, &std::collections::HashSet::new());
+}
+
+/// `merge`, where a different secret for an item in `updatable` (one the
+/// import brought, followed until the switchover) updates it instead of
+/// being a conflict: gnome-keyring still owns it then.
+pub fn merge_following(
+    body: &mut Body,
+    fetched: Vec<FetchedCollection>,
+    summary: &mut Summary,
+    updatable: &std::collections::HashSet<uuid::Uuid>,
+) {
     for collection in fetched {
         let target = if collection.is_default {
             body.resolve_alias(aleph_core::model::DEFAULT_ALIAS)
@@ -169,11 +186,12 @@ pub fn merge(body: &mut Body, fetched: Vec<FetchedCollection>, summary: &mut Sum
         };
         let target = body.collection_mut(id).expect("just found or created");
         // Only what was here before this merge counts.
-        let before: Vec<(String, BTreeMap<String, String>, Vec<u8>)> = target
+        let before: Vec<Before> = target
             .items
             .iter()
             .map(|i| {
                 (
+                    i.id,
                     i.label.clone(),
                     i.attributes.clone(),
                     i.secret.expose().to_vec(),
@@ -183,10 +201,19 @@ pub fn merge(body: &mut Body, fetched: Vec<FetchedCollection>, summary: &mut Sum
         for f in collection.items {
             let same: Vec<_> = before
                 .iter()
-                .filter(|(l, a, _)| *l == f.label && *a == f.attributes)
+                .filter(|(_, l, a, _)| *l == f.label && *a == f.attributes)
                 .collect();
-            if same.iter().any(|(_, _, s)| s == f.secret.expose()) {
+            if same.iter().any(|(_, _, _, s)| s == f.secret.expose()) {
                 summary.unchanged += 1;
+                continue;
+            }
+            if let Some((id, ..)) = same.iter().find(|(id, ..)| updatable.contains(id))
+                && let Some(item) = target.items.iter_mut().find(|i| i.id == *id)
+            {
+                item.secret = f.secret;
+                item.content_type = f.content_type;
+                item.modified = f.modified.max(aleph_core::model::now());
+                summary.updated += 1;
                 continue;
             }
             if !same.is_empty() {
@@ -378,13 +405,16 @@ impl Importer {
         };
         let mut labels: HashMap<String, (String, bool)> = HashMap::new();
         loop {
+            // (Item signals first: one sent just before gnome-keyring let
+            // go is still taken.)
             let msg = tokio::select! {
-                _ = owner_changes.next() => return,
+                biased;
                 msg = self.events.next() => match msg {
                     Some(Ok(msg)) => msg,
                     Some(Err(_)) => continue,
                     None => return,
                 },
+                _ = owner_changes.next() => return,
             };
             let header = msg.header();
             let member = header.member().map(|m| m.as_str().to_string());
@@ -433,10 +463,12 @@ impl Importer {
         let (label, is_default) = labels[collection].clone();
         let items = self.fetch_items(&[item]).await?;
         let keyring = keyring.clone();
+        let updatable: std::collections::HashSet<uuid::Uuid> =
+            load_imported(record).into_iter().map(|i| i.id).collect();
         let summary = tokio::task::spawn_blocking(move || {
             keyring.modify(|body| {
                 let mut summary = Summary::default();
-                merge(
+                merge_following(
                     body,
                     vec![FetchedCollection {
                         label,
@@ -444,6 +476,7 @@ impl Importer {
                         items,
                     }],
                     &mut summary,
+                    &updatable,
                 );
                 Ok(summary)
             })

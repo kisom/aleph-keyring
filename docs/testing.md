@@ -146,6 +146,13 @@ gnome-keyring-daemon.service gnome-keyring-daemon.socket`):
      `omarchy-hook lock` (DECISIONS.md G1); until then idle and sleep lock
      it.
    - `aleph setup` again changes nothing.
+   - If the root step was skipped: log out and in, and check that no
+     `gnome-keyring-daemon` runs (`pgrep -a gnome-keyring`) and that
+     `aleph status` still says alephd serves the Secret Service (sddm's
+     `pam_gnome_keyring auto_start` can start one).
+   - `sudo aleph system apply` runs the login password through the login
+     and lock-screen stacks as root: after it, check the lock screen
+     itself (it runs as you) before walking away.
    - `aleph setup --revert`: it asks the login password, copies
      everything back, and gnome-keyring serves the Secret Service again
      (with the items stored in aleph meanwhile); `sudo aleph system
@@ -184,12 +191,17 @@ from a TTY (Ctrl-Alt-F3) or a root shell:
 
 1. `sudo aleph system revert`; or by hand, for each of `sddm`,
    `sddm-autologin`, `omarchy-lock-password`, and `passwd` in
-   `/etc/pam.d/`: `mv <name>.aleph-orig <name>` (a missing backup means
-   the file was never changed), then `rm /var/lib/aleph/manifest.json`.
+   `/etc/pam.d/`: `mv <name>.aleph-orig <name>` where a backup exists;
+   where none does, take out the `pam_aleph` lines by hand (and, in `sddm`
+   and `sddm-autologin`, put back the `pam_gnome_keyring` lines). Then
+   `rm /var/lib/aleph/manifest.json`.
 2. As the user: `rm ~/.local/share/dbus-1/services/org.freedesktop.secrets.service
    ~/.local/share/dbus-1/services/org.gnome.keyring.service
    ~/.local/share/dbus-1/services/org.freedesktop.impl.portal.Secret.service`,
-   then `systemctl --user unmask gnome-keyring-daemon.service
+   `busctl --user call org.freedesktop.DBus /org/freedesktop/DBus
+   org.freedesktop.DBus ReloadConfig` (dbus-broker does not notice
+   removed activation files by itself), then `systemctl --user unmask
+   gnome-keyring-daemon.service
    gnome-keyring-daemon.socket` and `systemctl --user start
    gnome-keyring-daemon.socket`.
 3. Items stored in aleph since setup stay in its vault

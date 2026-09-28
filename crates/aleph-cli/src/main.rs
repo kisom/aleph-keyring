@@ -239,7 +239,21 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             if c.status().await?.locked {
                 outcome(c.converse("Unlock", Args::None).await?)?;
             }
-            eprintln!("aleph: {}", c.import_gnome_keyring().await?);
+            let summary = c.import_gnome_keyring().await?;
+            eprintln!("aleph: {summary}");
+            if summary.contains("Not imported:") {
+                let mut term = prompter::Terminal::new();
+                let answer = ask(
+                    &mut term,
+                    "Those collections stay in gnome-keyring, out of reach once aleph takes over (until `aleph setup --revert`). Take over anyway? [y/N] ",
+                )?;
+                if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                    eprintln!(
+                        "aleph: stopped before taking over: unlock them in gnome-keyring (Seahorse), then run `aleph setup` again"
+                    );
+                    return Ok(ExitCode::SUCCESS);
+                }
+            }
             let dirs = switchover::Dirs::from_env()?;
             let mut record = switchover::Record::load(&dirs)?;
             for step in
@@ -269,9 +283,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             if matches!(answer.trim(), "" | "y" | "Y" | "yes") {
                 if let Err(e) = wizard::run_as_root(&apply) {
                     eprintln!("aleph: {e}; run `sudo aleph system apply --user {user}` later");
+                    eprintln!("aleph: {ROOT_STEP_PENDING}");
                 }
             } else {
                 eprintln!("aleph: later: `sudo aleph system apply --user {user}`");
+                eprintln!("aleph: {ROOT_STEP_PENDING}");
             }
             eprintln!("aleph: setup is done (`aleph status` shows the keyring)");
         }
@@ -506,6 +522,9 @@ async fn backup(c: &Client, path: &std::path::Path, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// What stays until the root step runs.
+const ROOT_STEP_PENDING: &str = "until then, logging in does not unlock the keyring, and the login's PAM service can still start gnome-keyring behind aleph";
+
 /// `aleph system ...`, as root (DECISIONS.md E4–E6).
 fn run_system(action: SystemCmd) -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
@@ -527,25 +546,17 @@ fn run_system(action: SystemCmd) -> Result<()> {
                 );
                 return Ok(());
             }
-            let report = system::apply(&root)?;
-            for m in &report.manual {
-                eprintln!("aleph: by hand: {m}");
-            }
-            if report.changed.is_empty() {
-                eprintln!("aleph: the PAM services were already set up");
-                return Ok(());
-            }
+            // Asked before anything changes: nothing is ever left edited
+            // and unchecked.
             let password = zeroize::Zeroizing::new(
                 rpassword::prompt_password(format!(
                     "Login password for {user} (checks the login and lock screen once): "
                 ))
                 .map_err(|e| e.to_string())?,
             );
-            if let Err(e) = system::verify(&root, &user, &password) {
-                system::roll_back(&root, &report.changed)?;
-                return Err(format!(
-                    "the check failed ({e}); the PAM changes were undone"
-                ));
+            let report = system::apply_checked(&root, &user, &password, system::verify)?;
+            for m in &report.manual {
+                eprintln!("aleph: by hand: {m}");
             }
             eprintln!("aleph: login and screen unlock now reach aleph");
         }
@@ -578,38 +589,63 @@ async fn revert(c: &Client) -> Result<()> {
                 .into(),
         );
     }
-    let removed = c.removed_since_import().await?;
-    let mut delete = false;
-    if !removed.is_empty() {
-        eprintln!(
-            "aleph: imported from gnome-keyring and deleted in aleph since: {}",
-            removed.join(", ")
-        );
-        let mut term = prompter::Terminal::new();
-        let answer = ask(&mut term, "Delete them from gnome-keyring too? [y/N] ")?;
-        delete = matches!(answer.trim(), "y" | "Y" | "yes");
+    if c.status().await?.locked {
+        outcome(c.converse("Unlock", Args::None).await?)?;
     }
-    outcome(
-        c.converse("ExportToGnomeKeyring", Args::Bool(delete))
-            .await?,
-    )?;
     let dirs = switchover::Dirs::from_env()?;
     let mut record = switchover::Record::load(&dirs)?;
-    let steps =
-        match switchover::switch_back(c.bus(), &switchover::Systemctl, &dirs, &mut record).await {
+    // A revert that stopped after switching back resumes at the release
+    // (gnome-keyring runs by then, and a second export would be refused).
+    if record.revert_phase.as_deref() != Some(switchover::SWITCHED_BACK) {
+        let removed = c.removed_since_import().await?;
+        let mut delete = false;
+        if !removed.is_empty() {
+            eprintln!(
+                "aleph: imported from gnome-keyring and deleted in aleph since: {}",
+                removed.join(", ")
+            );
+            let mut term = prompter::Terminal::new();
+            let answer = ask(&mut term, "Delete them from gnome-keyring too? [y/N] ")?;
+            delete = matches!(answer.trim(), "y" | "Y" | "yes");
+        }
+        outcome(
+            c.converse("ExportToGnomeKeyring", Args::Bool(delete))
+                .await?,
+        )?;
+        let steps = match switchover::switch_back(
+            c.bus(),
+            &switchover::Systemctl,
+            &dirs,
+            &mut record,
+        )
+        .await
+        {
             Ok(steps) => steps,
             Err(e) => {
                 let _ = c.thaw_writes().await;
                 return Err(e);
             }
         };
-    for step in steps {
-        eprintln!("aleph: {step}");
+        for step in steps {
+            eprintln!("aleph: {step}");
+        }
+        record.revert_phase = Some(switchover::SWITCHED_BACK.into());
+        if let Err(e) = record.save(&dirs) {
+            let _ = c.thaw_writes().await;
+            return Err(e);
+        }
     }
-    if let Some(hook) = wizard::remove_omarchy_hook(&dirs.config_home)? {
-        eprintln!("aleph: removed {}", hook.display());
+    match wizard::remove_omarchy_hook(&dirs.config_home) {
+        Ok(Some(hook)) => eprintln!("aleph: removed {}", hook.display()),
+        Ok(None) => {}
+        Err(e) => eprintln!("aleph: {e}"),
     }
-    c.release_secret_service().await?;
+    if let Err(e) = c.release_secret_service().await {
+        let _ = c.thaw_writes().await;
+        return Err(e);
+    }
+    record.revert_phase = None;
+    record.save(&dirs)?;
     eprintln!(
         "aleph: gnome-keyring serves the Secret Service again; the aleph vault is left in place"
     );
@@ -643,7 +679,7 @@ fn offer_lockout_auth(term: &mut prompter::Terminal) -> Result<()> {
         value.as_str()
     );
     let typed = zeroize::Zeroizing::new(term_line(term, "Type it back to confirm: ")?);
-    if typed.trim().to_uppercase() != value.as_str() {
+    if !wizard::lockout_matches(&value, &typed) {
         eprintln!(
             "aleph: that does not match; the lockout password was not set (later: {command})"
         );

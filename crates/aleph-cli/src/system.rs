@@ -320,6 +320,9 @@ pub struct Report {
 pub fn apply(root: &Root) -> Result<Report> {
     let mut manifest = Manifest::load(root)?;
     let mut report = Report::default();
+    // Every transformation first: a service that cannot be transformed (its
+    // anchor gone) is left for the user, and nothing half-done is written.
+    let mut plans = Vec::new();
     for service in Service::ALL {
         let path = root.pam_dir.join(service.file());
         if !path.exists() && std::fs::symlink_metadata(&path).is_err() {
@@ -331,46 +334,99 @@ pub fn apply(root: &Root) -> Result<Report> {
                 .push(format!("{why}: {}", manual_lines(service)));
             continue;
         }
-        let original =
+        let current =
             std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let edit = transform(service, &original)?;
-        if edit.text == original {
-            // (Already applied, by an earlier run or by hand: recorded so
-            // revert can take the lines out again.)
-            manifest
-                .files
-                .entry(service.file().to_string())
-                .or_insert(Applied {
-                    applied: original,
-                    removed: Vec::new(),
-                    backup: false,
-                });
+        match transform(service, &current) {
+            Ok(edit) => plans.push((service, path, current, edit)),
+            Err(e) => report.manual.push(e),
+        }
+    }
+    for (service, path, current, edit) in plans {
+        let name = service.file().to_string();
+        let backup = root.backup(service);
+        let known = manifest.files.get(&name).cloned();
+        if edit.text == current {
+            // Already applied: by an earlier run, by a run cut short before
+            // its manifest (then the backup holds the original), or by hand.
+            if known.is_none() {
+                let (has_backup, removed) = match std::fs::read_to_string(&backup) {
+                    Ok(original) => (
+                        true,
+                        transform(service, &original)
+                            .map(|e| e.removed)
+                            .unwrap_or_default(),
+                    ),
+                    Err(_) => (false, Vec::new()),
+                };
+                manifest.files.insert(
+                    name,
+                    Applied {
+                        applied: current,
+                        removed,
+                        backup: has_backup,
+                    },
+                );
+                manifest.save(root)?;
+            }
             continue;
         }
         let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
         let mode = meta.mode() & 0o7777;
         let owner = Some((meta.uid(), meta.gid()));
-        let backup = root.backup(service);
-        if !backup.exists() {
-            write_atomic(&backup, original.as_bytes(), mode, owner)?;
+        // With no record of this file, a backup lying there is stale: the
+        // backup is the file as it is now.
+        if known.is_none() || !backup.exists() {
+            write_atomic(&backup, current.as_bytes(), mode, owner)?;
         }
-        write_atomic(&path, edit.text.as_bytes(), mode, owner)?;
-        let removed = match manifest.files.get(service.file()) {
+        let removed = match known {
             // (A re-run keeps what the first run removed.)
-            Some(prev) if edit.removed.is_empty() => prev.removed.clone(),
+            Some(prev) if edit.removed.is_empty() => prev.removed,
             _ => edit.removed,
         };
+        // Recorded before the file is replaced: a crash in between leaves a
+        // record revert can work from.
         manifest.files.insert(
-            service.file().to_string(),
+            name,
             Applied {
-                applied: edit.text,
+                applied: edit.text.clone(),
                 removed,
                 backup: true,
             },
         );
+        manifest.save(root)?;
+        write_atomic(&path, edit.text.as_bytes(), mode, owner)?;
         report.changed.push(service);
     }
-    manifest.save(root)?;
+    Ok(report)
+}
+
+/// Apply, then check the login and lock screen with `check` (real
+/// Linux-PAM: [`verify`]) whenever anything is recorded, a re-run after an
+/// interrupted check included; a failure puts every recorded file back from
+/// its backup.
+pub fn apply_checked(
+    root: &Root,
+    user: &str,
+    password: &str,
+    check: impl Fn(&Root, &str, &str) -> Result<()>,
+) -> Result<Report> {
+    let report = apply(root)?;
+    let manifest = Manifest::load(root)?;
+    if manifest.files.is_empty() {
+        return Ok(report);
+    }
+    if let Err(e) = check(root, user, password) {
+        let recorded: Vec<Service> = manifest
+            .files
+            .iter()
+            .filter(|(_, a)| a.backup)
+            .filter_map(|(name, _)| Service::from_file(name))
+            .collect();
+        roll_back(root, &recorded)?;
+        return Err(format!(
+            "the check failed ({e}); the PAM changes were undone"
+        ));
+    }
     Ok(report)
 }
 
@@ -443,6 +499,9 @@ pub fn revert(root: &Root) -> Result<Vec<String>> {
                 path.display()
             ));
         } else {
+            // (Its backup is stale now: a later apply must not bring it
+            // back.)
+            let _ = std::fs::remove_file(&backup);
             done.push(format!(
                 "{}: changed since setup and left alone; {}",
                 path.display(),
@@ -756,6 +815,105 @@ mod tests {
             assert!(!root.backup(service).exists());
         }
         assert!(!root.manifest_path().exists());
+    }
+
+    /// One service that cannot be transformed (its anchor is gone) is left
+    /// for the user; the others are still applied and recorded, so revert
+    /// undoes them.
+    #[test]
+    fn a_service_without_its_anchor_is_manual_and_the_rest_recorded() {
+        let (_dir, root) = tree();
+        std::fs::write(
+            root.pam_dir.join("passwd"),
+            "#%PAM-1.0\npassword required pam_unix.so\n",
+        )
+        .unwrap();
+        let report = apply(&root).unwrap();
+        assert_eq!(report.changed.len(), 3);
+        assert!(
+            report.manual.iter().any(|m| m.contains("passwd")),
+            "{:?}",
+            report.manual
+        );
+        revert(&root).unwrap();
+        for service in [Service::Sddm, Service::SddmAutologin, Service::LockPassword] {
+            assert_eq!(
+                std::fs::read_to_string(root.pam_dir.join(service.file())).unwrap(),
+                fixture("omarchy", service.file())
+            );
+        }
+    }
+
+    /// A crash after the files were written but before the manifest: a
+    /// re-run trusts the backup (the original), and revert restores it.
+    #[test]
+    fn a_crash_before_the_manifest_keeps_the_original() {
+        let (_dir, root) = tree();
+        apply(&root).unwrap();
+        std::fs::remove_file(root.manifest_path()).unwrap();
+        apply(&root).unwrap();
+        revert(&root).unwrap();
+        for service in Service::ALL {
+            assert_eq!(
+                std::fs::read_to_string(root.pam_dir.join(service.file())).unwrap(),
+                fixture("omarchy", service.file()),
+                "{service:?}"
+            );
+        }
+    }
+
+    /// A backup left from long ago (no manifest entry) is not trusted: the
+    /// backup is the file as it is now.
+    #[test]
+    fn a_stale_backup_is_replaced_by_the_current_file() {
+        let (_dir, root) = tree();
+        let passwd = root.pam_dir.join("passwd");
+        std::fs::write(root.backup(Service::Passwd), "#%PAM-1.0\nold\n").unwrap();
+        let mut current = fixture("omarchy", "passwd");
+        current.push_str("auth required pam_u2f.so\n");
+        std::fs::write(&passwd, &current).unwrap();
+        apply(&root).unwrap();
+        revert(&root).unwrap();
+        assert_eq!(std::fs::read_to_string(&passwd).unwrap(), current);
+    }
+
+    /// A file revert leaves alone loses its backup too (it is stale now).
+    #[test]
+    fn a_file_left_alone_by_revert_loses_its_backup() {
+        let (_dir, root) = tree();
+        apply(&root).unwrap();
+        let sddm = root.pam_dir.join("sddm");
+        std::fs::write(
+            &sddm,
+            "#%PAM-1.0\nauth required pam_deny.so\n-auth      optional  pam_aleph.so\n",
+        )
+        .unwrap();
+        revert(&root).unwrap();
+        assert!(!root.backup(Service::Sddm).exists());
+    }
+
+    /// The check runs whenever something is recorded (a re-run after an
+    /// interrupted check too), and a failure puts every recorded file back.
+    #[test]
+    fn a_checked_apply_rolls_back_on_failure_even_on_a_rerun() {
+        let (_dir, root) = tree();
+        let fail = |_: &Root, _: &str, _: &str| -> Result<()> { Err("no".into()) };
+        let pass = |_: &Root, _: &str, _: &str| -> Result<()> { Ok(()) };
+        // First run: applied, then the check is interrupted (not run).
+        apply(&root).unwrap();
+        let err = apply_checked(&root, "u", "pw", fail).unwrap_err();
+        assert!(err.contains("undone"), "{err}");
+        for service in Service::ALL {
+            assert_eq!(
+                std::fs::read_to_string(root.pam_dir.join(service.file())).unwrap(),
+                fixture("omarchy", service.file())
+            );
+        }
+        apply_checked(&root, "u", "pw", pass).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.pam_dir.join("passwd")).unwrap(),
+            fixture("omarchy-applied", "passwd")
+        );
     }
 
     /// A symlinked service is left for the user, with the lines to add.

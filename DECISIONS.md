@@ -9,6 +9,56 @@ made directly are marked as such.
 
 ## 2026-09-27: Plan 4c (setup), design
 
+### G3. The pre-execution review of the Plan 4c document: fixes adopted
+
+No path was found where the PAM edits make a correct password fail or a
+wrong one pass. The safety net around them, and revert, had gaps; each
+fixed with a test that failed first:
+- **A service that cannot be transformed** stopped `apply` part way, with
+  edits unrecorded. Every transformation is computed first (a missing
+  anchor is manual mode), and each manifest entry is saved before its
+  file is replaced.
+- **A crash before the manifest** lost the original on a re-run; a re-run
+  now trusts the backup. **A stale backup** (no manifest entry) could
+  later bring back an old file; it is rewritten from the current file,
+  and revert drops the backup of a file it leaves alone.
+- **An interrupted password prompt skipped the check for good.** The
+  password is asked before anything changes, and the check runs whenever
+  anything is recorded; a failure rolls back everything recorded.
+- **Revert deleted items aleph still held** (deleted and stored again), or
+  let gnome-keyring's replace (attributes only) take an item with another
+  label. Deletions come first and skip what aleph holds; a differing item
+  is updated in place; new items never replace.
+- **A revert that stopped after switching back got stuck** with writes
+  paused; it records its phase and resumes at the release, and writes
+  resume on every failure.
+- **alephd could take the Secret Service back after a revert** (started by
+  `pam.sock` with `pam_aleph` still in place): it claims the name only
+  while setup's activation file exists; setup asks it to claim once it
+  has written the file (`ClaimSecretService`).
+- **Skipping the root step** leaves sddm's `pam_gnome_keyring auto_start`,
+  which can start gnome-keyring behind alephd: setup says so, and the
+  hardware checklist checks it.
+- **A locked gnome-keyring collection** would be stranded by the
+  switchover: setup stops before it unless the user says to go on.
+
+Minor fixes adopted: gnome-keyring's updates to imported items are
+followed until the switchover; item signals are taken before the name
+change; the write freeze is checked under the keyring's lock; a failing
+`systemctl` is an error, never a recorded "not-found" (the CLI tests use
+a stand-in script); private and test buses have no service directories
+(no real prompter can start); sudo is `/usr/bin/sudo`, and the
+user-writable-binary warning comes before it; revert unlocks a locked
+vault first; the lockout value may be typed without dashes; the emergency
+manual revert no longer claims a missing backup means an unchanged file,
+and reloads the bus.
+
+Rulings on the rest: revert says what to remove rather than showing a
+diff (E4's "diff"); on NixOS the user-level unit masking still happens
+(it works there; E6 said it would be skipped); the lock screen, which
+runs as the user, is checked by hand (the root-side check runs as root).
+
+
 ### G2. Calls made while prototyping Plan 4c
 
 Each to be weighed by the plan's reviewers:

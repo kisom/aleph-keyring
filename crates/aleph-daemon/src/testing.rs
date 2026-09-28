@@ -308,6 +308,7 @@ impl Launcher for InteractiveLauncher {
 pub struct Bus {
     child: std::process::Child,
     pub address: String,
+    _config: tempfile::TempDir,
 }
 
 impl Drop for Bus {
@@ -318,8 +319,14 @@ impl Drop for Bus {
 }
 
 pub fn bus() -> Bus {
+    // (No service directories: nothing, a real prompter included, is ever
+    // started on a test bus.)
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bus.conf");
+    std::fs::write(&config, crate::export::PRIVATE_BUS_CONFIG).unwrap();
     let mut child = std::process::Command::new("dbus-daemon")
-        .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
+        .arg(format!("--config-file={}", config.display()))
+        .args(["--nofork", "--nopidfile", "--print-address=1"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -333,6 +340,7 @@ pub fn bus() -> Bus {
     Bus {
         child,
         address: line.trim().to_string(),
+        _config: dir,
     }
 }
 

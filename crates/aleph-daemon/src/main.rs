@@ -61,8 +61,22 @@ async fn run() -> Result<(), String> {
         aleph_daemon::daemon::serve(&conn, keyring.clone(), launcher, config.clone(), paths)
             .await
             .map_err(|e| e.to_string())?;
-    // Queued behind gnome-keyring until it lets go (DECISIONS.md E1).
-    match aleph_daemon::daemon::request_secrets_name(&conn).await {
+    // Queued behind gnome-keyring until it lets go (DECISIONS.md E1), and
+    // only while setup's activation file is in place: before setup (which
+    // claims it through the admin interface) and after a revert, the
+    // Secret Service is gnome-keyring's.
+    let claim = activation.as_ref().is_some_and(|a| a.exists());
+    if !claim {
+        tracing::info!(
+            "serving {BUS_NAME}; not claiming {SECRETS_NAME} (aleph setup has not switched over)"
+        );
+    }
+    match if claim {
+        aleph_daemon::daemon::request_secrets_name(&conn).await
+    } else {
+        Ok(true)
+    } {
+        Ok(true) if !claim => {}
         Ok(true) => tracing::info!("serving {SECRETS_NAME} and {BUS_NAME}"),
         // After setup switched over, nothing else should hold it.
         Ok(false) if activation.as_ref().is_some_and(|a| a.exists()) => {

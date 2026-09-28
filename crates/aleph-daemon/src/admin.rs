@@ -242,6 +242,17 @@ impl Admin {
         })
     }
 
+    /// Queue for `org.freedesktop.secrets` (setup calls it once its
+    /// activation file is in place). Returns whether alephd owns it now.
+    async fn claim_secret_service(
+        &self,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<bool> {
+        crate::daemon::request_secrets_name(conn)
+            .await
+            .map_err(failed)
+    }
+
     /// Let go of `org.freedesktop.secrets` (the end of a revert: the bus
     /// hands it to gnome-keyring, queued behind).
     async fn release_secret_service(

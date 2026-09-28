@@ -8,9 +8,20 @@ use aleph_daemon::testing::*;
 
 fn aleph(d: &Daemon, args: &[&str]) -> Command {
     // Never the real home, user manager, or sudo: setup writes activation
-    // files, runs systemctl (`false`: no unit exists, and any change
+    // files, runs systemctl (a stand-in: no unit exists, and any change
     // fails), and offers the root side through sudo (`false`: it fails).
     let home = d.env.paths.data_dir.parent().unwrap().join("home");
+    let systemctl = home.join("systemctl");
+    if !systemctl.exists() {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            &systemctl,
+            "#!/bin/sh\ncase \"$2\" in\n  is-enabled) echo not-found ;;\n  is-active) echo inactive ;;\n  *) exit 1 ;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aleph"));
     cmd.args(args)
         .env("DBUS_SESSION_BUS_ADDRESS", &d.bus.address)
@@ -18,7 +29,7 @@ fn aleph(d: &Daemon, args: &[&str]) -> Command {
         .env("XDG_DATA_HOME", home.join("data"))
         .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("ALEPH_SYSTEMCTL", "false")
+        .env("ALEPH_SYSTEMCTL", &systemctl)
         .env("ALEPH_SUDO", "false")
         .env("ALEPH_NO_TTY", "1")
         .stdin(Stdio::piped())
@@ -417,4 +428,58 @@ async fn setup_revert_hands_everything_back() {
         .deserialize()
         .unwrap();
     assert_eq!(found.len(), 1);
+}
+
+/// A revert that stopped after switching back (a Ctrl-C, a failed
+/// release) resumes at the release on a re-run: no second export.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revert_rerun_after_switching_back_goes_straight_to_the_release() {
+    let d = daemon(true, vec![]).await;
+    let home = d.env.paths.data_dir.parent().unwrap().join("home");
+    std::fs::create_dir_all(home.join("state/aleph")).unwrap();
+    std::fs::write(
+        home.join("state/aleph/setup.json"),
+        r#"{"units":{},"revert_phase":"switched-back"}"#,
+    )
+    .unwrap();
+    let (ok, _, err) = run(&d, &["setup", "--revert"], "").await;
+    assert!(ok, "{err}");
+    assert!(!err.contains("Copied"), "{err}");
+    assert!(
+        err.contains("gnome-keyring serves the Secret Service again"),
+        "{err}"
+    );
+}
+
+/// A gnome-keyring collection that stayed locked stops setup before the
+/// switchover (its items would be out of reach afterwards), unless the
+/// user says to go on.
+#[tokio::test(flavor = "multi_thread")]
+async fn skipped_collections_stop_setup_before_the_switchover() {
+    let bus = bus();
+    let gk = GnomeKeyring::start(&bus, "login password");
+    gk.store("Mail", &[("service", "mail")], "s3cret");
+    let c = zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    c.call_method(
+        Some("org.freedesktop.secrets"),
+        "/org/freedesktop/secrets",
+        Some("org.freedesktop.Secret.Service"),
+        "Lock",
+        &(vec![
+            zbus::zvariant::ObjectPath::try_from("/org/freedesktop/secrets/collection/login")
+                .unwrap(),
+        ],),
+    )
+    .await
+    .unwrap();
+    let d = daemon_on(bus, true).await;
+    let (ok, _, err) = run(&d, &["setup"], "").await;
+    assert!(ok, "{err}");
+    assert!(err.contains("Not imported"), "{err}");
+    assert!(!err.contains("alephd serves the Secret Service"), "{err}");
+    drop(gk);
 }

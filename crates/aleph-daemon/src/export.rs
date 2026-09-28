@@ -54,6 +54,22 @@ pub async fn gnome_keyring_active(session: &Connection) -> bool {
         || owner(SECRETS_NAME).await.is_some_and(|o| Some(o) != me)
 }
 
+/// A private session bus's configuration: no service directories, so
+/// nothing (a prompter, a second gnome-keyring) is ever started on it.
+pub const PRIVATE_BUS_CONFIG: &str = r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:tmpdir=/tmp</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+"#;
+
 /// A gnome-keyring (secrets component) alephd runs itself on a private
 /// bus, over the keyring files in `data_home`; killed on drop.
 pub struct Private {
@@ -74,8 +90,11 @@ impl Private {
         std::fs::create_dir_all(&run).map_err(gk)?;
         std::fs::set_permissions(&run, std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .map_err(gk)?;
+        let config = dirs.path().join("bus.conf");
+        std::fs::write(&config, PRIVATE_BUS_CONFIG).map_err(gk)?;
         let mut bus = std::process::Command::new("dbus-daemon")
-            .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
+            .arg(format!("--config-file={}", config.display()))
+            .args(["--nofork", "--nopidfile", "--print-address=1"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -316,6 +335,37 @@ pub async fn export(
         }
     };
     let mut report = Report::default();
+    // Deletions first, and never of an item aleph still holds (one deleted
+    // and stored again with the same label and attributes).
+    let held = |label: &str, attributes: &BTreeMap<String, String>| {
+        body.collections.iter().any(|c| {
+            c.items
+                .iter()
+                .any(|i| i.label == label && i.attributes == *attributes)
+        })
+    };
+    for d in delete {
+        if held(&d.label, &d.attributes) {
+            continue;
+        }
+        let target = if d.is_default {
+            default.clone()
+        } else {
+            by_label
+                .get(&d.collection)
+                .cloned()
+                .unwrap_or(default.clone())
+        };
+        for (path, _) in remote.find(&target, &d.attributes, &d.label).await? {
+            let _: OwnedObjectPath = remote
+                .proxy(path.as_str(), ITEM)
+                .await?
+                .call("Delete", &())
+                .await
+                .map_err(gk)?;
+            report.deleted += 1;
+        }
+    }
     let mut written = Vec::new();
     for collection in &body.collections {
         for item in &collection.items {
@@ -323,6 +373,28 @@ pub async fn export(
             let found = remote.find(&target, &item.attributes, &item.label).await?;
             if found.iter().any(|(_, s)| s == item.secret.expose()) {
                 report.unchanged += 1;
+                continue;
+            }
+            // The same item there with another secret: updated in place
+            // (gnome-keyring's own replace matches attributes only, and
+            // would take an item with another label).
+            if let Some((path, _)) = found.first() {
+                let (parameters, value) =
+                    remote.session.encrypt(item.secret.expose()).map_err(gk)?;
+                let secret = (
+                    remote.session_path.clone(),
+                    parameters,
+                    value,
+                    item.content_type.clone(),
+                );
+                remote
+                    .proxy(path.as_str(), ITEM)
+                    .await?
+                    .call_method("SetSecret", &(secret,))
+                    .await
+                    .map_err(gk)?;
+                report.exported += 1;
+                written.push((target, item));
                 continue;
             }
             let (parameters, value) = remote.session.encrypt(item.secret.expose()).map_err(gk)?;
@@ -350,7 +422,7 @@ pub async fn export(
             let (_, prompt): (OwnedObjectPath, OwnedObjectPath) = remote
                 .proxy(target.as_str(), COLLECTION)
                 .await?
-                .call("CreateItem", &(properties, secret, true))
+                .call("CreateItem", &(properties, secret, false))
                 .await
                 .map_err(gk)?;
             if prompt.as_str() != "/" {
@@ -358,25 +430,6 @@ pub async fn export(
             }
             report.exported += 1;
             written.push((target, item));
-        }
-    }
-    for d in delete {
-        let target = if d.is_default {
-            default.clone()
-        } else {
-            by_label
-                .get(&d.collection)
-                .cloned()
-                .unwrap_or(default.clone())
-        };
-        for (path, _) in remote.find(&target, &d.attributes, &d.label).await? {
-            let _: OwnedObjectPath = remote
-                .proxy(path.as_str(), ITEM)
-                .await?
-                .call("Delete", &())
-                .await
-                .map_err(gk)?;
-            report.deleted += 1;
         }
     }
     // Read everything written back, on a fresh connection and session.
@@ -390,7 +443,7 @@ pub async fn export(
         let found = check.find(&target, &item.attributes, &item.label).await?;
         if !found.iter().any(|(_, s)| s == item.secret.expose()) {
             return Err(Error::Invalid(format!(
-                "copying to gnome-keyring could not be verified ({}); nothing else was changed",
+                "copying to gnome-keyring could not be verified ({}); the session was not handed over",
                 item.label
             )));
         }

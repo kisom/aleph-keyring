@@ -296,10 +296,11 @@ impl Keyring {
     /// Change the body and write the vault. If `f` or the write fails, the
     /// in-memory body is restored, so memory never runs ahead of the file.
     pub fn modify<T>(&self, f: impl FnOnce(&mut Body) -> Result<T>) -> Result<T> {
+        let mut inner = lock(&self.inner);
+        // (Under the lock: no write slips past an export's snapshot.)
         if self.frozen.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(Error::Frozen);
         }
-        let mut inner = lock(&self.inner);
         *lock(&self.last_access) = Instant::now();
         let Inner {
             store,
@@ -396,9 +397,14 @@ impl Keyring {
                 return Err(Error::Locked);
             }
             let password = self.ask_password(chan)?;
-            self.frozen.store(true, std::sync::atomic::Ordering::SeqCst);
-            let result = self
-                .read(|b| b.clone())
+            // The freeze and the snapshot under one lock.
+            let body = {
+                let inner = lock(&self.inner);
+                self.frozen.store(true, std::sync::atomic::Ordering::SeqCst);
+                inner.vault.as_ref().map(|v| v.body().clone())
+            };
+            let result = body
+                .ok_or(Error::Locked)
                 .and_then(|body| run(&password, body));
             if result.is_err() {
                 self.thaw();

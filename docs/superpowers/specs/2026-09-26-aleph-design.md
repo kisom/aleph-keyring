@@ -680,8 +680,12 @@ data.
   `org.freedesktop.secrets` without `ReplaceExisting` or
   `AllowReplacement`, so while gnome-keyring runs alephd waits in the
   queue, and the bus hands the name over the moment gnome-keyring lets go
-  (the name is never unowned). `aleph status` says who serves it. After
-  setup switched over, a queued alephd logs a warning.
+  (the name is never unowned). alephd claims it only while setup's
+  activation file exists (setup asks the running alephd to claim it once
+  it has written that file): before setup, and after a revert, the Secret
+  Service stays gnome-keyring's even if `pam.sock` starts alephd.
+  `aleph status` says who serves it. After setup switched over, a queued
+  alephd logs a warning.
 - `aleph setup` (Arch/Omarchy), each step checking the real state, so a
   re-run does only what is still undone (E10):
   1. reports the TPM (§5) and detects SDDM autologin (E5: advisory; it
@@ -700,7 +704,12 @@ data.
      lockoutAuth (D9)
   6. last and optional, the root side through sudo: `sudo aleph system
      apply --user <you>` (below); declined or failed, setup says how to
-     run it later
+     run it later, and that until then logging in does not unlock the
+     keyring and the login's PAM service can still start gnome-keyring
+
+  A gnome-keyring collection that stayed locked (its unlock dismissed)
+  stops setup before step 4, unless the user says to go on: its items
+  would be out of reach once aleph takes over.
 - `aleph setup --revert` (E3), refused if gnome-keyring is not installed:
   1. lists items imported from gnome-keyring and deleted in aleph since,
      offering to delete them there too
@@ -715,8 +724,11 @@ data.
      the bus hands to gnome-keyring
   4. last, `sudo aleph system revert`
 
-  If the export fails, nothing changes and writes resume. The aleph vault
-  is left in place.
+  If the export fails, nothing changes and writes resume. A revert that
+  stops after step 3's switch back resumes at the release on a re-run.
+  Items deleted in aleph since the import are deleted in gnome-keyring
+  only if aleph holds no item with the same label and attributes (one
+  deleted and stored again). The aleph vault is left in place.
 
 ### PAM integration
 
@@ -958,9 +970,14 @@ aleph restore [--from-bak | --accept-rollback] [<path>]
   what to add; E6), then authenticates `<you>` through the edited
   lock-screen and login stacks with real Linux-PAM, the password asked
   once; a failure restores the originals at once. What it did is recorded
-  in `/var/lib/aleph/manifest.json`. `revert` restores each file byte for
-  byte if it is still what `apply` wrote, else takes aleph's lines out if
-  that applies cleanly, else leaves it and says what to remove. It reads
+  in `/var/lib/aleph/manifest.json`, each entry saved before its file is
+  replaced. The login password is asked before anything changes, and the
+  check runs whenever anything is recorded (a re-run after an interrupted
+  check too). `revert` restores each file byte for byte if it is still
+  what `apply` wrote, else takes aleph's lines out if that applies
+  cleanly, else leaves it (dropping its backup) and says what to remove.
+  A backup without a manifest entry is not trusted: it is rewritten from
+  the file as it is. It reads
   no user configuration or D-Bus, and warns if its own binary is not
   root-owned and root-only-writable. On NixOS it prints the configuration
   to add instead.

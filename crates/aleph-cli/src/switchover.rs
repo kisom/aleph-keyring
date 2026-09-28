@@ -66,13 +66,24 @@ impl Systemctl {
         std::env::var_os("ALEPH_SYSTEMCTL").unwrap_or_else(|| "systemctl".into())
     }
 
+    /// A query's answer. (`is-enabled` and `is-active` exit non-zero for
+    /// "disabled" or "inactive": their output is what counts; no output is
+    /// a failure, never a state to record.)
     fn run(args: &[&str]) -> Result<String> {
         let out = std::process::Command::new(Self::program())
             .arg("--user")
             .args(args)
             .output()
             .map_err(|e| format!("systemctl: {e}"))?;
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        let answer = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if answer.is_empty() {
+            return Err(format!(
+                "systemctl --user {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(answer)
     }
 
     fn checked(args: &[&str]) -> Result<()> {
@@ -95,17 +106,9 @@ impl Systemctl {
 
 impl Units for Systemctl {
     fn state(&self, unit: &str) -> Result<UnitState> {
-        // (Both commands exit non-zero for "disabled" or "inactive": their
-        // output is what counts.)
-        let enabled = Self::run(&["is-enabled", unit])?;
-        let active = Self::run(&["is-active", unit])? == "active";
         Ok(UnitState {
-            enabled: if enabled.is_empty() {
-                "not-found".into()
-            } else {
-                enabled
-            },
-            active,
+            enabled: Self::run(&["is-enabled", unit])?,
+            active: Self::run(&["is-active", unit])? == "active",
         })
     }
 
@@ -174,7 +177,14 @@ pub struct Record {
     /// gnome-keyring's units as they were before setup first changed them.
     #[serde(default)]
     pub units: BTreeMap<String, UnitState>,
+    /// How far an unfinished revert got ([`SWITCHED_BACK`]: only the
+    /// release is left).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revert_phase: Option<String>,
 }
+
+/// A revert's phase once gnome-keyring's routes are restored.
+pub const SWITCHED_BACK: &str = "switched-back";
 
 impl Record {
     pub fn load(dirs: &Dirs) -> Result<Self> {
@@ -243,6 +253,17 @@ pub async fn switch_over(
             services.display()
         ));
     }
+    // The running alephd queues for the name now (it claims it at start
+    // only while this activation file exists).
+    bus.call_method(
+        Some(ALEPH_NAME),
+        "/io/aleph/Admin",
+        Some("io.aleph.Admin1"),
+        "ClaimSecretService",
+        &(),
+    )
+    .await
+    .map_err(|e| format!("asking alephd to queue for the Secret Service: {e}"))?;
     let mut states = Vec::new();
     for unit in GNOME_UNITS {
         states.push((unit, units.state(unit)?));

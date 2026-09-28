@@ -103,12 +103,16 @@ pub fn remove_omarchy_hook(config_home: &Path) -> Result<Option<PathBuf>> {
 /// The program that runs the root side (`sudo`; `ALEPH_SUDO` names another,
 /// for tests, which must never run the real one).
 fn sudo() -> std::ffi::OsString {
-    std::env::var_os("ALEPH_SUDO").unwrap_or_else(|| "sudo".into())
+    std::env::var_os("ALEPH_SUDO").unwrap_or_else(|| "/usr/bin/sudo".into())
 }
 
 /// Run `args` as root through sudo, on the terminal (sudo asks for the
 /// password there).
 pub fn run_as_root(args: &[&str]) -> Result<()> {
+    // Before sudo: running a user-writable binary as root trusts its writer.
+    if let Some(w) = crate::system::writable_binary_warning() {
+        eprintln!("aleph: {w}");
+    }
     let status = std::process::Command::new(sudo())
         .args(args)
         .status()
@@ -138,6 +142,17 @@ pub fn lockout_value() -> Result<String> {
         .map(|c| c.iter().collect::<String>())
         .collect::<Vec<_>>()
         .join("-"))
+}
+
+/// Whether `typed` is the lockout value, however it was grouped or cased.
+pub fn lockout_matches(value: &str, typed: &str) -> bool {
+    let norm = |s: &str| {
+        s.chars()
+            .filter(|c| !c.is_whitespace() && *c != '-')
+            .map(|c| c.to_ascii_uppercase())
+            .collect::<String>()
+    };
+    !typed.trim().is_empty() && norm(value) == norm(typed)
 }
 
 /// The command that sets lockoutAuth, reading the value on standard input
@@ -217,6 +232,14 @@ mod tests {
         std::fs::write(&path, OMARCHY_HOOK).unwrap();
         assert_eq!(remove_omarchy_hook(dir.path()).unwrap(), Some(path.clone()));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_lockout_value_matches_however_it_is_typed() {
+        let v = "ABCD-EFGH-2345";
+        assert!(lockout_matches(v, "abcd efgh 2345"));
+        assert!(lockout_matches(v, "ABCDEFGH2345"));
+        assert!(!lockout_matches(v, "ABCDEFGH2346"));
     }
 
     #[test]
