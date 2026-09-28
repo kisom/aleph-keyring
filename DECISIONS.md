@@ -38,7 +38,10 @@ Adopted, each with a test that failed without it:
 - **The list and the detail share the width by a proportion,** evenly at
   first: the divider drags (each keeps at least 140 px: a higher floor for the detail stopped
   the divider at once at half a screen),
-  and the share it leaves holds when the window is retiled. A fixed
+  and the share it leaves holds when the window is retiled. The list's
+  rows are cut to its width (the full label is in the detail): an egui
+  panel grows to fit wider contents, so long labels held the list at its
+  widest and the divider could not move. A fixed
   280 px list left the detail too narrow at half a screen (Hyprland's
   side-by-side tiling).
 - **Both windows run without vsync:** Mesa's Wayland swap waits for a

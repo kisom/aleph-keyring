@@ -779,6 +779,46 @@ fn drag_divider(h: &mut Window, dx: f32) {
     frames(h);
 }
 
+/// A vault like a real one: many items, some with long labels (the list
+/// scrolls, and its rows are wider than it).
+fn crowded() -> Vault {
+    let items = (0..40)
+        .map(|i| {
+            item(
+                &format!("/c/login/{i}"),
+                &format!("Password for 'proton-sso-account-{i}' on 'account.proton.me'"),
+                &[("service", "proton")],
+            )
+        })
+        .collect();
+    Vault::Unlocked(vec![Collection {
+        path: "/c/login".into(),
+        label: "Login".into(),
+        is_default: true,
+        items,
+    }])
+}
+
+/// With a real vault's list, the divider drags both ways.
+#[test]
+fn the_divider_drags_with_a_crowded_list() {
+    let (mut h, _, _) = window_sized(ThemeChoice::Neon, crowded(), [620.0, 560.0]);
+    frames(&mut h);
+    let start = list_edge(&h);
+    drag_divider(&mut h, 60.0);
+    let wider = list_edge(&h);
+    assert!(
+        wider > start + 40.0,
+        "right: the list ended at {start}, now {wider}"
+    );
+    drag_divider(&mut h, -120.0);
+    let narrower = list_edge(&h);
+    assert!(
+        narrower < wider - 80.0,
+        "left: the list ended at {wider}, now {narrower}"
+    );
+}
+
 /// At half a screen the divider drags right too (a long label wants a
 /// wider list): the detail's floor must not stop it at once.
 #[test]
@@ -828,6 +868,11 @@ fn snapshots() {
                 failures.push(e.to_string());
             }
         };
+        // Half a screen, with a real vault's list: rows cut to the list.
+        let (mut h, _, _) = window_sized(theme, crowded(), [620.0, 560.0]);
+        h.get_by_label_contains("proton-sso-account-3'").click();
+        frames(&mut h);
+        shot(&mut h, "crowded");
         let (mut h, store, _) = window(theme, vault());
         shot(&mut h, "empty");
         h.get_by_label("GitHub token").click();

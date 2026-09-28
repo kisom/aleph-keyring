@@ -553,8 +553,13 @@ impl<S: Store, B: Backend> Manager<S, B> {
                             shown(&c.label, NAME)
                         };
                         let picked = self.selected == Some(Selection::Collection(c.path.clone()));
+                        // (Rows are cut to the list's width: a panel grows to
+                        // fit what is wider, and the divider could not move.)
                         if ui
-                            .selectable_label(picked, RichText::new(title).strong())
+                            .add(
+                                Button::selectable(picked, RichText::new(title).strong())
+                                    .truncate(),
+                            )
                             .clicked()
                         {
                             clicked = Some(Selection::Collection(c.path.clone()));
@@ -564,7 +569,10 @@ impl<S: Store, B: Backend> Manager<S, B> {
                             ui.horizontal(|ui| {
                                 ui.add_space(14.0);
                                 if ui
-                                    .selectable_label(picked, shown(&it.label, NAME))
+                                    .add(
+                                        Button::selectable(picked, shown(&it.label, NAME))
+                                            .truncate(),
+                                    )
                                     .clicked()
                                 {
                                     clicked = Some(Selection::Item(it.path.clone()));
