@@ -29,7 +29,7 @@ Every task was prototyped, then replayed from this document on a fresh clone: re
 - **The root side** edits `sddm`, `sddm-autologin`, `omarchy-lock-password`, and `passwd` (never `system-login`, `system-auth`, `login`), refuses symlinks, non-regular files, and files not owned by root (manual mode), checks the lock-screen and login stacks with a real login (never `passwd`), and rolls back on failure. On NixOS it prints what to add.
 - **The wizard:** an unanswered question takes its default; the root step defaults to yes and a declined or failed sudo does not fail setup; with autologin the default unlock method is a security key. Autologin detection reads every file in SDDM's directories (E5).
 - **`aleph export gnome-keyring` is not a command:** export happens only inside `setup --revert`.
-- **Tests never reach the real system:** `ALEPH_SYSTEMCTL` and `ALEPH_SUDO` name stand-ins (`false` in the CLI tests), and the CLI tests run with their own home and XDG directories; the PAM check tests use stub stacks (never `pam_aleph`, which could reach a real daemon).
+- **Tests never reach the real system:** `ALEPH_SYSTEMCTL` and `ALEPH_SUDO` name stand-ins (a script that knows no unit, and `false`, in the CLI tests), and the CLI tests run with their own home and XDG directories; the PAM check tests use stub stacks (never `pam_aleph`, which could reach a real daemon).
 
 ## Global Constraints
 
@@ -44,11 +44,11 @@ Every task was prototyped, then replayed from this document on a fresh clone: re
 
 ## Review Focus
 
-1. **A setup or revert interrupted at any step** (a crash, a failed sudo, gnome-keyring started outside systemd, a user who says no) must leave a working Secret Service and a login that works, and a re-run must finish the job. → Task 2 `gnome_keyring_hands_over_and_a_rerun_changes_nothing`, `a_gnome_keyring_outside_systemd_is_reported`, `a_login_keyring_that_does_not_unlock_changes_nothing`; Task 4 `setup_creates_the_keyring_and_status_shows_it` (a failed sudo, a second run).
-2. **A PAM edit that would lock the user out** must never stay: the edited stacks are checked with a real login and rolled back, the TTY path is never touched, and revert restores exactly what was there. → Task 3 `the_transformed_stacks_run_through_real_pam`, `apply_then_revert_restores_every_file_exactly`, `revert_after_an_edit_keeps_the_edit_or_leaves_the_file`, `a_symlinked_service_is_manual`. The check-and-roll-back path in `aleph system apply` runs only as root (hardware checklist).
-3. **Nothing is lost moving between keyrings:** items stored in gnome-keyring during the import, items stored in aleph after setup, conflicting items, locked collections, and items deleted in aleph since. → Task 1 `items_move_over_and_the_name_changes_hands`, `a_collection_that_stays_locked_is_skipped_with_a_message`, `import_is_idempotent_and_never_overwrites`; Task 2 `items_are_copied_back_and_writes_pause`, `items_deleted_since_the_import_are_deleted_there_too`, `setup_revert_hands_everything_back`.
+1. **A setup or revert interrupted at any step** (a crash, a failed sudo, gnome-keyring started outside systemd, a user who says no) must leave a working Secret Service and a login that works, and a re-run must finish the job. → Task 2 `gnome_keyring_hands_over_and_a_rerun_changes_nothing`, `a_gnome_keyring_outside_systemd_is_reported`, `a_login_keyring_that_does_not_unlock_changes_nothing`; Task 4 `setup_creates_the_keyring_and_status_shows_it` (a failed sudo, a second run); Task 6 `a_revert_rerun_after_switching_back_goes_straight_to_the_release`, `skipped_collections_stop_setup_before_the_switchover`.
+2. **A PAM edit that would lock the user out** must never stay: the edited stacks are checked with a real login and rolled back, the TTY path is never touched, and revert restores exactly what was there. → Task 3 `the_transformed_stacks_run_through_real_pam`, `apply_then_revert_restores_every_file_exactly`, `revert_after_an_edit_keeps_the_edit_or_leaves_the_file`, `a_symlinked_service_is_manual`, `files_not_owned_by_root_are_manual`, `roll_back_restores_the_changed_files`; Task 6 `a_service_without_its_anchor_is_manual_and_the_rest_recorded`, `a_crash_before_the_manifest_keeps_the_original`, `a_stale_backup_is_replaced_by_the_current_file`, `a_checked_apply_rolls_back_on_failure_even_on_a_rerun`. The check-and-roll-back path in `aleph system apply` runs only as root (hardware checklist).
+3. **Nothing is lost moving between keyrings:** items stored in gnome-keyring during the import, items stored in aleph after setup, conflicting items, locked collections, and items deleted in aleph since. → Task 1 `items_move_over_and_the_name_changes_hands`, `a_collection_that_stays_locked_is_skipped_with_a_message`, `import_is_idempotent_and_never_overwrites`; Task 2 `items_are_copied_back_and_writes_pause`, `items_deleted_since_the_import_are_deleted_there_too`, `setup_revert_hands_everything_back`; Task 6 `revert_never_deletes_what_aleph_still_holds`, `export_does_not_replace_an_item_with_another_label`, `an_update_in_gnome_keyring_is_followed`.
 4. **Two gnome-keyrings over the same files, or apps that start one behind alephd's back** (activation, PAM's `auto_start`): revert refuses while one serves the session, and setup disables gnome-keyring's other routes in. → Task 2 `revert_refuses_while_gnome_keyring_runs`; the activation files in `gnome_keyring_hands_over_and_a_rerun_changes_nothing`.
-5. **Tests that reach the real machine** (systemctl, sudo, `/etc/pam.d`, the real keyring files, a real alephd): none may. → the CLI test harness (`ALEPH_SYSTEMCTL=false`, `ALEPH_SUDO=false`, its own HOME and XDG directories); the stub PAM stacks in Task 3.
+5. **Tests that reach the real machine** (systemctl, sudo, `/etc/pam.d`, the real keyring files, a real alephd): none may. → the CLI test harness (a systemctl stand-in script, `ALEPH_SUDO=false`, its own HOME and XDG directories); the stub PAM stacks in Task 3.
 
 ## File Structure
 
@@ -1525,7 +1525,6 @@ Make each change below, run its test and see it FAIL (a hang counts: stop it aft
   // (nothing)
   ```
 
-- **an item already here is unchanged** (`crates/aleph-daemon/src/import.rs`), test `cargo test -p aleph-daemon --lib import_is_idempotent`: replace `if same.iter().any(|(_, _, s)| s == f.secret.expose()) {` with `if false {`.
 - **a different secret here is a conflict, not overwritten** (`crates/aleph-daemon/src/import.rs`), test `cargo test -p aleph-daemon --lib import_is_idempotent`: replace `if !same.is_empty() {` with `if false {`.
 - **the import keeps following gnome-keyring** (`crates/aleph-daemon/src/admin.rs`), test `cargo test -p aleph-daemon --test gnome_keyring items_move_over`: replace `tokio::spawn(importer.follow(` with `drop(importer.follow(`.
 - **a collection that stays locked is skipped** (`crates/aleph-daemon/src/import.rs`), test `cargo test -p aleph-daemon --test gnome_keyring a_collection_that_stays_locked`: replace `if locked && !self.unlock(&service, &path).await? {` with `if false {`.
@@ -6403,4 +6402,1383 @@ Expected (one entry per test binary, in cargo's order): ok. 16 passed | ok. 12 p
 ```bash
 git add docs README.md DECISIONS.md
 git commit -m "docs: spec, testing, README, and decisions for setup" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+
+### Task 6: the pre-execution review's fixes
+
+**Interfaces:**
+- Consumes: Tasks 1–5 (DECISIONS.md G3 has the findings this task answers).
+- Produces: `system::apply_checked(&Root, &str, &str, impl Fn(&Root, &str, &str) -> Result<()>) -> Result<Report>`; `wizard::lockout_matches(&str, &str) -> bool`; `import::merge_following(&mut Body, Vec<FetchedCollection>, &mut Summary, &HashSet<Uuid>)`, `Summary::updated`; `export::PRIVATE_BUS_CONFIG`; Admin `ClaimSecretService() -> b`; `switchover::{Record::revert_phase, SWITCHED_BACK}`
+
+- [ ] **Step 1: Write the failing tests**
+
+Apply this patch with `git apply` (save it as `/tmp/t6-tests.patch`):
+
+```diff
+--- a/crates/aleph-cli/src/system.rs
++++ b/crates/aleph-cli/src/system.rs
+@@ -756,6 +756,105 @@
+             assert!(!root.backup(service).exists());
+         }
+         assert!(!root.manifest_path().exists());
++    }
++
++    /// One service that cannot be transformed (its anchor is gone) is left
++    /// for the user; the others are still applied and recorded, so revert
++    /// undoes them.
++    #[test]
++    fn a_service_without_its_anchor_is_manual_and_the_rest_recorded() {
++        let (_dir, root) = tree();
++        std::fs::write(
++            root.pam_dir.join("passwd"),
++            "#%PAM-1.0\npassword required pam_unix.so\n",
++        )
++        .unwrap();
++        let report = apply(&root).unwrap();
++        assert_eq!(report.changed.len(), 3);
++        assert!(
++            report.manual.iter().any(|m| m.contains("passwd")),
++            "{:?}",
++            report.manual
++        );
++        revert(&root).unwrap();
++        for service in [Service::Sddm, Service::SddmAutologin, Service::LockPassword] {
++            assert_eq!(
++                std::fs::read_to_string(root.pam_dir.join(service.file())).unwrap(),
++                fixture("omarchy", service.file())
++            );
++        }
++    }
++
++    /// A crash after the files were written but before the manifest: a
++    /// re-run trusts the backup (the original), and revert restores it.
++    #[test]
++    fn a_crash_before_the_manifest_keeps_the_original() {
++        let (_dir, root) = tree();
++        apply(&root).unwrap();
++        std::fs::remove_file(root.manifest_path()).unwrap();
++        apply(&root).unwrap();
++        revert(&root).unwrap();
++        for service in Service::ALL {
++            assert_eq!(
++                std::fs::read_to_string(root.pam_dir.join(service.file())).unwrap(),
++                fixture("omarchy", service.file()),
++                "{service:?}"
++            );
++        }
++    }
++
++    /// A backup left from long ago (no manifest entry) is not trusted: the
++    /// backup is the file as it is now.
++    #[test]
++    fn a_stale_backup_is_replaced_by_the_current_file() {
++        let (_dir, root) = tree();
++        let passwd = root.pam_dir.join("passwd");
++        std::fs::write(root.backup(Service::Passwd), "#%PAM-1.0\nold\n").unwrap();
++        let mut current = fixture("omarchy", "passwd");
++        current.push_str("auth required pam_u2f.so\n");
++        std::fs::write(&passwd, &current).unwrap();
++        apply(&root).unwrap();
++        revert(&root).unwrap();
++        assert_eq!(std::fs::read_to_string(&passwd).unwrap(), current);
++    }
++
++    /// A file revert leaves alone loses its backup too (it is stale now).
++    #[test]
++    fn a_file_left_alone_by_revert_loses_its_backup() {
++        let (_dir, root) = tree();
++        apply(&root).unwrap();
++        let sddm = root.pam_dir.join("sddm");
++        std::fs::write(
++            &sddm,
++            "#%PAM-1.0\nauth required pam_deny.so\n-auth      optional  pam_aleph.so\n",
++        )
++        .unwrap();
++        revert(&root).unwrap();
++        assert!(!root.backup(Service::Sddm).exists());
++    }
++
++    /// The check runs whenever something is recorded (a re-run after an
++    /// interrupted check too), and a failure puts every recorded file back.
++    #[test]
++    fn a_checked_apply_rolls_back_on_failure_even_on_a_rerun() {
++        let (_dir, root) = tree();
++        let fail = |_: &Root, _: &str, _: &str| -> Result<()> { Err("no".into()) };
++        let pass = |_: &Root, _: &str, _: &str| -> Result<()> { Ok(()) };
++        // First run: applied, then the check is interrupted (not run).
++        apply(&root).unwrap();
++        let err = apply_checked(&root, "u", "pw", fail).unwrap_err();
++        assert!(err.contains("undone"), "{err}");
++        for service in Service::ALL {
++            assert_eq!(
++                std::fs::read_to_string(root.pam_dir.join(service.file())).unwrap(),
++                fixture("omarchy", service.file())
++            );
++        }
++        apply_checked(&root, "u", "pw", pass).unwrap();
++        assert_eq!(
++            std::fs::read_to_string(root.pam_dir.join("passwd")).unwrap(),
++            fixture("omarchy-applied", "passwd")
++        );
+     }
+ 
+     /// A symlinked service is left for the user, with the lines to add.
+--- a/crates/aleph-cli/src/wizard.rs
++++ b/crates/aleph-cli/src/wizard.rs
+@@ -220,6 +220,14 @@
+     }
+ 
+     #[test]
++    fn a_lockout_value_matches_however_it_is_typed() {
++        let v = "ABCD-EFGH-2345";
++        assert!(lockout_matches(v, "abcd efgh 2345"));
++        assert!(lockout_matches(v, "ABCDEFGH2345"));
++        assert!(!lockout_matches(v, "ABCDEFGH2346"));
++    }
++
++    #[test]
+     fn a_lockout_value_is_32_base32_characters_in_groups() {
+         let v = lockout_value().unwrap();
+         assert_eq!(v.len(), 39);
+--- a/crates/aleph-cli/tests/cli.rs
++++ b/crates/aleph-cli/tests/cli.rs
+@@ -8,9 +8,20 @@
+ 
+ fn aleph(d: &Daemon, args: &[&str]) -> Command {
+     // Never the real home, user manager, or sudo: setup writes activation
+-    // files, runs systemctl (`false`: no unit exists, and any change
++    // files, runs systemctl (a stand-in: no unit exists, and any change
+     // fails), and offers the root side through sudo (`false`: it fails).
+     let home = d.env.paths.data_dir.parent().unwrap().join("home");
++    let systemctl = home.join("systemctl");
++    if !systemctl.exists() {
++        use std::os::unix::fs::PermissionsExt;
++        std::fs::create_dir_all(&home).unwrap();
++        std::fs::write(
++            &systemctl,
++            "#!/bin/sh\ncase \"$2\" in\n  is-enabled) echo not-found ;;\n  is-active) echo inactive ;;\n  *) exit 1 ;;\nesac\n",
++        )
++        .unwrap();
++        std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
++    }
+     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aleph"));
+     cmd.args(args)
+         .env("DBUS_SESSION_BUS_ADDRESS", &d.bus.address)
+@@ -18,7 +29,7 @@
+         .env("XDG_DATA_HOME", home.join("data"))
+         .env("XDG_STATE_HOME", home.join("state"))
+         .env("XDG_CONFIG_HOME", home.join("config"))
+-        .env("ALEPH_SYSTEMCTL", "false")
++        .env("ALEPH_SYSTEMCTL", &systemctl)
+         .env("ALEPH_SUDO", "false")
+         .env("ALEPH_NO_TTY", "1")
+         .stdin(Stdio::piped())
+@@ -418,3 +429,57 @@
+         .unwrap();
+     assert_eq!(found.len(), 1);
+ }
++
++/// A revert that stopped after switching back (a Ctrl-C, a failed
++/// release) resumes at the release on a re-run: no second export.
++#[tokio::test(flavor = "multi_thread")]
++async fn a_revert_rerun_after_switching_back_goes_straight_to_the_release() {
++    let d = daemon(true, vec![]).await;
++    let home = d.env.paths.data_dir.parent().unwrap().join("home");
++    std::fs::create_dir_all(home.join("state/aleph")).unwrap();
++    std::fs::write(
++        home.join("state/aleph/setup.json"),
++        r#"{"units":{},"revert_phase":"switched-back"}"#,
++    )
++    .unwrap();
++    let (ok, _, err) = run(&d, &["setup", "--revert"], "").await;
++    assert!(ok, "{err}");
++    assert!(!err.contains("Copied"), "{err}");
++    assert!(
++        err.contains("gnome-keyring serves the Secret Service again"),
++        "{err}"
++    );
++}
++
++/// A gnome-keyring collection that stayed locked stops setup before the
++/// switchover (its items would be out of reach afterwards), unless the
++/// user says to go on.
++#[tokio::test(flavor = "multi_thread")]
++async fn skipped_collections_stop_setup_before_the_switchover() {
++    let bus = bus();
++    let gk = GnomeKeyring::start(&bus, "login password");
++    gk.store("Mail", &[("service", "mail")], "s3cret");
++    let c = zbus::connection::Builder::address(bus.address.as_str())
++        .unwrap()
++        .build()
++        .await
++        .unwrap();
++    c.call_method(
++        Some("org.freedesktop.secrets"),
++        "/org/freedesktop/secrets",
++        Some("org.freedesktop.Secret.Service"),
++        "Lock",
++        &(vec![
++            zbus::zvariant::ObjectPath::try_from("/org/freedesktop/secrets/collection/login")
++                .unwrap(),
++        ],),
++    )
++    .await
++    .unwrap();
++    let d = daemon_on(bus, true).await;
++    let (ok, _, err) = run(&d, &["setup"], "").await;
++    assert!(ok, "{err}");
++    assert!(err.contains("Not imported"), "{err}");
++    assert!(!err.contains("alephd serves the Secret Service"), "{err}");
++    drop(gk);
++}
+--- a/crates/aleph-daemon/tests/gnome_keyring.rs
++++ b/crates/aleph-daemon/tests/gnome_keyring.rs
+@@ -400,3 +400,102 @@
+         "alephd"
+     );
+ }
++
++/// An item imported, deleted in aleph, and stored again (same label and
++/// attributes) is not deleted from gnome-keyring by revert; its new secret
++/// is what gnome-keyring ends up with.
++#[tokio::test(flavor = "multi_thread")]
++async fn revert_never_deletes_what_aleph_still_holds() {
++    let bus = bus();
++    let address = bus.address.clone();
++    let gk = GnomeKeyring::start(&bus, "login password");
++    gk.store("Mail", &[("k", "mail")], "old");
++    let d = daemon_on(bus, true).await;
++    let c = client(&address).await;
++    admin(&c, "ImportGnomeKeyring").await.unwrap();
++    d.keyring
++        .modify(|b| {
++            for col in &mut b.collections {
++                col.items.retain(|i| i.label != "Mail");
++            }
++            Ok(())
++        })
++        .unwrap();
++    add(&d, None, "Mail", &[("k", "mail")], "new");
++    let body = d.keyring.read(|b| b.clone()).unwrap();
++    let delete = aleph_daemon::import::removed_since(
++        &aleph_daemon::import::load_imported(&d.env.paths.imported()),
++        &body,
++    );
++    assert_eq!(delete.len(), 1);
++    let report = aleph_daemon::export::export(&c, &address, &body, &delete)
++        .await
++        .unwrap();
++    assert_eq!(report.deleted, 0);
++    assert_eq!(found(&c, &[("k", "mail")]).await, 1);
++    // (The secret there is the new one: export verified it.)
++    assert_eq!(report.exported, 1);
++}
++
++/// An item in gnome-keyring with the same attributes but another label is
++/// a different item: export adds aleph's beside it, never over it.
++#[tokio::test(flavor = "multi_thread")]
++async fn export_does_not_replace_an_item_with_another_label() {
++    let bus = bus();
++    let address = bus.address.clone();
++    let gk = GnomeKeyring::start(&bus, "login password");
++    gk.store("Theirs", &[("k", "same")], "theirs");
++    let d = daemon_on(bus, true).await;
++    let c = client(&address).await;
++    add(&d, None, "Ours", &[("k", "same")], "ours");
++    let body = d.keyring.read(|b| b.clone()).unwrap();
++    aleph_daemon::export::export(&c, &address, &body, &[])
++        .await
++        .unwrap();
++    assert_eq!(found(&c, &[("k", "same")]).await, 2);
++}
++
++/// A secret gnome-keyring changes after the import (a token refresh) is
++/// followed into aleph, for the items the import brought.
++#[tokio::test(flavor = "multi_thread")]
++async fn an_update_in_gnome_keyring_is_followed() {
++    let bus = bus();
++    let address = bus.address.clone();
++    let gk = GnomeKeyring::start(&bus, "login password");
++    gk.store("Token", &[("k", "token")], "v1");
++    let d = daemon_on(bus, true).await;
++    let c = client(&address).await;
++    admin(&c, "ImportGnomeKeyring").await.unwrap();
++    gk.store("Token", &[("k", "token")], "v2");
++    eventually("the updated secret", async || {
++        items_labelled(&d, "Token")
++            .first()
++            .is_some_and(|(_, _, s)| s == b"v2")
++    })
++    .await;
++    assert_eq!(items_labelled(&d, "Token").len(), 1);
++}
++
++/// `ClaimSecretService` queues for the name (setup calls it once its
++/// activation file is in place).
++#[tokio::test(flavor = "multi_thread")]
++async fn claiming_the_name_queues_behind_gnome_keyring() {
++    let bus = bus();
++    let address = bus.address.clone();
++    let _gk = GnomeKeyring::start(&bus, "login password");
++    let d = daemon_on(bus, true).await;
++    let c = client(&address).await;
++    c.call_method(
++        Some(aleph_daemon::admin::BUS_NAME),
++        aleph_daemon::admin::ADMIN_PATH,
++        Some("io.aleph.Admin1"),
++        "ClaimSecretService",
++        &(),
++    )
++    .await
++    .unwrap();
++    assert_eq!(
++        aleph_daemon::daemon::secret_service_owner(&d.conn).await,
++        "another program"
++    );
++}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -q -p aleph-daemon -p aleph-cli`
+Expected: the build fails: `apply_checked` and `lockout_matches` do not exist yet (and the new export, follow, revert, and setup tests would fail).
+
+- [ ] **Step 3: Implement**
+
+Apply this patch with `git apply` (save it as `/tmp/t6-impl.patch`):
+
+```diff
+--- a/DECISIONS.md
++++ b/DECISIONS.md
+@@ -8,6 +8,56 @@
+ made directly are marked as such.
+ 
+ ## 2026-09-27: Plan 4c (setup), design
++
++### G3. The pre-execution review of the Plan 4c document: fixes adopted
++
++No path was found where the PAM edits make a correct password fail or a
++wrong one pass. The safety net around them, and revert, had gaps; each
++fixed with a test that failed first:
++- **A service that cannot be transformed** stopped `apply` part way, with
++  edits unrecorded. Every transformation is computed first (a missing
++  anchor is manual mode), and each manifest entry is saved before its
++  file is replaced.
++- **A crash before the manifest** lost the original on a re-run; a re-run
++  now trusts the backup. **A stale backup** (no manifest entry) could
++  later bring back an old file; it is rewritten from the current file,
++  and revert drops the backup of a file it leaves alone.
++- **An interrupted password prompt skipped the check for good.** The
++  password is asked before anything changes, and the check runs whenever
++  anything is recorded; a failure rolls back everything recorded.
++- **Revert deleted items aleph still held** (deleted and stored again), or
++  let gnome-keyring's replace (attributes only) take an item with another
++  label. Deletions come first and skip what aleph holds; a differing item
++  is updated in place; new items never replace.
++- **A revert that stopped after switching back got stuck** with writes
++  paused; it records its phase and resumes at the release, and writes
++  resume on every failure.
++- **alephd could take the Secret Service back after a revert** (started by
++  `pam.sock` with `pam_aleph` still in place): it claims the name only
++  while setup's activation file exists; setup asks it to claim once it
++  has written the file (`ClaimSecretService`).
++- **Skipping the root step** leaves sddm's `pam_gnome_keyring auto_start`,
++  which can start gnome-keyring behind alephd: setup says so, and the
++  hardware checklist checks it.
++- **A locked gnome-keyring collection** would be stranded by the
++  switchover: setup stops before it unless the user says to go on.
++
++Minor fixes adopted: gnome-keyring's updates to imported items are
++followed until the switchover; item signals are taken before the name
++change; the write freeze is checked under the keyring's lock; a failing
++`systemctl` is an error, never a recorded "not-found" (the CLI tests use
++a stand-in script); private and test buses have no service directories
++(no real prompter can start); sudo is `/usr/bin/sudo`, and the
++user-writable-binary warning comes before it; revert unlocks a locked
++vault first; the lockout value may be typed without dashes; the emergency
++manual revert no longer claims a missing backup means an unchanged file,
++and reloads the bus.
++
++Rulings on the rest: revert says what to remove rather than showing a
++diff (E4's "diff"); on NixOS the user-level unit masking still happens
++(it works there; E6 said it would be skipped); the lock screen, which
++runs as the user, is checked by hand (the root-side check runs as root).
++
+ 
+ ### G2. Calls made while prototyping Plan 4c
+ 
+--- a/crates/aleph-cli/src/main.rs
++++ b/crates/aleph-cli/src/main.rs
+@@ -239,7 +239,21 @@
+             if c.status().await?.locked {
+                 outcome(c.converse("Unlock", Args::None).await?)?;
+             }
+-            eprintln!("aleph: {}", c.import_gnome_keyring().await?);
++            let summary = c.import_gnome_keyring().await?;
++            eprintln!("aleph: {summary}");
++            if summary.contains("Not imported:") {
++                let mut term = prompter::Terminal::new();
++                let answer = ask(
++                    &mut term,
++                    "Those collections stay in gnome-keyring, out of reach once aleph takes over (until `aleph setup --revert`). Take over anyway? [y/N] ",
++                )?;
++                if !matches!(answer.trim(), "y" | "Y" | "yes") {
++                    eprintln!(
++                        "aleph: stopped before taking over: unlock them in gnome-keyring (Seahorse), then run `aleph setup` again"
++                    );
++                    return Ok(ExitCode::SUCCESS);
++                }
++            }
+             let dirs = switchover::Dirs::from_env()?;
+             let mut record = switchover::Record::load(&dirs)?;
+             for step in
+@@ -269,9 +283,11 @@
+             if matches!(answer.trim(), "" | "y" | "Y" | "yes") {
+                 if let Err(e) = wizard::run_as_root(&apply) {
+                     eprintln!("aleph: {e}; run `sudo aleph system apply --user {user}` later");
++                    eprintln!("aleph: {ROOT_STEP_PENDING}");
+                 }
+             } else {
+                 eprintln!("aleph: later: `sudo aleph system apply --user {user}`");
++                eprintln!("aleph: {ROOT_STEP_PENDING}");
+             }
+             eprintln!("aleph: setup is done (`aleph status` shows the keyring)");
+         }
+@@ -506,6 +522,9 @@
+     Ok(())
+ }
+ 
++/// What stays until the root step runs.
++const ROOT_STEP_PENDING: &str = "until then, logging in does not unlock the keyring, and the login's PAM service can still start gnome-keyring behind aleph";
++
+ /// `aleph system ...`, as root (DECISIONS.md E4–E6).
+ fn run_system(action: SystemCmd) -> Result<()> {
+     if unsafe { libc::geteuid() } != 0 {
+@@ -527,25 +546,17 @@
+                 );
+                 return Ok(());
+             }
+-            let report = system::apply(&root)?;
+-            for m in &report.manual {
+-                eprintln!("aleph: by hand: {m}");
+-            }
+-            if report.changed.is_empty() {
+-                eprintln!("aleph: the PAM services were already set up");
+-                return Ok(());
+-            }
++            // Asked before anything changes: nothing is ever left edited
++            // and unchecked.
+             let password = zeroize::Zeroizing::new(
+                 rpassword::prompt_password(format!(
+                     "Login password for {user} (checks the login and lock screen once): "
+                 ))
+                 .map_err(|e| e.to_string())?,
+             );
+-            if let Err(e) = system::verify(&root, &user, &password) {
+-                system::roll_back(&root, &report.changed)?;
+-                return Err(format!(
+-                    "the check failed ({e}); the PAM changes were undone"
+-                ));
++            let report = system::apply_checked(&root, &user, &password, system::verify)?;
++            for m in &report.manual {
++                eprintln!("aleph: by hand: {m}");
+             }
+             eprintln!("aleph: login and screen unlock now reach aleph");
+         }
+@@ -578,38 +589,63 @@
+                 .into(),
+         );
+     }
+-    let removed = c.removed_since_import().await?;
+-    let mut delete = false;
+-    if !removed.is_empty() {
+-        eprintln!(
+-            "aleph: imported from gnome-keyring and deleted in aleph since: {}",
+-            removed.join(", ")
+-        );
+-        let mut term = prompter::Terminal::new();
+-        let answer = ask(&mut term, "Delete them from gnome-keyring too? [y/N] ")?;
+-        delete = matches!(answer.trim(), "y" | "Y" | "yes");
+-    }
+-    outcome(
+-        c.converse("ExportToGnomeKeyring", Args::Bool(delete))
+-            .await?,
+-    )?;
++    if c.status().await?.locked {
++        outcome(c.converse("Unlock", Args::None).await?)?;
++    }
+     let dirs = switchover::Dirs::from_env()?;
+     let mut record = switchover::Record::load(&dirs)?;
+-    let steps =
+-        match switchover::switch_back(c.bus(), &switchover::Systemctl, &dirs, &mut record).await {
++    // A revert that stopped after switching back resumes at the release
++    // (gnome-keyring runs by then, and a second export would be refused).
++    if record.revert_phase.as_deref() != Some(switchover::SWITCHED_BACK) {
++        let removed = c.removed_since_import().await?;
++        let mut delete = false;
++        if !removed.is_empty() {
++            eprintln!(
++                "aleph: imported from gnome-keyring and deleted in aleph since: {}",
++                removed.join(", ")
++            );
++            let mut term = prompter::Terminal::new();
++            let answer = ask(&mut term, "Delete them from gnome-keyring too? [y/N] ")?;
++            delete = matches!(answer.trim(), "y" | "Y" | "yes");
++        }
++        outcome(
++            c.converse("ExportToGnomeKeyring", Args::Bool(delete))
++                .await?,
++        )?;
++        let steps = match switchover::switch_back(
++            c.bus(),
++            &switchover::Systemctl,
++            &dirs,
++            &mut record,
++        )
++        .await
++        {
+             Ok(steps) => steps,
+             Err(e) => {
+                 let _ = c.thaw_writes().await;
+                 return Err(e);
+             }
+         };
+-    for step in steps {
+-        eprintln!("aleph: {step}");
+-    }
+-    if let Some(hook) = wizard::remove_omarchy_hook(&dirs.config_home)? {
+-        eprintln!("aleph: removed {}", hook.display());
+-    }
+-    c.release_secret_service().await?;
++        for step in steps {
++            eprintln!("aleph: {step}");
++        }
++        record.revert_phase = Some(switchover::SWITCHED_BACK.into());
++        if let Err(e) = record.save(&dirs) {
++            let _ = c.thaw_writes().await;
++            return Err(e);
++        }
++    }
++    match wizard::remove_omarchy_hook(&dirs.config_home) {
++        Ok(Some(hook)) => eprintln!("aleph: removed {}", hook.display()),
++        Ok(None) => {}
++        Err(e) => eprintln!("aleph: {e}"),
++    }
++    if let Err(e) = c.release_secret_service().await {
++        let _ = c.thaw_writes().await;
++        return Err(e);
++    }
++    record.revert_phase = None;
++    record.save(&dirs)?;
+     eprintln!(
+         "aleph: gnome-keyring serves the Secret Service again; the aleph vault is left in place"
+     );
+@@ -643,7 +679,7 @@
+         value.as_str()
+     );
+     let typed = zeroize::Zeroizing::new(term_line(term, "Type it back to confirm: ")?);
+-    if typed.trim().to_uppercase() != value.as_str() {
++    if !wizard::lockout_matches(&value, &typed) {
+         eprintln!(
+             "aleph: that does not match; the lockout password was not set (later: {command})"
+         );
+--- a/crates/aleph-cli/src/switchover.rs
++++ b/crates/aleph-cli/src/switchover.rs
+@@ -66,13 +66,24 @@
+         std::env::var_os("ALEPH_SYSTEMCTL").unwrap_or_else(|| "systemctl".into())
+     }
+ 
++    /// A query's answer. (`is-enabled` and `is-active` exit non-zero for
++    /// "disabled" or "inactive": their output is what counts; no output is
++    /// a failure, never a state to record.)
+     fn run(args: &[&str]) -> Result<String> {
+         let out = std::process::Command::new(Self::program())
+             .arg("--user")
+             .args(args)
+             .output()
+             .map_err(|e| format!("systemctl: {e}"))?;
+-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
++        let answer = String::from_utf8_lossy(&out.stdout).trim().to_string();
++        if answer.is_empty() {
++            return Err(format!(
++                "systemctl --user {}: {}",
++                args.join(" "),
++                String::from_utf8_lossy(&out.stderr).trim()
++            ));
++        }
++        Ok(answer)
+     }
+ 
+     fn checked(args: &[&str]) -> Result<()> {
+@@ -95,17 +106,9 @@
+ 
+ impl Units for Systemctl {
+     fn state(&self, unit: &str) -> Result<UnitState> {
+-        // (Both commands exit non-zero for "disabled" or "inactive": their
+-        // output is what counts.)
+-        let enabled = Self::run(&["is-enabled", unit])?;
+-        let active = Self::run(&["is-active", unit])? == "active";
+         Ok(UnitState {
+-            enabled: if enabled.is_empty() {
+-                "not-found".into()
+-            } else {
+-                enabled
+-            },
+-            active,
++            enabled: Self::run(&["is-enabled", unit])?,
++            active: Self::run(&["is-active", unit])? == "active",
+         })
+     }
+ 
+@@ -174,7 +177,14 @@
+     /// gnome-keyring's units as they were before setup first changed them.
+     #[serde(default)]
+     pub units: BTreeMap<String, UnitState>,
+-}
++    /// How far an unfinished revert got ([`SWITCHED_BACK`]: only the
++    /// release is left).
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub revert_phase: Option<String>,
++}
++
++/// A revert's phase once gnome-keyring's routes are restored.
++pub const SWITCHED_BACK: &str = "switched-back";
+ 
+ impl Record {
+     pub fn load(dirs: &Dirs) -> Result<Self> {
+@@ -243,6 +253,17 @@
+             services.display()
+         ));
+     }
++    // The running alephd queues for the name now (it claims it at start
++    // only while this activation file exists).
++    bus.call_method(
++        Some(ALEPH_NAME),
++        "/io/aleph/Admin",
++        Some("io.aleph.Admin1"),
++        "ClaimSecretService",
++        &(),
++    )
++    .await
++    .map_err(|e| format!("asking alephd to queue for the Secret Service: {e}"))?;
+     let mut states = Vec::new();
+     for unit in GNOME_UNITS {
+         states.push((unit, units.state(unit)?));
+--- a/crates/aleph-cli/src/system.rs
++++ b/crates/aleph-cli/src/system.rs
+@@ -320,6 +320,9 @@
+ pub fn apply(root: &Root) -> Result<Report> {
+     let mut manifest = Manifest::load(root)?;
+     let mut report = Report::default();
++    // Every transformation first: a service that cannot be transformed (its
++    // anchor gone) is left for the user, and nothing half-done is written.
++    let mut plans = Vec::new();
+     for service in Service::ALL {
+         let path = root.pam_dir.join(service.file());
+         if !path.exists() && std::fs::symlink_metadata(&path).is_err() {
+@@ -331,46 +334,99 @@
+                 .push(format!("{why}: {}", manual_lines(service)));
+             continue;
+         }
+-        let original =
++        let current =
+             std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+-        let edit = transform(service, &original)?;
+-        if edit.text == original {
+-            // (Already applied, by an earlier run or by hand: recorded so
+-            // revert can take the lines out again.)
+-            manifest
+-                .files
+-                .entry(service.file().to_string())
+-                .or_insert(Applied {
+-                    applied: original,
+-                    removed: Vec::new(),
+-                    backup: false,
+-                });
++        match transform(service, &current) {
++            Ok(edit) => plans.push((service, path, current, edit)),
++            Err(e) => report.manual.push(e),
++        }
++    }
++    for (service, path, current, edit) in plans {
++        let name = service.file().to_string();
++        let backup = root.backup(service);
++        let known = manifest.files.get(&name).cloned();
++        if edit.text == current {
++            // Already applied: by an earlier run, by a run cut short before
++            // its manifest (then the backup holds the original), or by hand.
++            if known.is_none() {
++                let (has_backup, removed) = match std::fs::read_to_string(&backup) {
++                    Ok(original) => (
++                        true,
++                        transform(service, &original)
++                            .map(|e| e.removed)
++                            .unwrap_or_default(),
++                    ),
++                    Err(_) => (false, Vec::new()),
++                };
++                manifest.files.insert(
++                    name,
++                    Applied {
++                        applied: current,
++                        removed,
++                        backup: has_backup,
++                    },
++                );
++                manifest.save(root)?;
++            }
+             continue;
+         }
+         let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+         let mode = meta.mode() & 0o7777;
+         let owner = Some((meta.uid(), meta.gid()));
+-        let backup = root.backup(service);
+-        if !backup.exists() {
+-            write_atomic(&backup, original.as_bytes(), mode, owner)?;
+-        }
+-        write_atomic(&path, edit.text.as_bytes(), mode, owner)?;
+-        let removed = match manifest.files.get(service.file()) {
++        // With no record of this file, a backup lying there is stale: the
++        // backup is the file as it is now.
++        if known.is_none() || !backup.exists() {
++            write_atomic(&backup, current.as_bytes(), mode, owner)?;
++        }
++        let removed = match known {
+             // (A re-run keeps what the first run removed.)
+-            Some(prev) if edit.removed.is_empty() => prev.removed.clone(),
++            Some(prev) if edit.removed.is_empty() => prev.removed,
+             _ => edit.removed,
+         };
++        // Recorded before the file is replaced: a crash in between leaves a
++        // record revert can work from.
+         manifest.files.insert(
+-            service.file().to_string(),
++            name,
+             Applied {
+-                applied: edit.text,
++                applied: edit.text.clone(),
+                 removed,
+                 backup: true,
+             },
+         );
++        manifest.save(root)?;
++        write_atomic(&path, edit.text.as_bytes(), mode, owner)?;
+         report.changed.push(service);
+     }
+-    manifest.save(root)?;
++    Ok(report)
++}
++
++/// Apply, then check the login and lock screen with `check` (real
++/// Linux-PAM: [`verify`]) whenever anything is recorded, a re-run after an
++/// interrupted check included; a failure puts every recorded file back from
++/// its backup.
++pub fn apply_checked(
++    root: &Root,
++    user: &str,
++    password: &str,
++    check: impl Fn(&Root, &str, &str) -> Result<()>,
++) -> Result<Report> {
++    let report = apply(root)?;
++    let manifest = Manifest::load(root)?;
++    if manifest.files.is_empty() {
++        return Ok(report);
++    }
++    if let Err(e) = check(root, user, password) {
++        let recorded: Vec<Service> = manifest
++            .files
++            .iter()
++            .filter(|(_, a)| a.backup)
++            .filter_map(|(name, _)| Service::from_file(name))
++            .collect();
++        roll_back(root, &recorded)?;
++        return Err(format!(
++            "the check failed ({e}); the PAM changes were undone"
++        ));
++    }
+     Ok(report)
+ }
+ 
+@@ -443,6 +499,9 @@
+                 path.display()
+             ));
+         } else {
++            // (Its backup is stale now: a later apply must not bring it
++            // back.)
++            let _ = std::fs::remove_file(&backup);
+             done.push(format!(
+                 "{}: changed since setup and left alone; {}",
+                 path.display(),
+--- a/crates/aleph-cli/src/wizard.rs
++++ b/crates/aleph-cli/src/wizard.rs
+@@ -103,12 +103,16 @@
+ /// The program that runs the root side (`sudo`; `ALEPH_SUDO` names another,
+ /// for tests, which must never run the real one).
+ fn sudo() -> std::ffi::OsString {
+-    std::env::var_os("ALEPH_SUDO").unwrap_or_else(|| "sudo".into())
++    std::env::var_os("ALEPH_SUDO").unwrap_or_else(|| "/usr/bin/sudo".into())
+ }
+ 
+ /// Run `args` as root through sudo, on the terminal (sudo asks for the
+ /// password there).
+ pub fn run_as_root(args: &[&str]) -> Result<()> {
++    // Before sudo: running a user-writable binary as root trusts its writer.
++    if let Some(w) = crate::system::writable_binary_warning() {
++        eprintln!("aleph: {w}");
++    }
+     let status = std::process::Command::new(sudo())
+         .args(args)
+         .status()
+@@ -138,6 +142,17 @@
+         .map(|c| c.iter().collect::<String>())
+         .collect::<Vec<_>>()
+         .join("-"))
++}
++
++/// Whether `typed` is the lockout value, however it was grouped or cased.
++pub fn lockout_matches(value: &str, typed: &str) -> bool {
++    let norm = |s: &str| {
++        s.chars()
++            .filter(|c| !c.is_whitespace() && *c != '-')
++            .map(|c| c.to_ascii_uppercase())
++            .collect::<String>()
++    };
++    !typed.trim().is_empty() && norm(value) == norm(typed)
+ }
+ 
+ /// The command that sets lockoutAuth, reading the value on standard input
+--- a/crates/aleph-daemon/src/admin.rs
++++ b/crates/aleph-daemon/src/admin.rs
+@@ -242,6 +242,17 @@
+         })
+     }
+ 
++    /// Queue for `org.freedesktop.secrets` (setup calls it once its
++    /// activation file is in place). Returns whether alephd owns it now.
++    async fn claim_secret_service(
++        &self,
++        #[zbus(connection)] conn: &zbus::Connection,
++    ) -> zbus::fdo::Result<bool> {
++        crate::daemon::request_secrets_name(conn)
++            .await
++            .map_err(failed)
++    }
++
+     /// Let go of `org.freedesktop.secrets` (the end of a revert: the bus
+     /// hands it to gnome-keyring, queued behind).
+     async fn release_secret_service(
+--- a/crates/aleph-daemon/src/export.rs
++++ b/crates/aleph-daemon/src/export.rs
+@@ -54,6 +54,22 @@
+         || owner(SECRETS_NAME).await.is_some_and(|o| Some(o) != me)
+ }
+ 
++/// A private session bus's configuration: no service directories, so
++/// nothing (a prompter, a second gnome-keyring) is ever started on it.
++pub const PRIVATE_BUS_CONFIG: &str = r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
++ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
++<busconfig>
++  <type>session</type>
++  <listen>unix:tmpdir=/tmp</listen>
++  <auth>EXTERNAL</auth>
++  <policy context="default">
++    <allow send_destination="*" eavesdrop="true"/>
++    <allow eavesdrop="true"/>
++    <allow own="*"/>
++  </policy>
++</busconfig>
++"#;
++
+ /// A gnome-keyring (secrets component) alephd runs itself on a private
+ /// bus, over the keyring files in `data_home`; killed on drop.
+ pub struct Private {
+@@ -74,8 +90,11 @@
+         std::fs::create_dir_all(&run).map_err(gk)?;
+         std::fs::set_permissions(&run, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+             .map_err(gk)?;
++        let config = dirs.path().join("bus.conf");
++        std::fs::write(&config, PRIVATE_BUS_CONFIG).map_err(gk)?;
+         let mut bus = std::process::Command::new("dbus-daemon")
+-            .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
++            .arg(format!("--config-file={}", config.display()))
++            .args(["--nofork", "--nopidfile", "--print-address=1"])
+             .stdout(std::process::Stdio::piped())
+             .stderr(std::process::Stdio::null())
+             .spawn()
+@@ -316,6 +335,37 @@
+         }
+     };
+     let mut report = Report::default();
++    // Deletions first, and never of an item aleph still holds (one deleted
++    // and stored again with the same label and attributes).
++    let held = |label: &str, attributes: &BTreeMap<String, String>| {
++        body.collections.iter().any(|c| {
++            c.items
++                .iter()
++                .any(|i| i.label == label && i.attributes == *attributes)
++        })
++    };
++    for d in delete {
++        if held(&d.label, &d.attributes) {
++            continue;
++        }
++        let target = if d.is_default {
++            default.clone()
++        } else {
++            by_label
++                .get(&d.collection)
++                .cloned()
++                .unwrap_or(default.clone())
++        };
++        for (path, _) in remote.find(&target, &d.attributes, &d.label).await? {
++            let _: OwnedObjectPath = remote
++                .proxy(path.as_str(), ITEM)
++                .await?
++                .call("Delete", &())
++                .await
++                .map_err(gk)?;
++            report.deleted += 1;
++        }
++    }
+     let mut written = Vec::new();
+     for collection in &body.collections {
+         for item in &collection.items {
+@@ -323,6 +373,28 @@
+             let found = remote.find(&target, &item.attributes, &item.label).await?;
+             if found.iter().any(|(_, s)| s == item.secret.expose()) {
+                 report.unchanged += 1;
++                continue;
++            }
++            // The same item there with another secret: updated in place
++            // (gnome-keyring's own replace matches attributes only, and
++            // would take an item with another label).
++            if let Some((path, _)) = found.first() {
++                let (parameters, value) =
++                    remote.session.encrypt(item.secret.expose()).map_err(gk)?;
++                let secret = (
++                    remote.session_path.clone(),
++                    parameters,
++                    value,
++                    item.content_type.clone(),
++                );
++                remote
++                    .proxy(path.as_str(), ITEM)
++                    .await?
++                    .call_method("SetSecret", &(secret,))
++                    .await
++                    .map_err(gk)?;
++                report.exported += 1;
++                written.push((target, item));
+                 continue;
+             }
+             let (parameters, value) = remote.session.encrypt(item.secret.expose()).map_err(gk)?;
+@@ -350,7 +422,7 @@
+             let (_, prompt): (OwnedObjectPath, OwnedObjectPath) = remote
+                 .proxy(target.as_str(), COLLECTION)
+                 .await?
+-                .call("CreateItem", &(properties, secret, true))
++                .call("CreateItem", &(properties, secret, false))
+                 .await
+                 .map_err(gk)?;
+             if prompt.as_str() != "/" {
+@@ -358,25 +430,6 @@
+             }
+             report.exported += 1;
+             written.push((target, item));
+-        }
+-    }
+-    for d in delete {
+-        let target = if d.is_default {
+-            default.clone()
+-        } else {
+-            by_label
+-                .get(&d.collection)
+-                .cloned()
+-                .unwrap_or(default.clone())
+-        };
+-        for (path, _) in remote.find(&target, &d.attributes, &d.label).await? {
+-            let _: OwnedObjectPath = remote
+-                .proxy(path.as_str(), ITEM)
+-                .await?
+-                .call("Delete", &())
+-                .await
+-                .map_err(gk)?;
+-            report.deleted += 1;
+         }
+     }
+     // Read everything written back, on a fresh connection and session.
+@@ -390,7 +443,7 @@
+         let found = check.find(&target, &item.attributes, &item.label).await?;
+         if !found.iter().any(|(_, s)| s == item.secret.expose()) {
+             return Err(Error::Invalid(format!(
+-                "copying to gnome-keyring could not be verified ({}); nothing else was changed",
++                "copying to gnome-keyring could not be verified ({}); the session was not handed over",
+                 item.label
+             )));
+         }
+--- a/crates/aleph-daemon/src/import.rs
++++ b/crates/aleph-daemon/src/import.rs
+@@ -117,6 +117,8 @@
+ pub struct Summary {
+     pub imported: usize,
+     pub unchanged: usize,
++    /// Imported items gnome-keyring changed since (followed).
++    pub updated: usize,
+     /// Items skipped because a different secret is already here.
+     pub conflicts: Vec<String>,
+     /// Collections skipped, with the reason.
+@@ -146,8 +148,23 @@
+     }
+ }
+ 
++/// An item already in the target collection: id, label, attributes, secret.
++type Before = (uuid::Uuid, String, BTreeMap<String, String>, Vec<u8>);
++
+ /// Merge `fetched` into `body` (see the module comment for the rules).
+ pub fn merge(body: &mut Body, fetched: Vec<FetchedCollection>, summary: &mut Summary) {
++    merge_following(body, fetched, summary, &std::collections::HashSet::new());
++}
++
++/// `merge`, where a different secret for an item in `updatable` (one the
++/// import brought, followed until the switchover) updates it instead of
++/// being a conflict: gnome-keyring still owns it then.
++pub fn merge_following(
++    body: &mut Body,
++    fetched: Vec<FetchedCollection>,
++    summary: &mut Summary,
++    updatable: &std::collections::HashSet<uuid::Uuid>,
++) {
+     for collection in fetched {
+         let target = if collection.is_default {
+             body.resolve_alias(aleph_core::model::DEFAULT_ALIAS)
+@@ -169,11 +186,12 @@
+         };
+         let target = body.collection_mut(id).expect("just found or created");
+         // Only what was here before this merge counts.
+-        let before: Vec<(String, BTreeMap<String, String>, Vec<u8>)> = target
++        let before: Vec<Before> = target
+             .items
+             .iter()
+             .map(|i| {
+                 (
++                    i.id,
+                     i.label.clone(),
+                     i.attributes.clone(),
+                     i.secret.expose().to_vec(),
+@@ -183,10 +201,19 @@
+         for f in collection.items {
+             let same: Vec<_> = before
+                 .iter()
+-                .filter(|(l, a, _)| *l == f.label && *a == f.attributes)
++                .filter(|(_, l, a, _)| *l == f.label && *a == f.attributes)
+                 .collect();
+-            if same.iter().any(|(_, _, s)| s == f.secret.expose()) {
++            if same.iter().any(|(_, _, _, s)| s == f.secret.expose()) {
+                 summary.unchanged += 1;
++                continue;
++            }
++            if let Some((id, ..)) = same.iter().find(|(id, ..)| updatable.contains(id))
++                && let Some(item) = target.items.iter_mut().find(|i| i.id == *id)
++            {
++                item.secret = f.secret;
++                item.content_type = f.content_type;
++                item.modified = f.modified.max(aleph_core::model::now());
++                summary.updated += 1;
+                 continue;
+             }
+             if !same.is_empty() {
+@@ -378,13 +405,16 @@
+         };
+         let mut labels: HashMap<String, (String, bool)> = HashMap::new();
+         loop {
++            // (Item signals first: one sent just before gnome-keyring let
++            // go is still taken.)
+             let msg = tokio::select! {
+-                _ = owner_changes.next() => return,
++                biased;
+                 msg = self.events.next() => match msg {
+                     Some(Ok(msg)) => msg,
+                     Some(Err(_)) => continue,
+                     None => return,
+                 },
++                _ = owner_changes.next() => return,
+             };
+             let header = msg.header();
+             let member = header.member().map(|m| m.as_str().to_string());
+@@ -433,10 +463,12 @@
+         let (label, is_default) = labels[collection].clone();
+         let items = self.fetch_items(&[item]).await?;
+         let keyring = keyring.clone();
++        let updatable: std::collections::HashSet<uuid::Uuid> =
++            load_imported(record).into_iter().map(|i| i.id).collect();
+         let summary = tokio::task::spawn_blocking(move || {
+             keyring.modify(|body| {
+                 let mut summary = Summary::default();
+-                merge(
++                merge_following(
+                     body,
+                     vec![FetchedCollection {
+                         label,
+@@ -444,6 +476,7 @@
+                         items,
+                     }],
+                     &mut summary,
++                    &updatable,
+                 );
+                 Ok(summary)
+             })
+--- a/crates/aleph-daemon/src/keyring.rs
++++ b/crates/aleph-daemon/src/keyring.rs
+@@ -296,10 +296,11 @@
+     /// Change the body and write the vault. If `f` or the write fails, the
+     /// in-memory body is restored, so memory never runs ahead of the file.
+     pub fn modify<T>(&self, f: impl FnOnce(&mut Body) -> Result<T>) -> Result<T> {
++        let mut inner = lock(&self.inner);
++        // (Under the lock: no write slips past an export's snapshot.)
+         if self.frozen.load(std::sync::atomic::Ordering::SeqCst) {
+             return Err(Error::Frozen);
+         }
+-        let mut inner = lock(&self.inner);
+         *lock(&self.last_access) = Instant::now();
+         let Inner {
+             store,
+@@ -396,9 +397,14 @@
+                 return Err(Error::Locked);
+             }
+             let password = self.ask_password(chan)?;
+-            self.frozen.store(true, std::sync::atomic::Ordering::SeqCst);
+-            let result = self
+-                .read(|b| b.clone())
++            // The freeze and the snapshot under one lock.
++            let body = {
++                let inner = lock(&self.inner);
++                self.frozen.store(true, std::sync::atomic::Ordering::SeqCst);
++                inner.vault.as_ref().map(|v| v.body().clone())
++            };
++            let result = body
++                .ok_or(Error::Locked)
+                 .and_then(|body| run(&password, body));
+             if result.is_err() {
+                 self.thaw();
+--- a/crates/aleph-daemon/src/main.rs
++++ b/crates/aleph-daemon/src/main.rs
+@@ -61,8 +61,22 @@
+         aleph_daemon::daemon::serve(&conn, keyring.clone(), launcher, config.clone(), paths)
+             .await
+             .map_err(|e| e.to_string())?;
+-    // Queued behind gnome-keyring until it lets go (DECISIONS.md E1).
+-    match aleph_daemon::daemon::request_secrets_name(&conn).await {
++    // Queued behind gnome-keyring until it lets go (DECISIONS.md E1), and
++    // only while setup's activation file is in place: before setup (which
++    // claims it through the admin interface) and after a revert, the
++    // Secret Service is gnome-keyring's.
++    let claim = activation.as_ref().is_some_and(|a| a.exists());
++    if !claim {
++        tracing::info!(
++            "serving {BUS_NAME}; not claiming {SECRETS_NAME} (aleph setup has not switched over)"
++        );
++    }
++    match if claim {
++        aleph_daemon::daemon::request_secrets_name(&conn).await
++    } else {
++        Ok(true)
++    } {
++        Ok(true) if !claim => {}
+         Ok(true) => tracing::info!("serving {SECRETS_NAME} and {BUS_NAME}"),
+         // After setup switched over, nothing else should hold it.
+         Ok(false) if activation.as_ref().is_some_and(|a| a.exists()) => {
+--- a/crates/aleph-daemon/src/testing.rs
++++ b/crates/aleph-daemon/src/testing.rs
+@@ -308,6 +308,7 @@
+ pub struct Bus {
+     child: std::process::Child,
+     pub address: String,
++    _config: tempfile::TempDir,
+ }
+ 
+ impl Drop for Bus {
+@@ -318,8 +319,14 @@
+ }
+ 
+ pub fn bus() -> Bus {
++    // (No service directories: nothing, a real prompter included, is ever
++    // started on a test bus.)
++    let dir = tempfile::tempdir().unwrap();
++    let config = dir.path().join("bus.conf");
++    std::fs::write(&config, crate::export::PRIVATE_BUS_CONFIG).unwrap();
+     let mut child = std::process::Command::new("dbus-daemon")
+-        .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
++        .arg(format!("--config-file={}", config.display()))
++        .args(["--nofork", "--nopidfile", "--print-address=1"])
+         .stdout(std::process::Stdio::piped())
+         .stderr(std::process::Stdio::null())
+         .spawn()
+@@ -333,6 +340,7 @@
+     Bus {
+         child,
+         address: line.trim().to_string(),
++        _config: dir,
+     }
+ }
+ 
+--- a/docs/superpowers/specs/2026-09-26-aleph-design.md
++++ b/docs/superpowers/specs/2026-09-26-aleph-design.md
+@@ -680,8 +680,12 @@
+   `org.freedesktop.secrets` without `ReplaceExisting` or
+   `AllowReplacement`, so while gnome-keyring runs alephd waits in the
+   queue, and the bus hands the name over the moment gnome-keyring lets go
+-  (the name is never unowned). `aleph status` says who serves it. After
+-  setup switched over, a queued alephd logs a warning.
++  (the name is never unowned). alephd claims it only while setup's
++  activation file exists (setup asks the running alephd to claim it once
++  it has written that file): before setup, and after a revert, the Secret
++  Service stays gnome-keyring's even if `pam.sock` starts alephd.
++  `aleph status` says who serves it. After setup switched over, a queued
++  alephd logs a warning.
+ - `aleph setup` (Arch/Omarchy), each step checking the real state, so a
+   re-run does only what is still undone (E10):
+   1. reports the TPM (§5) and detects SDDM autologin (E5: advisory; it
+@@ -700,7 +704,12 @@
+      lockoutAuth (D9)
+   6. last and optional, the root side through sudo: `sudo aleph system
+      apply --user <you>` (below); declined or failed, setup says how to
+-     run it later
++     run it later, and that until then logging in does not unlock the
++     keyring and the login's PAM service can still start gnome-keyring
++
++  A gnome-keyring collection that stayed locked (its unlock dismissed)
++  stops setup before step 4, unless the user says to go on: its items
++  would be out of reach once aleph takes over.
+ - `aleph setup --revert` (E3), refused if gnome-keyring is not installed:
+   1. lists items imported from gnome-keyring and deleted in aleph since,
+      offering to delete them there too
+@@ -715,8 +724,11 @@
+      the bus hands to gnome-keyring
+   4. last, `sudo aleph system revert`
+ 
+-  If the export fails, nothing changes and writes resume. The aleph vault
+-  is left in place.
++  If the export fails, nothing changes and writes resume. A revert that
++  stops after step 3's switch back resumes at the release on a re-run.
++  Items deleted in aleph since the import are deleted in gnome-keyring
++  only if aleph holds no item with the same label and attributes (one
++  deleted and stored again). The aleph vault is left in place.
+ 
+ ### PAM integration
+ 
+@@ -958,9 +970,14 @@
+   what to add; E6), then authenticates `<you>` through the edited
+   lock-screen and login stacks with real Linux-PAM, the password asked
+   once; a failure restores the originals at once. What it did is recorded
+-  in `/var/lib/aleph/manifest.json`. `revert` restores each file byte for
+-  byte if it is still what `apply` wrote, else takes aleph's lines out if
+-  that applies cleanly, else leaves it and says what to remove. It reads
++  in `/var/lib/aleph/manifest.json`, each entry saved before its file is
++  replaced. The login password is asked before anything changes, and the
++  check runs whenever anything is recorded (a re-run after an interrupted
++  check too). `revert` restores each file byte for byte if it is still
++  what `apply` wrote, else takes aleph's lines out if that applies
++  cleanly, else leaves it (dropping its backup) and says what to remove.
++  A backup without a manifest entry is not trusted: it is rewritten from
++  the file as it is. It reads
+   no user configuration or D-Bus, and warns if its own binary is not
+   root-owned and root-only-writable. On NixOS it prints the configuration
+   to add instead.
+--- a/docs/testing.md
++++ b/docs/testing.md
+@@ -146,6 +146,13 @@
+      `omarchy-hook lock` (DECISIONS.md G1); until then idle and sleep lock
+      it.
+    - `aleph setup` again changes nothing.
++   - If the root step was skipped: log out and in, and check that no
++     `gnome-keyring-daemon` runs (`pgrep -a gnome-keyring`) and that
++     `aleph status` still says alephd serves the Secret Service (sddm's
++     `pam_gnome_keyring auto_start` can start one).
++   - `sudo aleph system apply` runs the login password through the login
++     and lock-screen stacks as root: after it, check the lock screen
++     itself (it runs as you) before walking away.
+    - `aleph setup --revert`: it asks the login password, copies
+      everything back, and gnome-keyring serves the Secret Service again
+      (with the items stored in aleph meanwhile); `sudo aleph system
+@@ -184,12 +191,17 @@
+ 
+ 1. `sudo aleph system revert`; or by hand, for each of `sddm`,
+    `sddm-autologin`, `omarchy-lock-password`, and `passwd` in
+-   `/etc/pam.d/`: `mv <name>.aleph-orig <name>` (a missing backup means
+-   the file was never changed), then `rm /var/lib/aleph/manifest.json`.
++   `/etc/pam.d/`: `mv <name>.aleph-orig <name>` where a backup exists;
++   where none does, take out the `pam_aleph` lines by hand (and, in `sddm`
++   and `sddm-autologin`, put back the `pam_gnome_keyring` lines). Then
++   `rm /var/lib/aleph/manifest.json`.
+ 2. As the user: `rm ~/.local/share/dbus-1/services/org.freedesktop.secrets.service
+    ~/.local/share/dbus-1/services/org.gnome.keyring.service
+    ~/.local/share/dbus-1/services/org.freedesktop.impl.portal.Secret.service`,
+-   then `systemctl --user unmask gnome-keyring-daemon.service
++   `busctl --user call org.freedesktop.DBus /org/freedesktop/DBus
++   org.freedesktop.DBus ReloadConfig` (dbus-broker does not notice
++   removed activation files by itself), then `systemctl --user unmask
++   gnome-keyring-daemon.service
+    gnome-keyring-daemon.socket` and `systemctl --user start
+    gnome-keyring-daemon.socket`.
+ 3. Items stored in aleph since setup stay in its vault
+```
+
+- [ ] **Step 4: Run the tests, clippy, and fmt**
+
+Run: `cargo test -q && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
+Expected (one entry per test binary, in cargo's order): ok. 22 passed | ok. 14 passed | ok. 59 passed | ok. 1 passed | ok. 29 passed | ok. 11 passed | ok. 1 passed | ok. 37 passed | ok. 3 passed | ok. 30 passed | ok. 12 passed | ok. 51 passed | ok. 1 passed | ok. 5 passed | ok. 2 passed | ok. 9 passed | ok. 17 passed | ok. 3 passed | ok. 3 passed | ok. 6 passed | ok. 5 passed | ok. 21 passed | ok. 5 passed | ok. 1 passed | ok. 1 passed | ok. 2 passed | ok. 23 passed | ok. 9 passed | ok. 7 passed | ok. 6 passed | ok. 3 passed | ok. 1 passed.
+
+- [ ] **Step 5: Confirm the tests have teeth**
+
+Make each change below, run its test and see it FAIL (a hang counts: stop it after a few minutes), then undo the change, `touch` the file, and see the test pass again:
+
+- **an item already here is unchanged** (`crates/aleph-daemon/src/import.rs`), test `cargo test -p aleph-daemon --lib import_is_idempotent`: replace `if same.iter().any(|(_, _, _, s)| s == f.secret.expose()) {` with `if false {`.
+- **a service without its anchor is manual** (`crates/aleph-cli/src/system.rs`), test `cargo test -p aleph-cli --bin aleph a_service_without_its_anchor`:
+
+  replace
+
+  ```rust
+  Err(e) => report.manual.push(e),
+  }
+  ```
+
+  with
+
+  ```rust
+  Err(e) => return Err(e),
+  }
+  ```
+
+- **a re-run trusts the backup** (`crates/aleph-cli/src/system.rs`), test `cargo test -p aleph-cli --bin aleph a_crash_before_the_manifest`: replace `let (has_backup, removed) = match std::fs::read_to_string(&backup) {` with `let (has_backup, removed) = match std::fs::read_to_string("/nonexistent/aleph") {`.
+- **a stale backup is rewritten** (`crates/aleph-cli/src/system.rs`), test `cargo test -p aleph-cli --bin aleph a_stale_backup_is_replaced`: replace `if known.is_none() || !backup.exists() {` with `if !backup.exists() {`.
+- **a file left alone loses its backup** (`crates/aleph-cli/src/system.rs`), test `cargo test -p aleph-cli --bin aleph a_file_left_alone_by_revert`:
+
+  replace
+
+  ```rust
+  let _ = std::fs::remove_file(&backup);
+  done.push(format!(
+      "{}: changed since setup and left alone
+  ```
+
+  with
+
+  ```rust
+  done.push(format!(
+  "{}: changed since setup and left alone
+  ```
+
+- **a failed check rolls back everything recorded** (`crates/aleph-cli/src/system.rs`), test `cargo test -p aleph-cli --bin aleph a_checked_apply_rolls_back`: replace `roll_back(root, &recorded)?;` with `roll_back(root, &report.changed)?;`.
+- **the lockout value may be typed any way** (`crates/aleph-cli/src/wizard.rs`), test `cargo test -p aleph-cli --bin aleph a_lockout_value_matches`: replace `.filter(|c| !c.is_whitespace() && *c != '-')` with `.filter(|_| true)`.
+- **revert never deletes what aleph holds** (`crates/aleph-daemon/src/export.rs`), test `cargo test -p aleph-daemon --test gnome_keyring revert_never_deletes_what_aleph_still_holds`: replace `if held(&d.label, &d.attributes) {` with `if false {`.
+- **export never replaces another item** (`crates/aleph-daemon/src/export.rs`), test `cargo test -p aleph-daemon --test gnome_keyring export_does_not_replace_an_item_with_another_label`: replace `.call("CreateItem", &(properties, secret, false))` with `.call("CreateItem", &(properties, secret, true))`.
+- **gnome-keyring's updates are followed** (`crates/aleph-daemon/src/import.rs`), test `cargo test -p aleph-daemon --test gnome_keyring an_update_in_gnome_keyring_is_followed`: replace `.find(|(id, ..)| updatable.contains(id))` with `.find(|_| false)`.
+- **a revert resumes at the release** (`crates/aleph-cli/src/main.rs`), test `cargo test -p aleph-cli --test cli a_revert_rerun_after_switching_back`: replace `if record.revert_phase.as_deref() != Some(switchover::SWITCHED_BACK) {` with `if true {`.
+- **skipped collections stop setup** (`crates/aleph-cli/src/main.rs`), test `cargo test -p aleph-cli --test cli skipped_collections_stop_setup`: replace `if summary.contains("Not imported:") {` with `if false {`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/aleph-daemon crates/aleph-cli docs DECISIONS.md
+git commit -m "fix: the pre-execution review's findings for setup" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
