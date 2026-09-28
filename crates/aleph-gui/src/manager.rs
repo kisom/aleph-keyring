@@ -169,9 +169,9 @@ impl<S: Store, B: Backend> Manager<S, B> {
 
     /// Show, copy, or edit `path`'s secret: after the reveal guard, then
     /// fetched.
-    fn want(&mut self, path: String, want: Want, now: Instant) {
+    fn want(&mut self, ctx: &egui::Context, path: String, want: Want, now: Instant) {
         if self.reauth.needed(now) {
-            self.start_confirm(path, want);
+            self.start_confirm(ctx, path, want);
         } else {
             self.fetch(path, want);
         }
@@ -182,7 +182,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
         self.awaiting = Some((path, want));
     }
 
-    fn start_confirm(&mut self, path: String, want: Want) {
+    fn start_confirm(&mut self, ctx: &egui::Context, path: String, want: Want) {
         let Ok((ours, theirs)) = UnixStream::pair() else {
             self.status = Some("cannot start the confirmation".into());
             return;
@@ -191,7 +191,10 @@ impl<S: Store, B: Backend> Manager<S, B> {
             self.status = Some("cannot start the confirmation".into());
             return;
         };
-        let Ok(events) = crate::link::spawn_reader(reader, || {}) else {
+        // (Each message from alephd wakes the window: with animations off
+        // nothing else draws the next frame.)
+        let wake = ctx.clone();
+        let Ok(events) = crate::link::spawn_reader(reader, move || wake.request_repaint()) else {
             self.status = Some("cannot start the confirmation".into());
             return;
         };
@@ -442,6 +445,8 @@ impl<S: Store, B: Backend> Manager<S, B> {
                                     .map(|c| c.path.clone())
                                     .unwrap_or_default(),
                             };
+                            // (A new form: an answer still owed to another no longer closes it.)
+                            self.saving = 0;
                             self.shown = None;
                             self.mode = Mode::New {
                                 collection,
@@ -451,6 +456,8 @@ impl<S: Store, B: Backend> Manager<S, B> {
                             };
                         }
                         if ui.button("+ FOLDER").clicked() {
+                            // (A new form: an answer still owed to another no longer closes it.)
+                            self.saving = 0;
                             self.shown = None;
                             self.mode = Mode::NewFolder {
                                 label: String::new(),
@@ -505,6 +512,8 @@ impl<S: Store, B: Backend> Manager<S, B> {
         if self.selected.as_ref() != Some(&s) {
             self.shown = None;
             self.mode = Mode::Browse;
+            // (The form was left: its answer, still to come, closes nothing.)
+            self.saving = 0;
         }
         self.selected = Some(s);
     }
@@ -561,7 +570,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     None => {
                         ui.label(RichText::new("the secret is not loaded").color(p.muted));
                         if ui.button("LOAD SECRET").clicked() {
-                            self.want(path.clone(), Want::Edit, now);
+                            self.want(&ui.ctx().clone(), path.clone(), Want::Edit, now);
                         }
                     }
                 }
@@ -821,15 +830,17 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     delete = ui.button("DELETE").clicked();
                 });
                 if show {
-                    self.want(path.clone(), Want::Show, now);
+                    self.want(&ui.ctx().clone(), path.clone(), Want::Show, now);
                 }
                 if hide {
                     self.shown = None;
                 }
                 if copy {
-                    self.want(path.clone(), Want::Copy, now);
+                    self.want(&ui.ctx().clone(), path.clone(), Want::Copy, now);
                 }
                 if edit {
+                    // (A new form: an answer still owed to another no longer closes it.)
+                    self.saving = 0;
                     self.shown = None;
                     self.mode = Mode::Edit {
                         path: path.clone(),

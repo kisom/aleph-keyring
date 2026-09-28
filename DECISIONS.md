@@ -45,6 +45,17 @@ Adopted, each with a test that failed without it:
   (operations and reasons, never secrets or labels); the embedded
   confirmation paints no second set of scanlines, has a snapshot, and its
   caveat is the manager's own line (it did not fit alephd's title).
+- **The final review of the executed branch** found three more, fixed
+  with tests that failed first: a burst of alephd signals arriving faster
+  than a long listing drained them filled zbus's queue, which then stops
+  reading the connection, so the store waited forever
+  (`a_burst_of_signals_does_not_hang_the_store`, run with a queue of 2:
+  the burst the reviewer used did not stall it on this machine); the
+  signals are now drained by a task of their own. A save's answer closed
+  whatever form was open by then (`a_save_answer_belongs_to_its_form`).
+  With animations off, the in-window confirmation waited for the pointer
+  to move before drawing alephd's next message
+  (`the_confirmation_wakes_the_window`).
 - **Left as they are:** a hostile item can carry attributes named
   `created` or `modified`, shown above the real dates; a collection named
   "X (default)" looks like the default (creating one needs alephd's

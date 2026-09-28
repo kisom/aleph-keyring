@@ -218,6 +218,38 @@ fn a_secret_is_shown_after_the_confirmation() {
     assert!(matches!(only(store.take()), Request::Secret(_)));
 }
 
+/// alephd's messages to the confirmation wake the window: with animations
+/// off nothing else would draw the next frame.
+#[test]
+fn the_confirmation_wakes_the_window() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("GitHub token").click();
+    frames(&mut h);
+    h.get_by_label("SHOW").click();
+    frames(&mut h);
+    let Request::Reauth(fd) = only(store.take()) else {
+        panic!("no confirmation");
+    };
+    // (Settle the frames the click asked for, then let alephd speak.)
+    for _ in 0..10 {
+        h.step();
+    }
+    let alephd = std::thread::spawn(move || {
+        let mut chan = Channel::from_fd(fd, Duration::from_secs(10)).unwrap();
+        chan.send(&ToPrompter::Begin {
+            purpose: Purpose::Reauth,
+            operation: "Confirm it is you".into(),
+            caller: None,
+        })
+        .unwrap();
+        chan
+    });
+    let chan = alephd.join().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(h.ctx.has_requested_repaint(), "nothing woke the window");
+    drop(chan);
+}
+
 /// A refused confirmation fetches nothing.
 #[test]
 fn a_refused_confirmation_fetches_nothing() {
@@ -517,6 +549,32 @@ fn a_typed_secret_survives_a_lock() {
         Request::SetSecret { secret, .. } => assert_eq!(&secret[..], b"oldnew"),
         other => panic!("{other:?}"),
     }
+}
+
+/// A save's answer belongs to its form: another form opened while alephd's
+/// prompt waits (a new folder's confirmation) can still be saved, and is
+/// not closed by the old answer.
+#[test]
+fn a_save_answer_belongs_to_its_form() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("+ FOLDER").click();
+    frames(&mut h);
+    type_into(&mut h, "Folder name", "tmp");
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::CreateCollection(_)));
+    h.get_by_label("VPN").click();
+    frames(&mut h);
+    h.get_by_label("EDIT").click();
+    frames(&mut h);
+    type_into(&mut h, "Label", " typed");
+    assert!(!h.get_by_label("SAVE").accesskit_node().is_disabled());
+    done(&store, "create the folder", None);
+    frames(&mut h);
+    assert_eq!(
+        h.get_by_label("Label").value().as_deref(),
+        Some("VPN typed")
+    );
 }
 
 /// Enter on the delete question answers its default: No.

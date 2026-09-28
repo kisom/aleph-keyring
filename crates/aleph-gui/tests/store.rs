@@ -255,6 +255,102 @@ async fn deleting_the_default_folder_keeps_the_keyring_reachable() {
     );
 }
 
+/// A burst of writes by other programs (signals arriving faster than a
+/// long listing drains them) does not stall the store: it still answers,
+/// and lists everything.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_burst_of_signals_does_not_hang_the_store() {
+    use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+    let d = daemon(true, vec![]).await;
+    // (A queue of 2: a full queue must never stall the store, whatever
+    // its size; with the real one it takes hundreds of signals during one
+    // listing.)
+    let mut store = Probe {
+        store: DbusStore::with_signal_queue(Some(d.bus.address.clone()), || {}, 2),
+        pending: Default::default(),
+    };
+    let cols = store.unlocked(|c| !c.is_empty()).await;
+    let default = cols[0].path.clone();
+    let writer = |first: usize, n: usize| {
+        let (address, default) = (d.bus.address.clone(), default.clone());
+        tokio::spawn(async move {
+            let c = zbus::connection::Builder::address(address.as_str())
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let svc = zbus::Proxy::new(
+                &c,
+                "org.freedesktop.secrets",
+                "/org/freedesktop/secrets",
+                "org.freedesktop.Secret.Service",
+            )
+            .await
+            .unwrap();
+            let (_, session): (OwnedValue, OwnedObjectPath) = svc
+                .call("OpenSession", &("plain", Value::from("")))
+                .await
+                .unwrap();
+            let col = zbus::Proxy::new(
+                &c,
+                "org.freedesktop.secrets",
+                default,
+                "org.freedesktop.Secret.Collection",
+            )
+            .await
+            .unwrap();
+            for i in first..first + n {
+                let mut props: std::collections::HashMap<&str, Value> = Default::default();
+                props.insert(
+                    "org.freedesktop.Secret.Item.Label",
+                    Value::from(format!("ext {i}")),
+                );
+                props.insert(
+                    "org.freedesktop.Secret.Item.Attributes",
+                    Value::from(std::collections::HashMap::from([(
+                        "n".to_string(),
+                        i.to_string(),
+                    )])),
+                );
+                let secret = (
+                    session.clone(),
+                    Vec::<u8>::new(),
+                    b"x".to_vec(),
+                    "text/plain".to_string(),
+                );
+                let _: (OwnedObjectPath, OwnedObjectPath) = col
+                    .call("CreateItem", &(props, secret, false))
+                    .await
+                    .unwrap();
+            }
+        })
+    };
+    writer(0, 100).await.unwrap();
+    store.unlocked(|c| c[0].items.len() >= 100).await;
+    let writers: Vec<_> = (0..4).map(|k| writer(1000 + k * 100, 50)).collect();
+    for w in writers {
+        w.await.unwrap();
+    }
+    store.request(Request::Secret(format!("{default}/none")));
+    let started = Instant::now();
+    let (mut answered, mut most) = (false, 0);
+    while started.elapsed() < Duration::from_secs(60) && !(answered && most >= 300) {
+        for e in store.store.events() {
+            match e {
+                StoreEvent::Done {
+                    request: "fetch the secret",
+                    ..
+                } => answered = true,
+                StoreEvent::Vault(Vault::Unlocked(c)) => most = most.max(c[0].items.len()),
+                _ => {}
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(answered, "the store stopped answering");
+    assert!(most >= 300, "listed at most {most} items");
+}
+
 /// With no alephd, the store says so (and keeps trying).
 #[tokio::test(flavor = "multi_thread")]
 async fn without_alephd_the_store_is_unreachable() {

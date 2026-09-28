@@ -13,7 +13,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use aleph_secret_session::{ClientDh, DH, Session};
-use futures_util::{FutureExt, StreamExt};
+use futures_util::StreamExt;
 use zbus::Connection;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 use zeroize::Zeroizing;
@@ -37,6 +37,9 @@ pub const POLL: Duration = Duration::from_secs(2);
 
 /// How long a burst of signals may run before the lists are fetched once.
 const SETTLE: Duration = Duration::from_millis(50);
+
+/// Signals queued before zbus stops reading the connection.
+pub const SIGNAL_QUEUE: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item {
@@ -147,6 +150,16 @@ impl DbusStore {
     /// Connect to `address` (the session bus if `None`); `wake` is called
     /// after every event (the window repaints).
     pub fn start(address: Option<String>, wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self::with_signal_queue(address, wake, SIGNAL_QUEUE)
+    }
+
+    /// `start` with another signal queue (the tests' small one shows that
+    /// a full queue never stalls the store).
+    pub fn with_signal_queue(
+        address: Option<String>,
+        wake: impl Fn() + Send + Sync + 'static,
+        queue: usize,
+    ) -> Self {
         let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel();
         let (ev_tx, ev_rx) = mpsc::channel();
         std::thread::Builder::new()
@@ -160,7 +173,7 @@ impl DbusStore {
                     tx: ev_tx,
                     wake: std::sync::Arc::new(wake),
                 };
-                rt.block_on(run(address, req_rx, emit));
+                rt.block_on(run(address, req_rx, emit, queue));
             })
             .expect("a thread");
         Self {
@@ -574,6 +587,7 @@ async fn run(
     address: Option<String>,
     mut requests: tokio::sync::mpsc::UnboundedReceiver<Request>,
     emit: Emit,
+    queue: usize,
 ) {
     emit.send(StoreEvent::Vault(Vault::Connecting));
     let conn = loop {
@@ -594,9 +608,18 @@ async fn run(
         .path_namespace(SERVICE_PATH)
         .expect("a valid path")
         .build();
-    let mut signals = zbus::MessageStream::for_match_rule(rule, &conn, Some(256))
-        .await
-        .ok();
+    // (Drained by a task of its own, which only marks the lists dirty: a
+    // full queue makes zbus stop reading the connection, and a listing
+    // waiting on its replies would then wait forever.)
+    let dirty = std::sync::Arc::new(tokio::sync::Notify::new());
+    if let Ok(mut signals) = zbus::MessageStream::for_match_rule(rule, &conn, Some(queue)).await {
+        let dirty = dirty.clone();
+        tokio::spawn(async move {
+            while signals.next().await.is_some() {
+                dirty.notify_one();
+            }
+        });
+    }
     let client = Client {
         conn: conn.clone(),
         session: Default::default(),
@@ -633,18 +656,11 @@ async fn run(
                 false
             }
             Some(()) = refresh.recv() => true,
-            m = async {
-                match &mut signals {
-                    Some(s) => s.next().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                // (A burst of signals means one listing.)
+            _ = dirty.notified() => {
+                // (A burst of signals means one listing: the ones during
+                // this wait, or during the listing, leave one mark.)
                 tokio::time::sleep(SETTLE).await;
-                if let Some(s) = &mut signals {
-                    while let Some(Some(_)) = s.next().now_or_never() {}
-                }
-                m.is_some()
+                true
             }
             // (Only the lock state is polled: listing every item each time
             // would cost a few calls per item.)
