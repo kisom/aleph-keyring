@@ -31,6 +31,9 @@ fn aleph(d: &Daemon, args: &[&str]) -> Command {
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("ALEPH_SYSTEMCTL", &systemctl)
         .env("ALEPH_SUDO", "false")
+        // (Setup reads /etc/pam.d and /var/lib/aleph to see whether its
+        // root step is done: never the real ones here.)
+        .env("ALEPH_SYSTEM_ROOT", home.join("system"))
         .env("ALEPH_NO_TTY", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -484,4 +487,28 @@ async fn skipped_collections_stop_setup_before_the_switchover() {
     assert!(err.contains("Not imported"), "{err}");
     assert!(!err.contains("alephd serves the Secret Service"), "{err}");
     drop(gk);
+}
+
+/// A re-run of setup skips the root step once it is done (the manifest
+/// recorded and every PAM file as apply writes it), instead of running
+/// `sudo alephctl system apply` and asking the login password again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_setup_rerun_skips_the_root_step_once_applied() {
+    let d = daemon(false, vec![]).await;
+    setup(&d).await;
+    let home = d.env.paths.data_dir.parent().unwrap().join("home");
+    let state = home.join("system/var/lib/aleph");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join("manifest.json"),
+        r#"{"files":{"sddm":{"applied":"x","removed":[],"backup":true}}}"#,
+    )
+    .unwrap();
+    let (ok, _, log) = run(&d, &["setup"], "").await;
+    assert!(ok, "{log}");
+    assert!(!log.contains("system apply"), "{log}");
+    assert!(
+        log.contains("login and screen unlock already reach aleph"),
+        "{log}"
+    );
 }

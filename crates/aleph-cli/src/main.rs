@@ -281,20 +281,27 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;
             let exe = exe.to_string_lossy();
             let apply = [exe.as_ref(), "system", "apply", "--user", user.as_str()];
-            let answer = ask(
-                &mut term,
-                "Set up login and screen unlock now (runs sudo)? [Y/n] ",
-            )?;
-            if matches!(answer.trim(), "" | "y" | "Y" | "yes") {
-                if let Err(e) = wizard::run_as_root(&apply) {
-                    eprintln!(
-                        "alephctl: {e}; run `sudo alephctl system apply --user {user}` later"
-                    );
+            // (A re-run skips it once done: no sudo, no password.)
+            if system::applied(&system::Root::as_seen_by_setup()).unwrap_or(false) {
+                eprintln!(
+                    "alephctl: login and screen unlock already reach aleph (`sudo alephctl system verify --user {user}` checks them)"
+                );
+            } else {
+                let answer = ask(
+                    &mut term,
+                    "Set up login and screen unlock now (runs sudo)? [Y/n] ",
+                )?;
+                if matches!(answer.trim(), "" | "y" | "Y" | "yes") {
+                    if let Err(e) = wizard::run_as_root(&apply) {
+                        eprintln!(
+                            "alephctl: {e}; run `sudo alephctl system apply --user {user}` later"
+                        );
+                        eprintln!("alephctl: {ROOT_STEP_PENDING}");
+                    }
+                } else {
+                    eprintln!("alephctl: later: `sudo alephctl system apply --user {user}`");
                     eprintln!("alephctl: {ROOT_STEP_PENDING}");
                 }
-            } else {
-                eprintln!("alephctl: later: `sudo alephctl system apply --user {user}`");
-                eprintln!("alephctl: {ROOT_STEP_PENDING}");
             }
             eprintln!("alephctl: setup is done (`alephctl status` shows the keyring)");
         }

@@ -32,6 +32,19 @@ tests run alephd directly, never under systemd. Those options are gone;
 a static test (`tests/units.rs`) keeps every option that implies
 `NoNewPrivileges` out of the unit.
 
+Setup's re-run offered the root step again and re-ran `sudo alephctl
+system apply` (and its login-password check) although nothing had
+changed; E10 says a re-run does only what is undone. Setup now reads the
+manifest and the PAM files (world-readable) and skips the step when
+every file is as apply writes it and recorded, pointing to `sudo
+alephctl system verify` instead. Ruled: a run whose verification was
+interrupted after apply counts as done then (the manifest does not
+record verification); cost if wrong, broken stacks go unchecked until
+`system verify` runs, with a TTY login and `system revert` as the way
+back. Also checked: SDDM does read `autologin.conf.disabled` (this
+boot's first session was `sddm-autologin`), so setup's autologin
+detection stands.
+
 ### G4. The final review of the executed Plan 4c branch: fixes
 
 Nothing critical: the forward path (`aleph setup`, then `sudo aleph

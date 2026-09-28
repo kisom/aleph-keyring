@@ -217,6 +217,23 @@ impl Root {
         }
     }
 
+    /// The system tree as setup reads it, without root:
+    /// `$ALEPH_SYSTEM_ROOT/etc/pam.d` and `.../var/lib/aleph` when that is
+    /// set (the tests), else the real ones.
+    pub fn as_seen_by_setup() -> Self {
+        match std::env::var_os("ALEPH_SYSTEM_ROOT") {
+            Some(prefix) => {
+                let prefix = PathBuf::from(prefix);
+                Self {
+                    pam_dir: prefix.join("etc/pam.d"),
+                    state_dir: prefix.join("var/lib/aleph"),
+                    owner: 0,
+                }
+            }
+            None => Self::system(),
+        }
+    }
+
     fn manifest_path(&self) -> PathBuf {
         self.state_dir.join("manifest.json")
     }
@@ -398,6 +415,32 @@ pub fn apply(root: &Root) -> Result<Report> {
         report.changed.push(service);
     }
     Ok(report)
+}
+
+/// Whether the root step is done: something is recorded, and every
+/// service file apply edits is as apply writes it, and recorded. Needs no
+/// root (the files and the manifest are world-readable), so setup's re-run
+/// can skip the step. (Files left for the user are not counted.)
+pub fn applied(root: &Root) -> Result<bool> {
+    let manifest = Manifest::load(root)?;
+    if manifest.files.is_empty() {
+        return Ok(false);
+    }
+    for service in Service::ALL {
+        let path = root.pam_dir.join(service.file());
+        if !path.exists() || not_ordinary(&path, root.owner).is_some() {
+            continue;
+        }
+        let current =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let Ok(edit) = transform(service, &current) else {
+            continue;
+        };
+        if edit.text != current || !manifest.files.contains_key(service.file()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Apply, then check the login and lock screen with `check` (real
@@ -740,6 +783,32 @@ mod tests {
             owner: unsafe { libc::getuid() },
         };
         (dir, root)
+    }
+
+    /// The root step counts as done once every service file is as apply
+    /// writes it and recorded (so setup's re-run does not ask for it
+    /// again); a file changed since (a package update) makes it pending.
+    #[test]
+    fn applied_once_every_file_is_as_apply_writes_it() {
+        let (_dir, root) = tree();
+        assert!(!applied(&root).unwrap());
+        apply(&root).unwrap();
+        assert!(applied(&root).unwrap());
+        std::fs::write(root.pam_dir.join("sddm"), fixture("omarchy", "sddm")).unwrap();
+        assert!(!applied(&root).unwrap());
+    }
+
+    /// No service files and no manifest (another distribution, or nothing
+    /// applied yet): not applied.
+    #[test]
+    fn nothing_recorded_is_not_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Root {
+            pam_dir: dir.path().join("pam.d"),
+            state_dir: dir.path().join("state"),
+            owner: unsafe { libc::getuid() },
+        };
+        assert!(!applied(&root).unwrap());
     }
 
     /// Apply edits everything and records it; revert restores every file

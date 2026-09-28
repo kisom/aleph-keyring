@@ -30,8 +30,19 @@ with gnome-keyring serving 4 items.
 | Root step (`sudo alephctl system apply`) | Pass: manifest written; login and lock-screen stacks checked |
 | Lock the screen, then unlock it | Pass: `pam.sock: unlocked`, no prompt |
 | Log out and in | Pass: `pam_aleph(sddm:auth): unlock: done`; unlocked, no prompt |
-| `alephctl setup` again, `passwd`, suspend and resume, NetworkManager | Not run yet |
+| `alephctl setup` again | Nothing imported or switched again; but it offered the root step again and re-ran `system apply` (sudo, the login password): fixed since, a re-run now skips a root step that is done |
+| Suspend and resume | Pass: `locked before sleep`; unlocked again by the lock screen after resume |
+| `passwd` (twice: a new password, then back) | Pass: `pam_aleph: password change: done`; the TPM slot re-sealed (its id changed each time) and the master key rotated, no prompt |
+| NetworkManager | Not applicable: the Wi-Fi password is system-wide, not in the keyring |
 | Chromium | Not applicable: not used on this machine |
+
+SDDM autologins at boot here: `/etc/sddm.conf.d/autologin.conf.disabled`
+is honored (SDDM reads every file in the directory; this boot's first
+session was `sddm-autologin`). Setup's autologin notice was right. After
+a reboot the keyring stays locked until the screen is locked and
+unlocked, or `alephctl unlock`; with no graphical prompter yet (Plan 5),
+a client asking before then gets `no prompter` (seen once, right after
+resume).
 
 Found on the way (DECISIONS.md G5):
 
