@@ -3,6 +3,46 @@
 Results of the manual checks in [testing.md](testing.md), newest first.
 Each release's notes summarize the entries since the previous release.
 
+## 2026-09-27, commit 429f5e4 (Plan 4c)
+
+Host: Framework Laptop 12 (13th Gen Intel Core), Intel PTT (firmware
+TPM 2.0), Omarchy 4.0.4, kernel 7.2.5-3-omarchy, libsecret 0.21.7,
+tpm2-tss 4.2.0, libfido2 1.17.0, NetworkManager 1.58.1.
+
+### `make gate-hw`
+
+| Test | Result |
+|---|---|
+| Real TPM (`tpm_hardware`, the test binary run with sudo) | Pass |
+| FIDO2: YubiKey 5 (`fido2_hardware`, with the PIN) | Pass |
+
+Only pass or fail was kept: no timings or `Status` values this time.
+
+### Setup and login unlock (testing.md, alephd with real clients, step 6)
+
+The first real run, on the owner's own account (not a test account),
+with gnome-keyring serving 4 items.
+
+| Step | Result |
+|---|---|
+| Install (`packaging/install.sh`) | Pass, after two fixes (below) |
+| `alephctl setup`: TPM reported, keyring created, items imported, switched over | Pass: TPM slot plus the recovery slot; `secret-tool` finds the 4 items through alephd; gnome-keyring's socket and service masked |
+| Root step (`sudo alephctl system apply`) | Pass: manifest written; login and lock-screen stacks checked |
+| Lock the screen, then unlock it | Pass: `pam.sock: unlocked`, no prompt |
+| Log out and in | Pass: `pam_aleph(sddm:auth): unlock: done`; unlocked, no prompt |
+| `alephctl setup` again, `passwd`, suspend and resume, NetworkManager | Not run yet |
+| Chromium | Not applicable: not used on this machine |
+
+Found on the way (DECISIONS.md G5):
+
+- `aleph setup` ran TeX: texlive-bin owns `/usr/bin/aleph`. The CLI is
+  now `alephctl`.
+- alephd's password check failed with PAM_AUTHINFO_UNAVAIL: the unit's
+  seccomp-based options implied `NoNewPrivileges` in the user manager,
+  so `unix_chkpwd` could not read `/etc/shadow`. The options are gone.
+  (A reinstalled unit takes effect only once alephd restarts; `make
+  install` now does that.)
+
 ## 2026-09-26, commit 080466d (Plan 2)
 
 Host: Omarchy (Arch), kernel 7.2.5-3-omarchy, libfido2 1.17, tpm2-tss 4.2.
