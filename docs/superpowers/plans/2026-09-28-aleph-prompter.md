@@ -5,13 +5,13 @@
 **Goal:** a locked keyring asks for the login password or a security key in a small window (`aleph-gui prompt`) whenever an application needs a secret, instead of waiting for `alephctl unlock`.
 
 **Architecture:**
-- **alephd** already starts `<prompt.program> prompt` with one end of a socketpair as `ALEPH_PROMPT_FD` and speaks `aleph-prompt-proto` over it (Plan 3). It now starts it on the session's *current* Wayland display, read at each launch from the systemd user manager's environment: alephd is often started by `pam_aleph` during login, before the compositor exists, so its own environment has no display.
+- **alephd** already starts `<prompt.program> prompt` with one end of a socketpair as `ALEPH_PROMPT_FD` and speaks `aleph-prompt-proto` over it (Plan 3). It now starts it on the session's *current* Wayland display, read at each launch from the systemd user manager's environment: alephd is often started by `pam_aleph` during login, before the compositor exists, so its own environment has no display. And prompter trouble (a prompt that times out, a prompter that crashes or cannot open its window) no longer dismisses an unlock: it waits for an unlock from elsewhere, as with no prompter (spec §4); only Cancel dismisses.
 - **`aleph-gui`** is a new crate: a pure conversation state machine (what the window shows, which answers it may send), a reader thread on the socket, a theme (Omarchy's `colors.toml`, followed live, or Aleph neon), and an eframe window with app_id `aleph-prompt` drawing one screen per protocol message.
 - **Setup** offers a Hyprland window rule (float, center, pin, keep focus), included from `~/.config/hypr/hyprland.lua`; revert takes it out. `packaging/install.sh` installs `aleph-gui` and the rule.
 
 **Tech Stack:** Rust 1.98; eframe/egui 0.36 (glow renderer, Wayland only); egui_kittest 0.36 (screens driven through AccessKit, snapshots rendered with wgpu); notify 8; zbus 5 (the user manager's `Environment`); Hyprland's Lua configuration.
 
-**Spec:** `docs/superpowers/specs/2026-09-26-aleph-design.md` revision 2 (§6 "Prompter orchestration", §7 "GUI": Theme and Prompter, §8 installs, §9 "GUI" testing). Decisions: `DECISIONS.md` H1 (the split, the owner's) and H2 (calls made while prototyping; Task 6 adds both). Task 6 updates the spec.
+**Spec:** `docs/superpowers/specs/2026-09-26-aleph-design.md` revision 2 (§4 "Locked search", §6 "Prompter orchestration", §7 "GUI": Theme and Prompter, §8 installs, §9 "GUI" testing). Decisions: `DECISIONS.md` H1 (the split, the owner's), H2 (calls made while prototyping), and H3 (the pre-execution review's fixes); Task 6 adds them. Task 6 updates the spec.
 
 **Plan series:** 1–4c (done) → **5a the prompter (this plan)** → 5b the manager window → 6 packaging and CI.
 
@@ -26,14 +26,16 @@
 
 Every task was prototyped on a clone of `master` and the whole gate run (`make gate`: fmt, clippy `-D warnings`, the full suite) green; the code below is that prototype's, verbatim. The properties below were each checked by reverting them (the "teeth" step of the owning task). `DECISIONS.md` H2 lists these calls for the reviewers.
 
-- **The display comes from the user manager** (`org.freedesktop.systemd1.Manager.Environment`, read uncached at each launch, 2 s limit), and only when the manager cannot be asked from alephd's own environment. No `WAYLAND_DISPLAY` there means no graphical session now: no prompter, and the prompt waits for an unlock from elsewhere (§4), as before. The journal says which reason stopped a prompter (no display, or `aleph-gui` not installed).
+- **The display comes from the user manager** (`org.freedesktop.systemd1.Manager.Environment`, read uncached at each launch, 2 s limit), and only when the manager cannot be asked from alephd's own environment. No `WAYLAND_DISPLAY` there means no graphical session now: no prompter, and the prompt waits for an unlock from elsewhere (§4), as before. Only a bare socket name is used (`wayland-1`), never a path: any process of the user can set the manager's environment. The journal says which reason stopped a prompter (no display, or `aleph-gui` not installed).
+- **Prompter trouble waits, only Cancel dismisses:** an unlock prompt whose prompter times out (`prompt.timeout`), closes or crashes before answering, or sends nonsense (`Error::Prompt`) now waits for an unlock from elsewhere, like one with no prompter; the prompts that joined it wait with it. Before this plan no prompter ever started (alephd never had a display), so every prompt waited; with a working prompter, a timeout would otherwise dismiss the unlock while the user is away (an autologin at boot, a background client while the screen is locked), and a client like Chromium would take the dismissal as "no key". Such a conversation ends with `Done` and no message, and so does one ended by an unlock elsewhere (the window just closes).
 - **The GUI's settings are their own file,** `~/.config/aleph/gui.toml` (`theme = "auto" | "neon"`, `scanlines = true|false`): alephd's `config.toml` refuses unknown keys, and alephd has no use for them. An unreadable file warns (stderr) and uses the defaults: a prompt must still open.
-- **Reduced motion** is GNOME's `enable-animations = false` (`gsettings`), the setting GTK apps and the portal share; absent `gsettings`, not requested. It turns off the scanlines, spinners, and egui's animations. Scanlines are static lines, drawn over everything.
+- **Reduced motion** is GNOME's `enable-animations = false` (`gsettings`, given at most a second), the setting GTK apps and the portal share; absent `gsettings`, not requested. It turns off the scanlines, spinners, and egui's animations. Scanlines are static lines, drawn over everything.
 - **Omarchy's palette:** `background`, `foreground`, and `accent` are required; `dark_background` (fields), `selection`, `muted`, `red` (errors), `yellow` (warnings), and `mode` are used when present, blends otherwise. A file that does not parse falls back to Aleph neon. Omarchy rewrites the theme's files in place: the watcher follows `~/.local/state/omarchy/current` recursively.
-- **The conversation is strict:** the first message must be `Begin`; the recovery-key question is refused (answered `Cancel`, nothing typed) outside a `Recover` conversation; one answer per question; `Cancel` any time. A `Done` without a message closes the window, with one it stays until closed; alephd closing the socket closes it too. A window that cannot open sends `Cancel` at once and exits 1, so alephd never waits out the prompt timeout.
-- **Text from other programs** (collection labels in confirmations, process names, key names, errors) is shown on one line per item, control characters replaced, and cut at 80 characters (names, the title) or 400 (questions, errors, messages): it can neither draw a fake prompt inside the real one nor push the buttons out of view.
-- **The window** is 460×300 logical pixels, not resizable, titled `aleph`. Escape cancels (closes, once over); Enter answers (a confirmation's default; "Use security key" when it is the only method). During a typed-password back-off the password is held (a countdown shows) while a security key can still be used.
+- **The conversation is strict:** the first message must be `Begin`; the recovery-key question is refused (answered `Cancel`, nothing typed) outside a `Recover` conversation; one answer per question; `Cancel` any time. A `Done` without a message closes the window; with one it stays up for 20 seconds, or until closed; alephd closing the socket closes it too. A window that cannot open exits 1 without answering, so alephd reads "no prompter" at once and the prompt waits (a `Cancel` would dismiss it). Keys arriving in the first 400 ms of a screen are ignored, so the end of something typed into another window (and its Enter) never becomes an answer. `aleph-gui` makes itself non-dumpable (it holds a typed password).
+- **Text from other programs** (collection labels in confirmations, process names, key names, errors) gets no line breaks of its own: control characters and runs of white space become one space, and it is cut at 80 characters (names, the title) or 400 (questions, errors, messages). It can neither draw a fake prompt inside the real one nor push the buttons out of view.
+- **The window** is 460×300 logical pixels, not resizable, titled `aleph`. Escape cancels (closes, once over); Enter answers (a confirmation's default; "Use security key" when it is the only method). During a typed-password back-off the password is held (a countdown shows; the field keeps the keyboard) while a security key can still be used. AccessKit is on (screen readers see the prompt; the tests drive it through AccessKit too).
 - **Hyprland:** only the Lua configuration (Omarchy's) gets the offer. Setup appends `pcall(dofile, "/usr/share/aleph/hyprland/aleph-prompt.lua")` (with a comment line) in place, so a symlinked dotfile stays a symlink and an uninstalled aleph never breaks Hyprland's configuration; revert removes exactly that. The rule floats, centers, pins, and keeps the keyboard on the prompt (`stay_focused`) so a password is never typed into another window; the prompt always ends (answer, Escape, or the prompt timeout).
+- **Left as they are (rulings in H3):** Cancel while "Touch your key" is up closes the window, but alephd is inside the key's own wait and reads the Cancel only when that ends (a touch in the meantime still unlocks, which is what the person did); confirmation prompts (create or delete a collection) are not serialized the way unlocks are, so two can be open at once; the rule applies to any window claiming app_id `aleph-prompt` (a same-user program can already grab the keyboard in other ways).
 - **The terminal prompter's comment** claimed the GUI offers "skip" while waiting for a key: the protocol has no such answer. Cancel ends the operation in both.
 
 ## Global Constraints
@@ -49,18 +51,19 @@ Every task was prototyped on a clone of `master` and the whole gate run (`make g
 
 ## Review Focus
 
-1. **The prompt opens without the keyboard** (behind a fullscreen window, on another monitor, or before the rule is included), and a password is typed into another window. → the rule's `stay_focused` and setup's offer: Task 5 `the_hyprland_files_are_lua` (the rule names the app_id), `setup_adds_the_prompts_window_rule_to_hyprland_once`; the window taking focus itself: Task 4 `after_a_wrong_password_the_field_is_ready_again`. Focus on the real desktop is a manual check (Task 6, testing.md).
-2. **alephd started before the compositor** (PAM at login, SDDM autologin at boot) must still show the prompt once the desktop is up. → Task 1 `the_display_is_read_from_the_user_manager_at_each_launch`, `a_launched_prompter_talks_over_its_inherited_socket`, `no_display_starts_no_prompter`.
-3. **Text from other programs** (a collection label, a process name) must not fake prompt lines or hide the buttons. → Task 2 `shown_text_has_no_line_breaks_and_is_cut`; Task 4 snapshot `confirm_long_label_*`.
-4. **The conversation ends under the window** (alephd restarts, the prompt times out, the keyring is unlocked elsewhere): the window must close or say why, never sit waiting. → Task 4 `alephd_going_away_closes_the_window`, `done_closes_unless_there_is_a_message`, `without_a_display_it_cancels`.
-5. **A retry** after a wrong password, and a TPM or attempt back-off: the field is cleared and focused again, and a password is not sent before it may be tried. → Task 2 `a_password_waits_out_the_back_off_but_a_key_does_not`; Task 4 `after_a_wrong_password_the_field_is_ready_again`, `a_password_is_held_during_the_back_off`.
+1. **The prompt times out, or cannot open its window** (the person is away after an autologin boot; a background client asks while the screen is locked; a broken GL driver): the unlock must wait for the next unlock from elsewhere, never come back to the client empty-handed. → Task 1 `a_prompter_that_ends_without_an_answer_leaves_the_unlock_waiting`, `unlock_prompts_wait_when_the_prompter_times_out`; Task 4 `without_a_display_it_exits_without_answering`.
+2. **The prompt and the keyboard:** it opens without the keyboard (behind a fullscreen window, before the rule is included) and a password goes into another window; or it opens while the person is typing elsewhere and takes the rest of that text as an answer; or it holds the keyboard after it has nothing left to ask. → Task 5 `the_hyprland_files_are_lua`, `setup_adds_the_prompts_window_rule_to_hyprland_once`; Task 4 `the_first_keys_after_a_screen_appears_are_ignored`, `after_a_wrong_password_the_field_is_ready_again`, `a_closing_message_closes_itself`, `done_closes_unless_there_is_a_message`; Task 1 `a_waiting_prompter_is_released_when_the_vault_unlocks_elsewhere` (no message). Focus on the real desktop is a manual check (Task 6).
+3. **alephd started before the compositor** (PAM at login, SDDM autologin at boot) must still show the prompt once the desktop is up, and only on a real display name. → Task 1 `the_display_is_read_from_the_user_manager_at_each_launch`, `the_managers_environment_wins_over_alephds_own`, `a_launched_prompter_talks_over_its_inherited_socket`, `no_display_starts_no_prompter`.
+4. **Text from other programs** (a collection label, a process name) must not fake prompt lines or hide the buttons. → Task 2 `shown_text_has_no_line_breaks_and_is_cut`; Task 4 snapshot `confirm_long_label_*`.
+5. **Retries:** after a wrong password, and during and after a TPM or attempt back-off, the field is cleared, keeps the keyboard, and a password is sent only once it may be tried. → Task 2 `a_password_waits_out_the_back_off_but_a_key_does_not`; Task 4 `after_a_wrong_password_the_field_is_ready_again`, `a_password_is_held_during_the_back_off`, `a_held_password_is_sent_once_the_back_off_ends`; Task 4 `alephd_going_away_closes_the_window`.
 
 ## File Structure
 
 ```
 crates/aleph-daemon/src/display.rs        Session (trait), OwnEnvironment, UserManager (the user manager's environment)
 crates/aleph-daemon/src/{prompt,main,lib}.rs  ProgramLauncher starts the prompter on the session's display
-crates/aleph-daemon/tests/{display,launcher}.rs
+crates/aleph-daemon/src/keyring.rs        prompter trouble leaves an unlock waiting; no message when nothing is left to say
+crates/aleph-daemon/tests/{display,launcher,keyring,secret_service}.rs
 crates/aleph-gui/Cargo.toml
 crates/aleph-gui/src/lib.rs
 crates/aleph-gui/src/conversation.rs      Conversation, Screen, Action, shown: the protocol without drawing
@@ -80,11 +83,11 @@ docs: spec (§6, §7, §8, §9), DECISIONS.md (H1, H2), testing.md, README.md
 
 ---
 
-### Task 1: alephd starts the prompter on the session's display
+### Task 1: alephd: the session's display, and prompter trouble waits
 
 **Files:**
 - Create: `crates/aleph-daemon/src/display.rs`, `crates/aleph-daemon/tests/display.rs`
-- Modify: `crates/aleph-daemon/src/lib.rs`, `crates/aleph-daemon/src/prompt.rs` (`ProgramLauncher`), `crates/aleph-daemon/src/main.rs`, `crates/aleph-daemon/tests/launcher.rs`
+- Modify: `crates/aleph-daemon/src/lib.rs`, `crates/aleph-daemon/src/prompt.rs` (`ProgramLauncher`), `crates/aleph-daemon/src/main.rs`, `crates/aleph-daemon/src/keyring.rs` (`unlock_prompting`, `unlock_conversation`, `converse`), `crates/aleph-daemon/tests/launcher.rs`, `crates/aleph-daemon/tests/keyring.rs`, `crates/aleph-daemon/tests/secret_service.rs`
 
 **Interfaces:**
 - Produces:
@@ -92,6 +95,8 @@ docs: spec (§6, §7, §8, §9), DECISIONS.md (H1, H2), testing.md, README.md
   - `display::OwnEnvironment` (alephd's own `WAYLAND_DISPLAY`)
   - `display::UserManager { pub conn: zbus::Connection, pub runtime: tokio::runtime::Handle }` (blocks; call from blocking threads only)
   - `prompt::ProgramLauncher { pub config: Arc<Mutex<Config>>, pub session: Arc<dyn display::Session> }`; the child gets `WAYLAND_DISPLAY` set to the session's display
+  - `Keyring::unlock_prompting` returns `Ok(false)` (wait) for `Error::Prompt(_)` too; `converse` sends `Done` with no message for `Error::Prompt(_)`; an unlock elsewhere ends the conversation with no message
+  - for Task 4: a prompter that exits without answering makes an unlock prompt wait
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -121,6 +126,11 @@ mod tests {
             Some("wayland-0".into())
         );
         assert_eq!(choose(Some(&["WAYLAND_DISPLAY=".to_string()]), None), None);
+        // A path (a proxy socket anywhere) is refused.
+        assert_eq!(
+            choose(Some(&["WAYLAND_DISPLAY=/tmp/proxy".to_string()]), None),
+            None
+        );
     }
 }
 ```
@@ -259,10 +269,163 @@ fn no_display_starts_no_prompter() {
 }
 ```
 
+In `crates/aleph-daemon/tests/keyring.rs`, at the end of `a_waiting_prompter_is_released_when_the_vault_unlocks_elsewhere`, replace
+
+```rust
+    assert!(
+        matches!(seen.last(), Some(ToPrompter::Done { ok: true, .. })),
+        "{:?}",
+        seen.last()
+    );
+}
+```
+
+with
+
+```rust
+    // (No message: the window closes by itself.)
+    assert!(
+        matches!(
+            seen.last(),
+            Some(ToPrompter::Done {
+                ok: true,
+                message: None
+            })
+        ),
+        "{:?}",
+        seen.last()
+    );
+}
+```
+
+and add after that test (before `a_key_wait_is_released_when_the_vault_unlocks_elsewhere`'s doc comment):
+
+```rust
+/// Prompter trouble is not the user's answer: a prompter that closes
+/// without answering (it could not open its window) or stays silent until
+/// the prompt timeout leaves the unlock waiting (`Ok(false)`, as with no
+/// prompter: spec §4), and is told `Done` without a message. Only Cancel
+/// dismisses.
+#[test]
+fn a_prompter_that_ends_without_an_answer_leaves_the_unlock_waiting() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+    let env = env();
+    let k = keyring(&env, MockKeys::default());
+    create_with_password(&k);
+    k.lock();
+    let closed = k.unlock_prompting(
+        || {
+            let (ours, theirs) = UnixStream::pair()?;
+            drop(theirs);
+            aleph_daemon::prompt::Channel::new(ours, Duration::from_secs(5))
+        },
+        None,
+    );
+    assert!(matches!(closed, Ok(false)), "{closed:?}");
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let silent = k.unlock_prompting(
+        || aleph_daemon::prompt::Channel::new(ours, Duration::from_millis(300)),
+        None,
+    );
+    assert!(matches!(silent, Ok(false)), "{silent:?}");
+    let last: ToPrompter = BufReader::new(theirs)
+        .lines()
+        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+        .last()
+        .unwrap();
+    assert_eq!(
+        last,
+        ToPrompter::Done {
+            ok: false,
+            message: None
+        }
+    );
+    assert!(k.is_locked());
+}
+```
+
+In `crates/aleph-daemon/tests/secret_service.rs`, replace the whole test `joined_unlock_prompts_end_when_the_conversation_is_dismissed` (from its doc comment, `/// Unlock prompts that joined a running conversation end with it when it`, through its closing brace, just before `/// Final-review minor 11:`) with:
+
+```rust
+/// A prompter that times out (or crashes) is not the user's answer: the
+/// unlock prompt that started it and those that joined it keep waiting
+/// (as with no prompter, spec §4), and complete, undismissed, when the
+/// vault is unlocked some other way. (Only Cancel dismisses.)
+#[tokio::test(flavor = "multi_thread")]
+async fn unlock_prompts_wait_when_the_prompter_times_out() {
+    use futures_util::StreamExt;
+    let (s, holding) = served_holding().await;
+    s.svc.lock().await.unwrap();
+    let c = client(&s).await;
+    let mut prompts = Vec::new();
+    for _ in 0..2 {
+        let (_, prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) = service(&c)
+            .await
+            .call(
+                "Unlock",
+                &(vec![
+                    ObjectPath::try_from("/org/freedesktop/secrets/aliases/default").unwrap(),
+                ],),
+            )
+            .await
+            .unwrap();
+        let p = zbus::Proxy::new(
+            &c,
+            "org.freedesktop.secrets",
+            prompt,
+            "org.freedesktop.Secret.Prompt",
+        )
+        .await
+        .unwrap();
+        let completed = p.receive_signal("Completed").await.unwrap();
+        p.call_method("Prompt", &("",)).await.unwrap();
+        prompts.push((p, completed));
+        // The first starts the conversation; the second joins it.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert_eq!(held(&holding), 1);
+    // The held conversation times out after 2 s: both prompts wait on.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    for (_, completed) in &mut prompts {
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), completed.next())
+                .await
+                .is_err(),
+            "a prompt completed after the prompter timed out"
+        );
+    }
+    assert_eq!(s.svc.waiting_count(), 2);
+    // "alephctl unlock" in a terminal: both complete, undismissed.
+    let keyring = s.svc.keyring.clone();
+    tokio::task::spawn_blocking(move || {
+        keyring.unlock(&mut Interactive::new(vec![password(PW)]).channel(), None)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    s.svc.unlocked().await.unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    for (_, completed) in &mut prompts {
+        let msg = tokio::time::timeout_at(deadline, completed.next())
+            .await
+            .expect("the prompt completes")
+            .unwrap();
+        let (dismissed, _): (bool, zbus::zvariant::OwnedValue) = msg.body().deserialize().unwrap();
+        assert!(!dismissed);
+    }
+    assert_eq!(s.svc.waiting_count(), 0);
+    assert_eq!(held(&holding), 1);
+}
+```
+
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -q -p aleph-daemon --lib display`
 Expected: the build fails: `choose`, `Session`, and `UserManager` do not exist.
+Run: `cargo test -q -p aleph-daemon --test keyring -- a_prompter_that_ends a_waiting_prompter_is_released && cargo test -q -p aleph-daemon --test secret_service unlock_prompts_wait`
+Expected: all three FAIL (the unlock returns `Err`, `Done` carries a message, and the prompts complete dismissed after the timeout).
 
 - [ ] **Step 3: Implement**
 
@@ -292,10 +455,16 @@ pub struct OwnEnvironment;
 
 impl Session for OwnEnvironment {
     fn wayland_display(&self) -> Option<String> {
-        std::env::var("WAYLAND_DISPLAY")
-            .ok()
-            .filter(|v| !v.is_empty())
+        std::env::var("WAYLAND_DISPLAY").ok().filter(|v| usable(v))
     }
+}
+
+/// A display name the prompter may use: a bare socket name in the runtime
+/// directory (`wayland-1`), never a path. Any process of the user can set
+/// the manager's environment; a path could send the prompt, and what is
+/// typed into it, through a proxy of its choosing.
+fn usable(name: &str) -> bool {
+    !name.is_empty() && !name.contains('/')
 }
 
 /// The systemd user manager's environment (its `Environment` property,
@@ -343,7 +512,7 @@ fn choose(manager: Option<&[String]>, own: Option<String>) -> Option<String> {
         Some(env) => env
             .iter()
             .find_map(|kv| kv.strip_prefix("WAYLAND_DISPLAY="))
-            .filter(|v| !v.is_empty())
+            .filter(|v| usable(v))
             .map(str::to_string),
         None => own,
     }
@@ -456,10 +625,76 @@ with
 
 (Prompts run on blocking threads: `SecretService` runs each in `spawn_blocking`, and `Keyring::unlock_prompting` is called from there, so `Handle::block_on` inside `UserManager` is allowed.)
 
+In `crates/aleph-daemon/src/keyring.rs`, in `unlock_prompting`, replace
+
+```rust
+        match converse(&mut chan, |chan| self.unlock_conversation(chan, caller)) {
+            Err(_) if !self.is_locked() => Ok(true),
+            other => other.map(|()| true),
+        }
+```
+
+with
+
+```rust
+        match converse(&mut chan, |chan| self.unlock_conversation(chan, caller)) {
+            Err(_) if !self.is_locked() => Ok(true),
+            // Prompter trouble (it timed out, closed or crashed before an
+            // answer, could not open its window) is not the user's no: the
+            // prompt waits for an unlock from elsewhere, as with no
+            // prompter (§4). Only Cancel dismisses.
+            Err(Error::Prompt(e)) => {
+                tracing::info!("the prompter ended without an answer: {e}");
+                Ok(false)
+            }
+            other => other.map(|()| true),
+        }
+```
+
+in `unlock_conversation`, replace
+
+```rust
+            Err(Error::UnlockedElsewhere) => {
+                return Ok(Some("The keyring was unlocked meanwhile.".into()));
+            }
+```
+
+with
+
+```rust
+            // (No message: the window just closes. A message would keep a
+            // pinned, focused window up until someone dismissed it.)
+            Err(Error::UnlockedElsewhere) => return Ok(None),
+```
+
+and in `converse`, replace
+
+```rust
+        Err(e) => {
+            chan.done(false, Some(e.to_string()));
+            Err(e)
+        }
+```
+
+with
+
+```rust
+        Err(e) => {
+            // Prompter trouble has nothing to tell the person: the window
+            // closes (if it is still there to be told).
+            let message = match &e {
+                Error::Prompt(_) => None,
+                e => Some(e.to_string()),
+            };
+            chan.done(false, message);
+            Err(e)
+        }
+```
+
 - [ ] **Step 4: Run the tests, clippy, and fmt**
 
-Run: `cargo test -q -p aleph-daemon --lib display && cargo test -q -p aleph-daemon --test display --test launcher && cargo test -q -p aleph-daemon && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
-Expected: `ok. 1 passed` (the unit test; the rest filtered), then `ok. 1 passed` (display) and `ok. 2 passed` (launcher), then every aleph-daemon test binary ok.
+Run: `cargo test -q -p aleph-daemon --lib display && cargo test -q -p aleph-daemon --test display --test launcher && cargo test -q -p aleph-daemon --test keyring --test secret_service && cargo test -q -p aleph-daemon && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
+Expected: `ok. 1 passed` (the unit test; the rest filtered), then `ok. 1 passed` (display) and `ok. 2 passed` (launcher), then `ok. 52 passed` (keyring) and `ok. 17 passed` (secret_service), then every aleph-daemon test binary ok.
 
 - [ ] **Step 5: Confirm the tests have teeth**
 
@@ -467,12 +702,15 @@ Make each change below, run its test and see it FAIL, then undo the change and s
 
 - **the child gets the session's display** (`crates/aleph-daemon/src/prompt.rs`), test `cargo test -p aleph-daemon --test launcher`: replace `.env("WAYLAND_DISPLAY", display);` with `;let _ = display;` (the prompter script exits 3; the conversation fails).
 - **the manager's environment is read** (`crates/aleph-daemon/src/display.rs`), test `env -u WAYLAND_DISPLAY cargo test -p aleph-daemon --test display`: replace `choose(manager.as_deref(), OwnEnvironment.wayland_display())` with `{ let _ = manager; OwnEnvironment.wayland_display() }`.
+- **never a path** (`display.rs`), test `cargo test -p aleph-daemon --lib display`: replace `!name.is_empty() && !name.contains('/')` with `!name.is_empty()`.
+- **prompter trouble waits** (`keyring.rs`), tests `cargo test -p aleph-daemon --test keyring a_prompter_that_ends` and `cargo test -p aleph-daemon --test secret_service unlock_prompts_wait`: delete the `Err(Error::Prompt(e)) => { … Ok(false) }` arm in `unlock_prompting`.
+- **no message when nothing is left to say** (`keyring.rs`), test `cargo test -p aleph-daemon --test keyring -- a_prompter_that_ends a_waiting_prompter_is_released`: in `converse` replace `Error::Prompt(_) => None,` with nothing, and replace `Err(Error::UnlockedElsewhere) => return Ok(None),` with `Err(Error::UnlockedElsewhere) => return Ok(Some("x".into())),` (both FAIL).
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add crates/aleph-daemon
-git commit -m "fix: alephd starts the prompter on the session's current display" -m "alephd is often started by pam_aleph during login, before the compositor exports WAYLAND_DISPLAY: the display now comes from the user manager's environment at each launch." -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git commit -m "fix: the prompter's display comes from the session; prompter trouble waits" -m "alephd is often started by pam_aleph during login, before the compositor exports WAYLAND_DISPLAY: the display now comes from the user manager's environment at each launch. A prompter that times out, crashes, or cannot open its window no longer dismisses an unlock: it waits, as with no prompter (spec 4)." -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
 
 ### Task 2: `aleph-gui`: the conversation and the socket
@@ -649,6 +887,11 @@ mod tests {
     #[test]
     fn shown_text_has_no_line_breaks_and_is_cut() {
         assert_eq!(shown("a\nb\tc", 10), "a b c");
+        // Padding cannot push text onto a line of its own.
+        assert_eq!(
+            shown(&format!("a{}Wrong password", " ".repeat(300)), 40),
+            "a Wrong password"
+        );
         assert_eq!(shown(&"x".repeat(500), 5), "xxxxx…");
         assert_eq!(shown("ééé", 2), "éé…");
         let mut c = begun(Purpose::Reauth);
@@ -900,16 +1143,18 @@ const NAME: usize = 80;
 /// The longest question, error, or closing message shown.
 const TEXT: usize = 400;
 
-/// Text from alephd as shown: control characters (newlines included)
-/// become spaces, and it is cut to `max` characters. Collection labels and
-/// process names come from other programs; they must not be able to draw
-/// a fake prompt inside the real one, or push its buttons out of view.
+/// Text from alephd as shown: control characters (newlines included) and
+/// runs of white space become one space, and it is cut to `max`
+/// characters. Collection labels and process names come from other
+/// programs; they must not be able to draw a fake prompt inside the real
+/// one (lines of their own), or push its buttons out of view.
 pub fn shown(s: &str, max: usize) -> String {
-    let clean: String = s
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    let clean = clean.trim();
+    let clean = s
+        .split(|c: char| c.is_control() || c.is_whitespace())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let clean = clean.as_str();
     match clean.char_indices().nth(max) {
         Some((cut, _)) => format!("{}…", &clean[..cut]),
         None => clean.to_string(),
@@ -1237,7 +1482,7 @@ Make each change below in `crates/aleph-gui/src/conversation.rs`, run `cargo tes
 
 - **the recovery key only in a recovery** (`the_recovery_key_is_refused_outside_a_recovery`): replace `ToPrompter::RecoveryKey { .. } if self.purpose != Some(Purpose::Recover) => {` with `ToPrompter::RecoveryKey { .. } if false => {`.
 - **the back-off holds a password** (`a_password_waits_out_the_back_off_but_a_key_does_not`): replace `&& retry_at.is_none_or(|at| now >= at) =>` with `=>`.
-- **one line, cut** (`shown_text_has_no_line_breaks_and_is_cut`): replace `.map(|c| if c.is_control() { ' ' } else { c })` with `.map(|c| c)`.
+- **one line, cut** (`shown_text_has_no_line_breaks_and_is_cut`): replace `.split(|c: char| c.is_control() || c.is_whitespace())` with `.split(|c: char| c == '\n')`.
 
 - [ ] **Step 6: Commit**
 
@@ -1501,14 +1746,40 @@ pub fn home() -> Option<PathBuf> {
 
 /// Whether the desktop asks for reduced motion: GNOME's
 /// `enable-animations` setting, which GTK and the portal share, read
-/// through `gsettings` (absent: not asked).
+/// through `gsettings` (absent: not asked). It gets at most a second: a
+/// stuck settings service must not keep the prompt from opening.
 pub fn reduced_motion() -> bool {
-    std::process::Command::new("gsettings")
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+    let Ok(mut child) = std::process::Command::new("gsettings")
         .args(["get", "org.gnome.desktop.interface", "enable-animations"])
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
-        .is_ok_and(|o| o.status.success() && animations_off(&String::from_utf8_lossy(&o.stdout)))
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut out = String::new();
+                if let Some(mut stdout) = child.stdout.take() {
+                    let _ = stdout.read_to_string(&mut out);
+                }
+                return status.success() && animations_off(&out);
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 fn animations_off(gsettings_output: &str) -> bool {
@@ -1737,7 +2008,8 @@ git commit -m "feat(gui): settings, the Omarchy theme, and Aleph neon" -m "Co-Au
 - Produces:
   - `screens::SIZE: [f32; 2]` (460×300); `screens::PromptUi { pub conversation, pub palette, pub still, pub secret: Zeroizing<String>, pub groups: [Zeroizing<String>; 2], pub show_recovery_key }` with `new(Palette, bool)`, `screen_changed()`, `show(&mut self, &mut egui::Ui, Instant) -> Option<Action>`
   - `app::PromptApp { pub ui: PromptUi, pub closed: bool, .. }` with `new(UnixStream, Receiver<Event>, Settings, Option<PathBuf>, bool) -> Self`, `watch_theme(&mut self, &egui::Context)`, `frame(&mut self, &mut egui::Ui)`; `impl eframe::App`
-  - the binary `aleph-gui prompt` (exit 2: usage or no usable `ALEPH_PROMPT_FD`; exit 1: the window could not open, after sending `Cancel`)
+  - `app::{INPUT_GUARD, MESSAGE_FOR}` and the fields `pub input_guard: Duration`, `pub message_for: Duration` (the tests shorten them)
+  - the binary `aleph-gui prompt` (exit 2: usage or no usable `ALEPH_PROMPT_FD`; exit 1: the window could not open, without answering)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1787,9 +2059,10 @@ Replace `.gitignore` with:
 
 ```
 /target
-# egui_kittest writes these next to a failing snapshot.
+# egui_kittest writes these next to a snapshot that failed or was updated.
 *.new.png
 *.diff.png
+*.old.png
 ```
 
 Write `crates/aleph-gui/tests/screens.rs`:
@@ -1854,7 +2127,10 @@ fn window(theme: ThemeChoice) -> (Harness<'static, PromptApp>, Daemon) {
     };
     // A fixed home: auto reads the Omarchy fixture from it.
     let home = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/home");
-    let app = PromptApp::new(ours, events, settings, Some(home), true);
+    let mut app = PromptApp::new(ours, events, settings, Some(home), true);
+    // (Typed at once, as the tests do; `the_first_keys_after_a_screen_appears_are_ignored`
+    // checks the guard.)
+    app.input_guard = Duration::ZERO;
     let palette = app.ui.palette.clone();
     let harness = Harness::builder()
         .with_size(egui::Vec2::from(aleph_gui::screens::SIZE))
@@ -2092,12 +2368,75 @@ fn after_a_wrong_password_the_field_is_ready_again() {
     );
 }
 
+/// Keys arriving just as a screen appears (typed into another window)
+/// are ignored: they never become an answer.
+#[test]
+fn the_first_keys_after_a_screen_appears_are_ignored() {
+    let (mut h, mut d) = window(ThemeChoice::Neon);
+    h.state_mut().input_guard = Duration::from_secs(60);
+    begin(&mut d, Purpose::Unlock, "Unlock the keyring");
+    d.say(&ask(vec![Method::Password], None, None));
+    settle(&mut h);
+    h.get_by_label("Login password").type_text("hunter2");
+    frames(&mut h);
+    h.key_press(Key::Enter);
+    frames(&mut h);
+    assert!(h.state().ui.secret.is_empty());
+    assert!(d.heard_nothing());
+}
+
+/// A closing message closes itself: the window holds the keyboard while it
+/// is open.
+#[test]
+fn a_closing_message_closes_itself() {
+    let (mut h, mut d) = window(ThemeChoice::Neon);
+    h.state_mut().message_for = Duration::from_millis(100);
+    begin(&mut d, Purpose::Unlock, "Unlock the keyring");
+    d.say(&ToPrompter::Done {
+        ok: false,
+        message: Some("too many attempts".into()),
+    });
+    settle(&mut h);
+    std::thread::sleep(Duration::from_millis(150));
+    frames(&mut h);
+    assert!(h.state().closed);
+}
+
+/// Enter during the back-off holds the password; once it ends, Enter sends
+/// it (the field kept the keyboard).
+#[test]
+fn a_held_password_is_sent_once_the_back_off_ends() {
+    let (mut h, mut d) = window(ThemeChoice::Neon);
+    begin(&mut d, Purpose::Unlock, "Unlock the keyring");
+    d.say(&ask(
+        vec![Method::Password],
+        Some("too many attempts"),
+        Some(1),
+    ));
+    settle(&mut h);
+    type_into(&mut h, "Login password", "hunter2");
+    h.key_press(Key::Enter);
+    frames(&mut h);
+    assert!(d.heard_nothing());
+    std::thread::sleep(Duration::from_millis(1100));
+    frames(&mut h);
+    h.key_press(Key::Enter);
+    frames(&mut h);
+    assert_eq!(
+        d.heard(),
+        FromPrompter::Password {
+            password: Secret::new("hunter2")
+        }
+    );
+}
+
 const KEY: &str = "AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH-JJJJ-KKKK-LLLL-MMMM-NNNN-PPPP";
 
 /// Every screen, in both themes.
 #[test]
 fn snapshots() {
     let screens: Vec<(&str, Purpose, Vec<ToPrompter>)> = vec![
+        ("working", Purpose::Unlock, vec![]),
         (
             "ask_password",
             Purpose::Unlock,
@@ -2216,6 +2555,14 @@ fn snapshots() {
             if let Err(e) = h.try_snapshot(format!("{name}_{suffix}")) {
                 failures.push(e.to_string());
             }
+            // The key's second step: typing two groups back.
+            if *name == "show_recovery_key" {
+                h.get_by_label("I have written it down").click();
+                frames(&mut h);
+                if let Err(e) = h.try_snapshot(format!("recovery_check_{suffix}")) {
+                    failures.push(e.to_string());
+                }
+            }
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
@@ -2300,10 +2647,11 @@ fn anything_but_a_socket_is_refused() {
     assert!(stderr(&o).contains("not a socket"), "{}", stderr(&o));
 }
 
-/// With no display to open, it cancels at once rather than leave alephd
-/// waiting out the prompt timeout.
+/// With no display to open, it exits without answering: alephd reads the
+/// closed socket as "no prompter", and the prompt waits for an unlock from
+/// elsewhere (a Cancel would dismiss it).
 #[test]
-fn without_a_display_it_cancels() {
+fn without_a_display_it_exits_without_answering() {
     let dir = tempfile::tempdir().unwrap();
     let (ours, theirs) = UnixStream::pair().unwrap();
     let o = with_fd(prompter(dir.path()), theirs.as_raw_fd());
@@ -2315,8 +2663,11 @@ fn without_a_display_it_cancels() {
         stderr(&o)
     );
     let mut line = String::new();
-    BufReader::new(ours).read_line(&mut line).unwrap();
-    assert_eq!(line, "{\"type\":\"cancel\"}\n");
+    assert_eq!(
+        BufReader::new(ours).read_line(&mut line).unwrap(),
+        0,
+        "{line}"
+    );
 }
 ```
 
@@ -2555,6 +2906,10 @@ impl PromptUi {
                     ui.label("Use your security key.");
                 }
                 let ready = password && wait.is_none() && !self.secret.is_empty();
+                if submit && !ready {
+                    // (Enter left the field: give it the keyboard back.)
+                    self.focused_for = u64::MAX;
+                }
                 let label = if unlocking { "Unlock" } else { "Continue" };
                 let mut clicked = None;
                 let bar = Self::buttons(ui, |ui| {
@@ -2676,6 +3031,10 @@ impl PromptUi {
                     done = Self::primary(p, "I have written it down", true, ui);
                     None
                 });
+                if done {
+                    // (The check's first field takes the keyboard.)
+                    self.focused_for = u64::MAX;
+                }
                 bar.or(done.then_some(Action::RecoveryKeyWritten))
             }
             Screen::ShowRecoveryKey {
@@ -2783,7 +3142,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aleph_prompt_proto::FromPrompter;
 
@@ -2806,7 +3165,23 @@ pub struct PromptApp {
     _watcher: Option<notify::RecommendedWatcher>,
     /// The window was told to close.
     pub closed: bool,
+    /// How long keys are ignored after a screen appears, so the end of
+    /// something typed into another window (and its Enter) never becomes
+    /// an answer here.
+    pub input_guard: Duration,
+    /// How long a closing message stays up (the window holds the keyboard
+    /// while it is open).
+    pub message_for: Duration,
+    /// When the current screen appeared.
+    shown_at: Instant,
+    /// When a closing message closes itself.
+    close_at: Option<Instant>,
 }
+
+/// Keys ignored after a screen appears.
+pub const INPUT_GUARD: Duration = Duration::from_millis(400);
+/// A closing message's time on screen.
+pub const MESSAGE_FOR: Duration = Duration::from_secs(20);
 
 impl PromptApp {
     pub fn new(
@@ -2827,6 +3202,10 @@ impl PromptApp {
             theme_changed: Arc::default(),
             _watcher: None,
             closed: false,
+            input_guard: INPUT_GUARD,
+            message_for: MESSAGE_FOR,
+            shown_at: Instant::now(),
+            close_at: None,
         }
     }
 
@@ -2881,6 +3260,7 @@ impl PromptApp {
                         self.reply(&ctx, refusal);
                     }
                     self.ui.screen_changed();
+                    self.shown_at = now;
                 }
                 // alephd is done with us: nothing more to answer. A
                 // closing message stays up until it is read.
@@ -2908,13 +3288,34 @@ impl PromptApp {
             }
             self.closed = true;
         }
-        if let crate::conversation::Screen::Finished { message: None, .. } =
-            self.ui.conversation.screen
-        {
-            self.close(&ctx);
+        match self.ui.conversation.screen {
+            crate::conversation::Screen::Finished { message: None, .. } => self.close(&ctx),
+            // A closing message closes itself after a while.
+            crate::conversation::Screen::Finished {
+                message: Some(_), ..
+            } => {
+                let at = *self.close_at.get_or_insert(now + self.message_for);
+                if now >= at {
+                    self.close(&ctx);
+                } else {
+                    ctx.request_repaint_after(at - now);
+                }
+            }
+            _ => {}
         }
         if self.closed {
             return;
+        }
+        if now < self.shown_at + self.input_guard {
+            ctx.input_mut(|i| {
+                i.events.retain(|e| {
+                    !matches!(
+                        e,
+                        egui::Event::Key { .. } | egui::Event::Text(_) | egui::Event::Paste(_)
+                    )
+                })
+            });
+            ctx.request_repaint_after(self.shown_at + self.input_guard - now);
         }
         let action = self.ui.show(ui, now);
         if self.scanlines {
@@ -2948,7 +3349,6 @@ Write `crates/aleph-gui/src/main.rs`:
 use std::process::ExitCode;
 
 use aleph_gui::{app, link, screens, settings};
-use aleph_prompt_proto::FromPrompter;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -2964,6 +3364,10 @@ fn main() -> ExitCode {
 }
 
 fn prompt() -> ExitCode {
+    // What is typed here is a password: no core dumps, no ptrace by
+    // other processes of the user.
+    // SAFETY: prctl with these arguments only sets a process flag.
+    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
     // First, while single-threaded: the variable is removed.
     let stream = match link::take_from_env() {
         Ok(s) => s,
@@ -2971,10 +3375,6 @@ fn prompt() -> ExitCode {
             eprintln!("aleph-gui: {e}");
             return ExitCode::from(2);
         }
-    };
-    let Ok(answer) = stream.try_clone() else {
-        eprintln!("aleph-gui: cannot use the prompter socket");
-        return ExitCode::FAILURE;
     };
     let config_home = settings::config_home();
     let (settings, warning) = match &config_home {
@@ -3016,9 +3416,10 @@ fn prompt() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            // Tell alephd now rather than leave it waiting out the timeout.
+            // Without an answer: alephd reads the closed socket as "no
+            // prompter", and the prompt waits for an unlock from elsewhere
+            // (a Cancel would dismiss it).
             eprintln!("aleph-gui: cannot open the prompt window: {e}");
-            let _ = link::send(&answer, &FromPrompter::Cancel {});
             ExitCode::FAILURE
         }
     }
@@ -3028,14 +3429,14 @@ fn prompt() -> ExitCode {
 - [ ] **Step 4: Generate the snapshots and look at every one**
 
 Run: `UPDATE_SNAPSHOTS=1 cargo test -q -p aleph-gui --test screens snapshots`
-Expected: `ok. 1 passed`, and 26 files in `crates/aleph-gui/tests/snapshots/`: `{ask_password, ask_both_error, ask_key, ask_back_off, old_password, pin, insert_key, touch, confirm, confirm_long_label, recovery_key, show_recovery_key, finished_message}_{neon, omarchy}.png`.
+Expected: `ok. 1 passed`, and 30 files in `crates/aleph-gui/tests/snapshots/`: `{working, ask_password, ask_both_error, ask_key, ask_back_off, old_password, pin, insert_key, touch, confirm, confirm_long_label, recovery_key, show_recovery_key, recovery_check, finished_message}_{neon, omarchy}.png`.
 
-Open every one. Each must show the `aleph` label, the title, and "Requested by secret-tool (pid 4242)"; text legible against its background in both themes; the buttons along the bottom right, none clipped (`confirm_long_label_*`: the label is cut with "…" and the buttons still show, "No" focused); the primary button filled with the accent only when it can be used (`ask_password_*`: "Unlock" plain until something is typed); `show_recovery_key_*`: 14 numbered groups in two rows of 7. Fix and regenerate until they do. (Snapshots are compared pixel by pixel on this machine; another GPU or driver may render text slightly differently: regenerate there, and review the images as above.)
+Open every one. Each must show the `aleph` label, the title, and "Requested by secret-tool (pid 4242)"; text legible against its background in both themes; the buttons along the bottom right, none clipped (`confirm_long_label_*`: the label is cut with "…" and the buttons still show, "No" focused); the primary button filled with the accent only when it can be used (`ask_password_*`: "Unlock" plain until something is typed); `show_recovery_key_*`: 14 numbered groups in two rows of 7; `recovery_check_*`: the first group field has the keyboard. Fix and regenerate until they do. (Snapshots are compared pixel by pixel on this machine; another GPU or driver may render text slightly differently: regenerate there, and review the images as above.)
 
 - [ ] **Step 5: Run the tests, clippy, and fmt**
 
 Run: `cargo test -q -p aleph-gui && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
-Expected: `ok. 19 passed` (lib), `ok. 0 passed` (the binary's unit tests), `ok. 3 passed` (binary), `ok. 11 passed` (screens).
+Expected: `ok. 19 passed` (lib), `ok. 0 passed` (the binary's unit tests), `ok. 3 passed` (binary), `ok. 14 passed` (screens).
 
 - [ ] **Step 6: Confirm the tests have teeth**
 
@@ -3043,7 +3444,9 @@ Make each change below, run its test and see it FAIL, then undo it:
 
 - **the field takes the focus on a new screen** (`screens.rs`), test `cargo test -q -p aleph-gui --test screens after_a_wrong_password`: replace `let focus = self.focused_for != self.screen_number;` with `let focus = false;`.
 - **alephd closing closes the window** (`app.rs`), test `cargo test -q -p aleph-gui --test screens alephd_going_away`: replace the body of the `Event::Closed =>` arm (the `if !matches!(…) { self.close(&ctx); }` block) with `{}`.
-- **no window: cancel at once** (`main.rs`), test `cargo test -q -p aleph-gui --test binary without_a_display`: replace `let _ = link::send(&answer, &FromPrompter::Cancel {});` with `let _ = &answer;`.
+- **keys are ignored as a screen appears** (`app.rs`), test `cargo test -q -p aleph-gui --test screens the_first_keys`: replace `if now < self.shown_at + self.input_guard {` with `if false {`.
+- **a closing message closes itself** (`app.rs`), test `cargo test -q -p aleph-gui --test screens a_closing_message`: replace `                if now >= at {` with `                if false {`.
+- **the field keeps the keyboard through the back-off** (`screens.rs`), test `cargo test -q -p aleph-gui --test screens a_held_password`: delete the `if submit && !ready { … self.focused_for = u64::MAX; }` block.
 - **only a socket is adopted** (`link.rs`), test `cargo test -q -p aleph-gui --test binary anything_but_a_socket`: replace `if st.st_mode & libc::S_IFMT != libc::S_IFSOCK {` with `if false {`.
 
 - [ ] **Step 7: Commit**
@@ -3229,7 +3632,8 @@ Write `packaging/hyprland/aleph-prompt.lua`:
 -- aleph's unlock prompt (alephd starts it as `aleph-gui prompt`): float it
 -- in the middle of the screen, on every workspace, and keep the keyboard on
 -- it while it is open, so a password is never typed into another window.
--- (It closes itself: answered, cancelled with Escape, or timed out.)
+-- (It closes itself: answered, cancelled with Escape, timed out, or, for a
+-- closing message, after 20 seconds.)
 -- `alephctl setup` offers to include this from ~/.config/hypr/hyprland.lua.
 hl.window_rule({
   match = { class = "^aleph-prompt$" },
@@ -3354,6 +3758,12 @@ with
                         config.display(),
                         wizard::HYPRLAND_RULE_FILE
                     );
+                    if !std::path::Path::new(wizard::HYPRLAND_RULE_FILE).exists() {
+                        eprintln!(
+                            "alephctl: {} is not installed yet (`make install` puts it there); until then the rule does nothing",
+                            wizard::HYPRLAND_RULE_FILE
+                        );
+                    }
                 }
             }
             if tpm {
@@ -3455,6 +3865,22 @@ git commit -m "feat: setup offers the prompt's Hyprland window rule; install ale
 
 - [ ] **Step 1: Update the spec**
 
+In §4 "Locked search", replace
+
+```markdown
+  prompt with no reply timeout. If no prompter can start (no graphical
+  session), the prompt is not dismissed: it waits until the vault is
+```
+
+with
+
+```markdown
+  prompt with no reply timeout. If no prompter can start (no graphical
+  session), or the prompter times out or ends without an answer (it
+  crashed, or could not open its window), the prompt is not dismissed
+  (only the user's Cancel dismisses it): it waits until the vault is
+```
+
 In §6 "Prompter orchestration", replace
 
 ```markdown
@@ -3513,12 +3939,14 @@ with
 - The recovery key is never requested here, except inside the explicit
   "Recover…" flow: asked for in any other conversation, the prompter
   refuses without showing a field.
-- Text from other programs (collection labels, process names) is shown
-  on one line and cut short, so it can neither draw a fake prompt inside
-  the real one nor push the buttons out of view.
-- If no window can open, the prompter cancels at once; when alephd ends
-  the conversation, the window closes (a closing message stays until it
-  is read).
+- Text from other programs (collection labels, process names) gets no
+  line breaks of its own and is cut short, so it can neither draw a fake
+  prompt inside the real one nor push the buttons out of view.
+- If no window can open, the prompter exits without answering, and the
+  prompt waits (§4). When alephd ends the conversation, the window
+  closes; a closing message stays up for 20 seconds or until closed.
+  Keys arriving just as a screen appears are ignored, so text typed into
+  another window never becomes an answer.
 - The package ships a Hyprland window rule,
   `/usr/share/aleph/hyprland/aleph-prompt.lua` (float, center, pin, and
   keep the keyboard on the prompt while it is open), which setup offers
@@ -3577,6 +4005,49 @@ In `DECISIONS.md`, insert after the introduction (before `## 2026-09-27: Plan 4c
 ```markdown
 ## 2026-09-28: Plan 5a (the prompter), design
 
+### H3. The pre-execution review of the Plan 5a document: fixes adopted
+
+An independent review of the plan and its prototype. Adopted, each with a
+test that failed without it:
+
+- **Prompter trouble waits (Important).** With a working prompter, a
+  prompt that timed out (the person away after an autologin boot; a
+  background client while the screen is locked) dismissed the unlock, and
+  a client like Chromium would take that as "no key", which §4 exists to
+  prevent. Now `Error::Prompt` (timed out, closed or crashed before an
+  answer, nonsense) leaves the prompt waiting like no prompter; the
+  prompts that joined it wait too (this replaces the earlier test that
+  had them end with it). Only Cancel dismisses. §4 says so.
+- **A window that cannot open exits without answering (Important),** so
+  alephd reads "no prompter" and the prompt waits. (The plan had it send
+  Cancel, which would dismiss every unlock at once on a broken GL driver.)
+- **Nothing holds the keyboard with nothing to ask (Important).** An
+  unlock elsewhere and prompter trouble end the conversation with no
+  message (the window just closes); any other closing message stays up
+  for 20 seconds or until closed.
+- **Task 6's document check** is limited to the spec, testing.md, the
+  README, and the code (history mentions the old names).
+- **Minor, adopted:** the field keeps the keyboard when Enter is pressed
+  during a back-off; keys arriving in the first 400 ms of a screen are
+  ignored; white-space runs collapse in text from other programs (and the
+  claim is "no line breaks of its own"); the display must be a bare name,
+  never a path; `aleph-gui` is non-dumpable; the Working and
+  recovery-check screens have snapshots; `gsettings` gets a second; the
+  first group field takes the keyboard on the check step; AccessKit is on;
+  setup warns when the rule file is not installed; testing.md's new check
+  joins step 3 instead of renumbering.
+- **Rulings (not changed):** Cancel during "Touch your key" closes the
+  window while alephd is inside the key's own wait (it reads the Cancel
+  when that ends; a touch meanwhile still unlocks, which is what the
+  person did) — cost if wrong: a surprising unlock after a Cancel.
+  Confirmation prompts are not serialized like unlocks, so two can be
+  open — cost if wrong: two pinned windows; a later plan can queue them.
+  The window rule matches any app_id `aleph-prompt` — a same-user program
+  can grab the keyboard in other ways; documented, not defended.
+- **Noted for later:** §4 says prompts that joined a *cancelled*
+  conversation keep waiting; the code (since Plan 3) ends them with it.
+  This plan does not change Cancel; the mismatch is left for its own fix.
+
 ### H2. Calls made while prototyping Plan 5a
 
 For the reviewers; each is argued in the plan
@@ -3590,7 +4061,9 @@ while prototyping") and pinned by a test that was seen to fail without it.
   the systemd user manager's `Environment` (uncached, 2 s limit), where the
   compositor exports the display, and uses its own environment only when
   the manager cannot be asked. No display there means no graphical session
-  now, and the prompt waits (§4), as before.
+  now, and the prompt waits (§4), as before. Only a bare socket name is
+  accepted, never a path (any process of the user can set the manager's
+  environment).
 - **`~/.config/aleph/gui.toml`** holds the GUI's settings (`theme = "auto" |
   "neon"`, `scanlines`): alephd's `config.toml` refuses unknown keys and
   has no use for them. An unreadable file warns and uses the defaults.
@@ -3604,19 +4077,17 @@ while prototyping") and pinned by a test that was seen to fail without it.
   theme's files in place).
 - **A strict conversation:** `Begin` first; the recovery-key question is
   refused outside a recovery conversation (answered `Cancel`, no field
-  shown); one answer per question; `Cancel` at any time. A window that
-  cannot open cancels at once (alephd would otherwise wait out the prompt
-  timeout); alephd closing the socket closes the window; a closing message
-  stays until it is read.
+  shown); one answer per question; `Cancel` at any time. (Closing and
+  timing out: H3.)
 - **Text from other programs** (collection labels, process names, key
-  names, errors) is shown one line per item and cut at 80 or 400
+  names, errors) gets no line breaks of its own and is cut at 80 or 400
   characters.
 - **Hyprland:** only the Lua configuration (Omarchy's) gets setup's offer;
   the include is `pcall(dofile, …)`, appended in place (a symlinked dotfile
   stays one) and removed exactly by revert. The rule floats, centers, pins,
   and keeps the keyboard on the prompt (`stay_focused`), so a password is
   never typed into another window; the prompt always ends (an answer,
-  Escape, or `prompt.timeout`). A `hyprland.conf` user adds the rule by
+  Escape, `prompt.timeout`, or 20 seconds for a closing message). A `hyprland.conf` user adds the rule by
   hand. The spec's `/usr/share/aleph/hypr/aleph.conf` becomes
   `/usr/share/aleph/hyprland/aleph-prompt.lua`.
 - **Snapshot tests render with wgpu:** they need a GPU driver or Mesa's
@@ -3682,21 +4153,16 @@ with
    ends without a secret), and from a fullscreen window (the prompt still
    gets the keyboard). With a security key enrolled: "Use security key",
    then the PIN and touch screens. Switch the Omarchy theme while a prompt
-   is open: it re-themes. Without a graphical session (a text console,
-   `WAYLAND_DISPLAY` unset), the lookup waits, and `alephctl unlock` in
-   another terminal ends it.
+   is open: it re-themes. Leave a prompt unanswered past `prompt.timeout`
+   (`alephctl config set prompt.timeout 30` to wait less; set it back to
+   300 after): the window closes and the lookup keeps waiting; `alephctl
+   unlock` ends it with the secret. Without a graphical session (a text
+   console, `WAYLAND_DISPLAY` unset), the lookup waits, and `alephctl
+   unlock` in another terminal ends it. After a reboot with SDDM autologin
+   (alephd starts before Hyprland), the first lookup opens the prompt.
 ```
 
 and in step 4 (Chromium) replace `` `alephctl unlock` when it waits `` with `unlock in the prompt`.
-
-After step 6 add:
-
-```markdown
-7. **After a reboot with SDDM autologin** (Plan 5a): the first
-   application that wants a secret (or `secret-tool lookup service
-   aleph-check`) opens the prompt, although alephd started before
-   Hyprland.
-```
 
 In `README.md`, add a row to the Crates table after `aleph-cli`:
 
@@ -3724,7 +4190,7 @@ lua`). Hardware tests are opt-in; see [docs/testing.md](docs/testing.md).
 
 - [ ] **Step 4: Check the documents**
 
-Run: `grep -n "hypr/aleph.conf\|no graphical prompter yet\|offers \"skip\"" -r docs README.md crates || echo clean`
+Run: `grep -n "hypr/aleph.conf\|no graphical prompter yet\|offers \"skip\"" docs/superpowers/specs/2026-09-26-aleph-design.md docs/testing.md README.md -r crates || echo clean`
 Expected: `clean`.
 Run: `make gate`
 Expected: exit 0.
@@ -3738,4 +4204,4 @@ git commit -m "docs: Plan 5a, the prompter (spec, decisions H1 and H2, testing)"
 
 - [ ] **Step 6: Hand over the manual checks**
 
-The manual checks (testing.md "alephd with real clients" steps 3 and 7) need the installed build on the owner's live session (`make && make install` restarts alephd, which locks the keyring). Do not run them; list them for the owner, who records the results in `docs/hardware-log.md`.
+The manual checks (testing.md "alephd with real clients" step 3) need the installed build on the owner's live session (`make && make install` restarts alephd, which locks the keyring). Do not run them; list them for the owner, who records the results in `docs/hardware-log.md`.
