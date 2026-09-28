@@ -8,15 +8,20 @@ rust-version.workspace = true
 
 [dependencies]
 aleph-prompt-proto = { path = "../aleph-prompt-proto" }
+aleph-secret-session = { path = "../aleph-secret-session" }
 eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland"] }
 egui = "0.36"
+futures-util = { version = "0.3", default-features = false }
 libc.workspace = true
 notify = "8"
 serde.workspace = true
 serde_json.workspace = true
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 toml = "1"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 zeroize.workspace = true
 
 [dev-dependencies]
+aleph-daemon = { path = "../aleph-daemon", features = ["testing"] }
 egui_kittest = { version = "0.36", features = ["snapshot", "wgpu"] }
 tempfile.workspace = true

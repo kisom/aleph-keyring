@@ -1,9 +1,11 @@
-//! `aleph-gui`: the aleph keyring's prompter (spec §7), started by alephd
-//! as `aleph-gui prompt`. (The manager window comes with Plan 5b.)
+//! `aleph-gui`: the aleph keyring's manager window (`aleph-gui`, the
+//! manager spec) and the prompter alephd starts (`aleph-gui prompt`, spec
+//! §7).
 
 pub mod app;
 pub mod conversation;
 pub mod link;
 pub mod screens;
 pub mod settings;
+pub mod store;
 pub mod theme;

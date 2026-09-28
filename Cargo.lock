@@ -246,16 +246,21 @@ dependencies = [
 name = "aleph-gui"
 version = "0.1.0"
 dependencies = [
+ "aleph-daemon",
  "aleph-prompt-proto",
+ "aleph-secret-session",
  "eframe",
  "egui",
  "egui_kittest",
+ "futures-util",
  "libc",
  "notify",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "toml",
+ "zbus",
  "zeroize",
 ]
 
