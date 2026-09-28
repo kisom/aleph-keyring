@@ -47,9 +47,8 @@ dbus libsecret`). Hardware tests are opt-in;
 see [docs/testing.md](docs/testing.md).
 
 ~~~sh
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
+make gate                # formatting, clippy, the full suite
+make && make install     # release build, installed (sudo) until there is a package
 ~~~
 
 ## License

@@ -2,11 +2,11 @@
 # Install (or uninstall) aleph from a release build of this tree, the way
 # the package lays it out (spec §9). Until there is a package:
 #
-#   cargo build --release --workspace
-#   sudo packaging/install.sh            # or: sudo packaging/install.sh uninstall
+#   make && make install                 # or: make uninstall
 #
-# Then, as the user: `systemctl --user daemon-reload`,
-# `systemctl --user start alephd.socket`, and `alephctl setup`.
+# (`make install` runs this with sudo, then restarts alephd as the user;
+# a running alephd keeps the old binary and unit until it restarts.)
+# Then `alephctl setup`.
 set -eu
 cd "$(dirname "$0")/.."
 R=target/release

@@ -3,9 +3,7 @@
 ## Automated (CI and local)
 
 ```sh
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
+make gate    # cargo fmt --check, clippy -D warnings, cargo test
 ```
 
 Requirements:
@@ -129,9 +127,8 @@ gnome-keyring-daemon.service gnome-keyring-daemon.socket`):
    asking for the Wi-Fi password again.
 6. **Setup and login unlock** (Plan 4c), on a test account with
    gnome-keyring running and a few items in it (Seahorse). Install first:
-   `cargo build --release --workspace`, then `sudo packaging/install.sh`,
-   then as the user `systemctl --user daemon-reload` and `systemctl
-   --user start alephd.socket` (the next login starts it by itself).
+   `make && make install` (it asks for sudo, then reloads the user
+   units, restarts alephd, and starts `alephd.socket`).
    The client is `alephctl`: `aleph` on PATH is TeX's (texlive-bin).
    - `alephctl setup`: it reports the TPM, creates the keyring, imports the
      items (`secret-tool lookup` finds them through aleph), switches over
