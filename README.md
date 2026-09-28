@@ -13,9 +13,12 @@ gnome-keyring's secrets store; libsecret applications work unmodified.
 [`docs/superpowers/specs/2026-09-26-aleph-design.md`](docs/superpowers/specs/2026-09-26-aleph-design.md).
 
 Login and screen unlock (`pam_aleph`), `passwd` changes, and locking on
-sleep, screen lock, or idle are in place (Plan 4a). `aleph setup` does not
-yet edit PAM, take over from gnome-keyring, or import its items (Plan 4c):
-see [docs/testing.md](docs/testing.md) for the lines to add by hand. If
+sleep, screen lock, or idle are in place (Plan 4a). `aleph setup` creates the
+keyring,
+imports gnome-keyring's items, takes over the Secret Service from it, and
+(with `sudo aleph system apply`) sets up login and screen unlock; `aleph
+setup --revert` hands everything back (Plan 4c; see
+[docs/testing.md](docs/testing.md), including an emergency manual revert). If
 the login password is changed outside aleph, the next unlock asks for the
 previous one to update the TPM keyslot. `aleph backup` and `aleph restore`
 (with the recovery key, from `.bak`, or accepting a rolled-back file) are

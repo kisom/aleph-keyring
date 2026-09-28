@@ -671,28 +671,52 @@ data.
 
 ### Startup and switchover from gnome-keyring
 
-- Runs as a systemd user service `alephd.service`, with `alephd.socket`
-  owning `$XDG_RUNTIME_DIR/aleph/pam.sock` (mode `0600`). It is started by
-  D-Bus activation for `org.freedesktop.secrets`, or by socket activation
-  from PAM.
-- `aleph setup` (Arch/Omarchy):
-  1. checks `aleph-tpmd` `Status` and reports it (§5)
-  2. installs the user D-Bus activation file in
-     `$XDG_DATA_HOME/dbus-1/services/`, which takes precedence over
-     gnome-keyring's system file
-  3. masks gnome-keyring's user units
-  4. backs up and edits PAM (below)
-  5. imports gnome-keyring items while gnome-keyring still runs
+- Runs as a systemd user service `alephd.service` (`BusName=io.aleph.Keyring`),
+  with `alephd.socket` owning `$XDG_RUNTIME_DIR/aleph/pam.sock` (mode
+  `0600`). It is started by D-Bus activation for `org.freedesktop.secrets`
+  or `io.aleph.Keyring`, or by socket activation from PAM.
+- **The Secret Service name is queued for, never taken** (DECISIONS.md
+  E1): alephd owns `io.aleph.Keyring` and requests
+  `org.freedesktop.secrets` without `ReplaceExisting` or
+  `AllowReplacement`, so while gnome-keyring runs alephd waits in the
+  queue, and the bus hands the name over the moment gnome-keyring lets go
+  (the name is never unowned). `aleph status` says who serves it. After
+  setup switched over, a queued alephd logs a warning.
+- `aleph setup` (Arch/Omarchy), each step checking the real state, so a
+  re-run does only what is still undone (E10):
+  1. reports the TPM (§5) and detects SDDM autologin (E5: advisory; it
+     picks the default unlock method and the summary)
+  2. creates the vault (§7), if there is none
+  3. imports gnome-keyring's items while it still serves the Secret
+     Service, and keeps following it until the name changes hands (E1,
+     E2)
+  4. switches over, user-level only (E9): D-Bus activation files in
+     `$XDG_DATA_HOME/dbus-1/services/` (the Secret Service name starts
+     alephd; `org.gnome.keyring` and `org.freedesktop.impl.portal.Secret`
+     start nothing), a bus `ReloadConfig`, gnome-keyring's user units
+     recorded (once), masked, and stopped, then the name's owner checked.
+     gnome-keyring's pkcs11 component goes away with it.
+  5. installs Omarchy's lock hook (G1), and offers to set the TPM's
+     lockoutAuth (D9)
+  6. last and optional, the root side through sudo: `sudo aleph system
+     apply --user <you>` (below); declined or failed, setup says how to
+     run it later
+- `aleph setup --revert` (E3), refused if gnome-keyring is not installed:
+  1. lists items imported from gnome-keyring and deleted in aleph since,
+     offering to delete them there too
+  2. with the login password, alephd pauses writes and runs its own
+     gnome-keyring on a private bus over the keyring files (after checking
+     that none serves the session), writes every item missing there or
+     different (collections it lacks go into its default collection), and
+     reads each back on a fresh connection
+  3. only then: the activation files removed (if still aleph's) and the
+     bus reloaded; gnome-keyring's units unmasked and restored as
+     recorded; the Omarchy hook removed; alephd lets go of the name, which
+     the bus hands to gnome-keyring
+  4. last, `sudo aleph system revert`
 
-  It detects SDDM autologin and configures first-use mode instead of login
-  unlock.
-- `aleph setup --revert`:
-  1. exports every aleph item created or modified since setup into
-     gnome-keyring, through its Secret Service API after restarting it
-  2. verifies the export
-  3. only then restores the backed-up PAM files and units
-
-  If the export fails, revert stops and nothing changes.
+  If the export fails, nothing changes and writes resume. The aleph vault
+  is left in place.
 
 ### PAM integration
 
@@ -709,8 +733,8 @@ Verified against a stock Omarchy install on 2026-09-26.
   -password  optional  pam_aleph.so
   ```
 
-- **Which services get them**, with setup editing each and keeping a
-  backup (Plan 4c; by hand until then, `docs/testing.md`):
+- **Which services get them**, edited by `sudo aleph system apply` (E4),
+  each keeping an `.aleph-orig` backup:
 
   | Service | Change |
   |---|---|
@@ -794,9 +818,10 @@ Verified against a stock Omarchy install on 2026-09-26.
   whether MK is `mlock`ed, TPM usability, keyslots with stale marks),
   `Lock`, `Unlock`, `Create`, `EnrollTpm`, `EnrollFido2`,
   `RemoveKeyslot`, `RotateMaster`, `ReissueRecoveryKey`, `RetryKeyslot`,
-  `GetConfig`, `SetConfig`, (Plan 4b) `Backup`, `Recover`,
-  `RestoreBackup`, `RestoreFromBak`, `AcceptRollback`, and (Plan 4c)
-  `ImportGnomeKeyring`, `ExportToGnomeKeyring`.
+  `GetConfig`, `SetConfig`, `Backup`, `Recover`, `RestoreBackup`,
+  `RestoreFromBak`, `AcceptRollback`, `ImportGnomeKeyring`,
+  `RemovedSinceImport`, `ExportToGnomeKeyring`, `ReleaseSecretService`,
+  `ThawWrites`. `Status` also names who owns `org.freedesktop.secrets`.
 - **Methods that need the user take a prompter:** one end of a
   socketpair, passed as a Unix fd, speaking the prompter protocol. The
   CLI answers it in the terminal, `aleph-gui` in its windows. The call
@@ -900,7 +925,7 @@ aleph store --label L attr=val…            # secret read from stdin, never arg
 aleph delete attr=val…
 aleph ls [collection]
 aleph import gnome-keyring
-aleph export gnome-keyring
+sudo aleph system apply --user <you> | verify --user <you> | revert
 aleph config get|set <key> [value]
 aleph backup [--force] <path>
 aleph restore [--from-bak | --accept-rollback] [<path>]
@@ -918,11 +943,27 @@ aleph restore [--from-bak | --accept-rollback] [<path>]
   5. live import from gnome-keyring
   6. system changes (sudo)
 
-  Plan 3 implements steps 1, 2, and 4 (creating the vault) and says that
-  the rest is not available yet; Plan 4c adds 3, 5, and 6.
+  Export to gnome-keyring happens only as part of `setup --revert`.
 - **Import** reads every collection and item through the Secret Service
-  API while gnome-keyring still owns the bus name. That covers everything
-  shown in Seahorse's Passwords view.
+  API while gnome-keyring still owns the bus name, over an encrypted
+  session (alephd reads them itself; secrets never pass through the CLI).
+  That covers everything shown in Seahorse's Passwords view. It needs the
+  vault unlocked; locked gnome-keyring collections ask through
+  gnome-keyring's own prompt, and are skipped (with a message) if it is
+  dismissed. It is idempotent and never overwrites (E2); what it added is
+  recorded in `$XDG_STATE_HOME/aleph/imported.json` for revert.
+- **`sudo aleph system apply --user <you>`** edits the PAM services above
+  as pure text transformations, atomically, refusing symlinks, files that
+  are not regular, and files not owned by root (manual mode: it prints
+  what to add; E6), then authenticates `<you>` through the edited
+  lock-screen and login stacks with real Linux-PAM, the password asked
+  once; a failure restores the originals at once. What it did is recorded
+  in `/var/lib/aleph/manifest.json`. `revert` restores each file byte for
+  byte if it is still what `apply` wrote, else takes aleph's lines out if
+  that applies cleanly, else leaves it and says what to remove. It reads
+  no user configuration or D-Bus, and warns if its own binary is not
+  root-owned and root-only-writable. On NixOS it prints the configuration
+  to add instead.
 - **`aleph backup <path>`** writes a re-headered copy containing **only
   the recovery slot**, with its MK wrap. It also warns that generic backups
   of `~/.local/share/aleph/` contain every slot, including

@@ -9,6 +9,41 @@ made directly are marked as such.
 
 ## 2026-09-27: Plan 4c (setup), design
 
+### G2. Calls made while prototyping Plan 4c
+
+Each to be weighed by the plan's reviewers:
+- **Import needs the vault unlocked** and no aleph prompter: gnome-keyring
+  asks for its own locked collections through its own prompt (a dismissed
+  one is skipped and listed), so the admin call just returns a summary.
+- **What import added is recorded** (`imported.json`: id, collection,
+  label, attributes), so revert can list items deleted in aleph since.
+- **Revert's export needs the login password** (checked with PAM): it
+  unlocks gnome-keyring's login keyring, which `pam_gnome_keyring` kept in
+  step in `passwd` (E4). If it does not open with it, nothing changes.
+- **"No gnome-keyring runs" is checked on the bus** (`org.gnome.keyring`
+  owned, or the Secret Service name held by another), not by listing
+  processes; the private instance gets a throwaway home and runtime
+  directory, and only the keyring data directory is real.
+- **Collections gnome-keyring lacks go into its default collection** on
+  revert: creating one would need gnome-keyring's own password prompt.
+- **E3's order holds as reviewed:** gnome-keyring, started while alephd
+  holds the name, waits and takes it once alephd lets go (checked with
+  the real gnome-keyring).
+- **`aleph export gnome-keyring` is not a command:** export happens only
+  in `setup --revert` (with the write freeze and the private instance).
+- **Wizard defaults:** a question left unanswered (end of input) takes its
+  default; the root step defaults to yes, and a failed or declined sudo
+  does not fail setup (it says how to run it later); with autologin the
+  default unlock method is a security key.
+- **`aleph system verify` runs the lock-screen and login stacks** (never
+  `passwd`, which would change the password).
+- **Tests never reach the real system:** `ALEPH_SYSTEMCTL` and
+  `ALEPH_SUDO` name stand-ins, and the CLI tests run with their own home.
+- **Observed on this machine:** autologin detection (every file in
+  `/etc/sddm.conf.d`, E5) reports `autologin.conf.disabled`'s user; if
+  SDDM does read it, that file still turns autologin on.
+
+
 ### G1. Omarchy's screen lock reaches alephd through an upstream `lock` hook — owner's decision
 
 Every Omarchy lock (key binding, menu, idle) runs the package-owned

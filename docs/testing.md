@@ -127,29 +127,29 @@ gnome-keyring-daemon.service gnome-keyring-daemon.socket`):
    stored for the user ("Store the password only for this user"), lock,
    reconnect, and unlock when asked: the connection must come up without
    asking for the Wi-Fi password again.
-6. **Login and screen unlock** (Plan 4a; setup's PAM edits come in 4c, so
-   by hand for now, keeping backups):
-   - `install -Dm755 target/debug/libpam_aleph.so /usr/lib/security/pam_aleph.so`
-   - `/etc/pam.d/sddm`: `-auth optional pam_aleph.so` after `auth include
-     system-login`, and `-session optional pam_aleph.so` after `session
-     include system-login` (remove the `pam_gnome_keyring` lines)
-   - `/etc/pam.d/omarchy-lock-password`: `-auth optional pam_aleph.so` at
-     the end
-   - `/etc/pam.d/passwd`: `-password optional pam_aleph.so` after `password
-     include system-auth`
-   - Never edit `system-login`, `system-auth`, or `login`: a TTY login is
-     the way back in if something goes wrong (keep a root shell open while
-     editing, and try the lock screen before walking away)
-   - `systemctl --user enable --now alephd.socket` (with the units under
-     `~/.config/systemd/user/`)
-
-   Then: log out and in (the vault is unlocked at login, no prompt); lock
-   the screen with a locker that calls `loginctl lock-session` (not
-   Omarchy's own lock, which does not yet reach alephd; `aleph lock` stands
-   in for it) and check `aleph status` says locked, then unlock the screen
-   (unlocked, with no prompt); `passwd`
-   (the TPM slot's id changes; with a FIDO2 slot, `aleph status` asks for
-   `aleph keyslot rotate-master`); suspend and resume (locked).
+6. **Setup and login unlock** (Plan 4c), on a test account with
+   gnome-keyring running and a few items in it (Seahorse):
+   - `aleph setup`: it reports the TPM, creates the keyring, imports the
+     items (`secret-tool lookup` finds them through aleph), switches over
+     (`aleph status` says alephd serves the Secret Service;
+     `systemctl --user is-enabled gnome-keyring-daemon.socket` says
+     masked), and offers the root step: answer yes, and `sudo` runs
+     `aleph system apply`, which asks the login password once and checks
+     the lock screen and the login with it.
+   - Keep a root shell open until the lock screen has been tried: a TTY
+     login is the way back in (`system-login`, `system-auth`, and `login`
+     are never edited).
+   - Log out and in (the vault is unlocked at login, no prompt); lock the
+     screen, then unlock it (unlocked, no prompt); `passwd` (the TPM
+     slot's id changes); suspend and resume (locked). With Omarchy's lock,
+     the vault locks with the screen only once Omarchy runs
+     `omarchy-hook lock` (DECISIONS.md G1); until then idle and sleep lock
+     it.
+   - `aleph setup` again changes nothing.
+   - `aleph setup --revert`: it asks the login password, copies
+     everything back, and gnome-keyring serves the Secret Service again
+     (with the items stored in aleph meanwhile); `sudo aleph system
+     revert` restores the PAM files byte for byte.
 7. `aleph status` shows the keyslots; `journalctl --user` (or the
    terminal) shows no secrets.
 8. **Backup and restore** (Plan 4b):
@@ -176,3 +176,22 @@ gnome-keyring-daemon.service gnome-keyring-daemon.socket`):
 
 Record the results, and the libsecret, Chromium, and NetworkManager
 versions, in `hardware-log.md`.
+
+## Emergency manual revert
+
+If login or the lock screen misbehaves after `sudo aleph system apply`,
+from a TTY (Ctrl-Alt-F3) or a root shell:
+
+1. `sudo aleph system revert`; or by hand, for each of `sddm`,
+   `sddm-autologin`, `omarchy-lock-password`, and `passwd` in
+   `/etc/pam.d/`: `mv <name>.aleph-orig <name>` (a missing backup means
+   the file was never changed), then `rm /var/lib/aleph/manifest.json`.
+2. As the user: `rm ~/.local/share/dbus-1/services/org.freedesktop.secrets.service
+   ~/.local/share/dbus-1/services/org.gnome.keyring.service
+   ~/.local/share/dbus-1/services/org.freedesktop.impl.portal.Secret.service`,
+   then `systemctl --user unmask gnome-keyring-daemon.service
+   gnome-keyring-daemon.socket` and `systemctl --user start
+   gnome-keyring-daemon.socket`.
+3. Items stored in aleph since setup stay in its vault
+   (`~/.local/share/aleph`); `aleph setup --revert` copies them back once
+   alephd runs again (`aleph restore` if the vault itself needs recovery).
