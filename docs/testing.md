@@ -19,6 +19,12 @@ Requirements:
   daemon and CLI tests run `alephd`'s interfaces on a private session bus
   and drive them with the real libsecret client and the real `alephctl`
   binary. They never touch your session bus or keyring.
+- **A GPU driver** (or Mesa's software Vulkan, `vulkan-swrast`, headless)
+  and **`lua`** (`luac`): the prompter's snapshot tests render with wgpu,
+  and setup's Hyprland include is checked with `luac -p`. The snapshots
+  are compared pixel by pixel; on another machine, regenerate them with
+  `UPDATE_SNAPSHOTS=1 cargo test -p aleph-gui --test screens` and look at
+  every image before committing.
 - PAM is exercised for real through a private service directory
   (`pam_start_confdir`, Linux-PAM 1.4+): `pam_unix` rejecting a wrong
   password, the shipped `packaging/pam/aleph-check`, and the built
@@ -28,8 +34,8 @@ Requirements:
 - The lock policy runs against a stand-in logind on the private bus
   (`aleph_daemon::testing::Logind`): sleep inhibitors, `PrepareForSleep`,
   and `Session.Lock`.
-- Arch: `pacman -S swtpm tpm2-tools tpm2-tss libfido2 pam dbus libsecret`.
-  Nix: `swtpm tpm2-tools tpm2-tss libfido2 pam dbus libsecret`.
+- Arch: `pacman -S swtpm tpm2-tools tpm2-tss libfido2 pam dbus libsecret lua`.
+  Nix: `swtpm tpm2-tools tpm2-tss libfido2 pam dbus libsecret lua`.
 
 FIDO2 logic is tested against `aleph_unlock::fido2::mock::MockKeys`; no
 test in the default run needs a security key. Prompts are answered by
@@ -120,12 +126,24 @@ gnome-keyring-daemon.service gnome-keyring-daemon.socket`):
    in another; choose the TPM (or a key) and confirm the recovery key.
 2. `secret-tool store --label=t service aleph-check` (type a secret), then
    `secret-tool lookup service aleph-check` prints it.
-3. `alephctl lock`, then `secret-tool lookup service aleph-check`: it waits
-   (no graphical prompter yet). In the other terminal, `alephctl unlock`: the
-   lookup then prints the secret.
+3. `alephctl lock`, then `secret-tool lookup service aleph-check`: the
+   prompt window opens, floating in the middle of the screen with the
+   keyboard on its password field. Type the login password: the lookup
+   prints the secret. Again with a wrong password (the error shows, the
+   field is empty and still has the keyboard), with Escape (the lookup
+   ends without a secret), and from a fullscreen window (the prompt still
+   gets the keyboard). With a security key enrolled: "Use security key",
+   then the PIN and touch screens. Switch the Omarchy theme while a prompt
+   is open: it re-themes. Leave a prompt unanswered past `prompt.timeout`
+   (`alephctl config set prompt.timeout 30` to wait less; set it back to
+   300 after): the window closes and the lookup keeps waiting; `alephctl
+   unlock` ends it with the secret. Without a graphical session (a text
+   console, `WAYLAND_DISPLAY` unset), the lookup waits, and `alephctl
+   unlock` in another terminal ends it. After a reboot with SDDM autologin
+   (alephd starts before Hyprland), the first lookup opens the prompt.
 4. **Chromium:** start it with `--password-store=gnome-libsecret`, save a
    site password, quit, `alephctl lock`, start Chromium again, and
-   `alephctl unlock` when it waits. Saved passwords must still be there
+   unlock in the prompt. Saved passwords must still be there
    (Chromium did not create a new safe-storage key).
 5. **NetworkManager:** with `nmcli` and a Wi-Fi network whose password is
    stored for the user ("Store the password only for this user"), lock,

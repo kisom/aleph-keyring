@@ -7,6 +7,113 @@ first. The spec (`docs/superpowers/specs/2026-09-26-aleph-design.md`)
 is updated to match wherever a decision changes it. Decisions the owner
 made directly are marked as such.
 
+## 2026-09-28: Plan 5a (the prompter), design
+
+### H3. The pre-execution review of the Plan 5a document: fixes adopted
+
+An independent review of the plan and its prototype. Adopted, each with a
+test that failed without it:
+
+- **Prompter trouble waits (Important).** With a working prompter, a
+  prompt that timed out (the person away after an autologin boot; a
+  background client while the screen is locked) dismissed the unlock, and
+  a client like Chromium would take that as "no key", which §4 exists to
+  prevent. Now `Error::Prompt` (timed out, closed or crashed before an
+  answer, nonsense) leaves the prompt waiting like no prompter; the
+  prompts that joined it wait too (this replaces the earlier test that
+  had them end with it). Only Cancel dismisses. §4 says so.
+- **A window that cannot open exits without answering (Important),** so
+  alephd reads "no prompter" and the prompt waits. (The plan had it send
+  Cancel, which would dismiss every unlock at once on a broken GL driver.)
+- **Nothing holds the keyboard with nothing to ask (Important).** An
+  unlock elsewhere and prompter trouble end the conversation with no
+  message (the window just closes); any other closing message stays up
+  for 20 seconds or until closed.
+- **Task 6's document check** is limited to the spec, testing.md, the
+  README, and the code (history mentions the old names).
+- **Minor, adopted:** the field keeps the keyboard when Enter is pressed
+  during a back-off; keys arriving in the first 400 ms of a screen are
+  ignored; white-space runs collapse in text from other programs (and the
+  claim is "no line breaks of its own"); the display must be a bare name,
+  never a path; `aleph-gui` is non-dumpable; the Working and
+  recovery-check screens have snapshots; `gsettings` gets a second; the
+  first group field takes the keyboard on the check step; AccessKit is on;
+  setup warns when the rule file is not installed; testing.md's new check
+  joins step 3 instead of renumbering.
+- **Rulings (not changed):** Cancel during "Touch your key" closes the
+  window while alephd is inside the key's own wait (it reads the Cancel
+  when that ends; a touch meanwhile still unlocks, which is what the
+  person did) — cost if wrong: a surprising unlock after a Cancel.
+  Confirmation prompts are not serialized like unlocks, so two can be
+  open — cost if wrong: two pinned windows; a later plan can queue them.
+  The window rule matches any app_id `aleph-prompt` — a same-user program
+  can grab the keyboard in other ways; documented, not defended.
+- **Found while executing:** a confirmation's text is laid out to the
+  rows that fit above the buttons, ending in "…" (the snapshot review
+  showed a long label reaching the button row; a label of capitals ran
+  under it). Test: `a_long_confirmation_never_covers_the_buttons`.
+- **Noted for later:** §4 says prompts that joined a *cancelled*
+  conversation keep waiting; the code (since Plan 3) ends them with it.
+  This plan does not change Cancel; the mismatch is left for its own fix.
+
+### H2. Calls made while prototyping Plan 5a
+
+For the reviewers; each is argued in the plan
+(`docs/superpowers/plans/2026-09-28-aleph-prompter.md`, "Decisions made
+while prototyping") and pinned by a test that was seen to fail without it.
+
+- **The prompter's display comes from the user manager.** alephd is often
+  started by `pam_aleph` during login, before Hyprland exists; its own
+  environment then never has `WAYLAND_DISPLAY`, and every prompt would wait
+  for `alephctl unlock` until alephd restarted. At each launch alephd reads
+  the systemd user manager's `Environment` (uncached, 2 s limit), where the
+  compositor exports the display, and uses its own environment only when
+  the manager cannot be asked. No display there means no graphical session
+  now, and the prompt waits (§4), as before. Only a bare socket name is
+  accepted, never a path (any process of the user can set the manager's
+  environment).
+- **`~/.config/aleph/gui.toml`** holds the GUI's settings (`theme = "auto" |
+  "neon"`, `scanlines`): alephd's `config.toml` refuses unknown keys and
+  has no use for them. An unreadable file warns and uses the defaults.
+- **Reduced motion** is GNOME's `enable-animations = false`, read with
+  `gsettings` (absent: not requested). It turns off scanlines, spinners, and
+  animations; the scanlines themselves never move.
+- **Omarchy's palette:** `background`, `foreground`, and `accent` are
+  required; the other keys are used when present, blends otherwise; a file
+  that does not parse means Aleph neon. The watcher follows
+  `~/.local/state/omarchy/current` recursively (Omarchy rewrites the
+  theme's files in place).
+- **A strict conversation:** `Begin` first; the recovery-key question is
+  refused outside a recovery conversation (answered `Cancel`, no field
+  shown); one answer per question; `Cancel` at any time. (Closing and
+  timing out: H3.)
+- **Text from other programs** (collection labels, process names, key
+  names, errors) gets no line breaks of its own and is cut at 80 or 400
+  characters.
+- **Hyprland:** only the Lua configuration (Omarchy's) gets setup's offer;
+  the include is `pcall(dofile, …)`, appended in place (a symlinked dotfile
+  stays one) and removed exactly by revert. The rule floats, centers, pins,
+  and keeps the keyboard on the prompt (`stay_focused`), so a password is
+  never typed into another window; the prompt always ends (an answer,
+  Escape, `prompt.timeout`, or 20 seconds for a closing message). A `hyprland.conf` user adds the rule by
+  hand. The spec's `/usr/share/aleph/hypr/aleph.conf` becomes
+  `/usr/share/aleph/hyprland/aleph-prompt.lua`.
+- **Snapshot tests render with wgpu:** they need a GPU driver or Mesa's
+  software Vulkan, and are regenerated (and looked at) on a new machine.
+- **The terminal prompter's comment** said the GUI offers "skip" while
+  waiting for a key; the protocol has no such answer, and the comment now
+  says Cancel ends the operation in both.
+
+### H1. Plan 5 is split: 5a the prompter, 5b the manager — owner's decision
+
+After the first real setup, the missing graphical prompt was the gap met
+every day: SDDM logs the owner in automatically, so after each boot the
+keyring is locked, and applications asking for a secret waited for
+`alephctl unlock` ("no prompter" in alephd's journal). Plan 5a is the
+prompter alone (`aleph-gui prompt`, the Hyprland rule, setup's offer);
+Plan 5b is the manager window (items, keyslots, settings, import and
+export, "Recover…", the `.desktop` file and icons), which nothing waits on.
+
 ## 2026-09-27: Plan 4c (setup), design
 
 ### G5. The CLI is `alephctl` (owner's decision)

@@ -38,13 +38,14 @@ in place (Plan 4b). Design decisions made along the way are in
 | `aleph-daemon` | `alephd`: the Secret Service and the `io.aleph.Admin1` interface |
 | `pam_aleph` | PAM module that hands the login password to `alephd` |
 | `aleph-cli` | `alephctl`: the command-line client |
+| `aleph-gui` | `aleph-gui prompt`: the unlock prompt `alephd` opens (the manager window comes later) |
 
 ## Development
 
-Tests need `swtpm`, `tpm2-tools`, `tpm2-tss`, `libfido2`, `pam`, `dbus`
-and `libsecret` (Arch: `pacman -S swtpm tpm2-tools tpm2-tss libfido2 pam
-dbus libsecret`). Hardware tests are opt-in;
-see [docs/testing.md](docs/testing.md).
+Tests need `swtpm`, `tpm2-tools`, `tpm2-tss`, `libfido2`, `pam`, `dbus`,
+`libsecret` and `lua`, and a GPU driver for the prompter's snapshots
+(Arch: `pacman -S swtpm tpm2-tools tpm2-tss libfido2 pam dbus libsecret
+lua`). Hardware tests are opt-in; see [docs/testing.md](docs/testing.md).
 
 ~~~sh
 make gate                # formatting, clippy, the full suite

@@ -386,7 +386,9 @@ classic case) create a new key that orphans their existing data.
   locked changes nothing.
 - No method call ever blocks waiting for the user. `Unlock()` returns a
   prompt with no reply timeout. If no prompter can start (no graphical
-  session), the prompt is not dismissed: it waits until the vault is
+  session), or the prompter times out or ends without an answer (it
+  crashed, or could not open its window), the prompt is not dismissed
+  (only the user's Cancel dismisses it): it waits until the vault is
   unlocked some other way (`alephctl unlock`, PAM), then completes. At
   most 8 prompts per client, and 128 in all, may wait; a prompt starts
   once; while one unlock conversation runs, other unlock prompts wait for
@@ -905,6 +907,12 @@ idle_timeout = 0         # seconds without secret access; 0 = disabled
   child of `alephd`. A window claiming `aleph-prompt` that `alephd` did
   not spawn gets nothing, because secrets only ever travel over a
   socketpair, never in D-Bus message bodies.
+- **The display:** the prompter runs on the session's current Wayland
+  display, read at each launch from the systemd user manager's
+  environment (where the compositor exports it). alephd itself is often
+  started before the compositor (by `pam_aleph` during login), so its own
+  environment is used only when the manager cannot be asked
+  (DECISIONS.md H2).
 - With no Wayland display, Secret Service prompts wait (§4), and
   `alephctl unlock` unlocks in the terminal, in the style of
   `systemd-ask-password`. With `ALEPH_NO_TTY=1` its answers are lines of
@@ -1051,7 +1059,12 @@ alephctl restore [--from-bak | --accept-rollback] [<path>]
 - **Aleph neon** (near-black, neon cyan/magenta, monospace) is the
   fallback off Omarchy, and can be selected anywhere.
 - The scanline overlay is an independent toggle, on by default, and
-  disabled automatically when reduced motion is requested.
+  disabled automatically when reduced motion is requested (GNOME's
+  `enable-animations` set to false, which also stops spinners and
+  animations).
+- The GUI's settings are in `~/.config/aleph/gui.toml`: `theme = "auto"`
+  (Omarchy's where there is one, else Aleph neon) or `"neon"`, and
+  `scanlines = true|false`.
 - Section headers may use Gibson vocabulary. Buttons and labels stay plain.
 
 **Prompter (`aleph-gui prompt`)**
@@ -1064,9 +1077,22 @@ alephctl restore [--from-bak | --accept-rollback] [<path>]
     admin operations
   - rollback and replacement warnings (§4)
 - The recovery key is never requested here, except inside the explicit
-  "Recover…" flow.
-- The package ships a Hyprland snippet (float, center, pin, focus) that
-  setup offers to include.
+  "Recover…" flow: asked for in any other conversation, the prompter
+  refuses without showing a field.
+- Text from other programs (collection labels, process names) gets no
+  line breaks of its own and is cut short, so it can neither draw a fake
+  prompt inside the real one nor push the buttons out of view.
+- If no window can open, the prompter exits without answering, and the
+  prompt waits (§4). When alephd ends the conversation, the window
+  closes; a closing message stays up for 20 seconds or until closed.
+  Keys arriving just as a screen appears are ignored, so text typed into
+  another window never becomes an answer.
+- The package ships a Hyprland window rule,
+  `/usr/share/aleph/hyprland/aleph-prompt.lua` (float, center, pin, and
+  keep the keyboard on the prompt while it is open), which setup offers
+  to include from `~/.config/hypr/hyprland.lua` (through `pcall`, so an
+  uninstalled aleph never breaks Hyprland's configuration); revert
+  removes it.
 
 **Manager (`aleph-gui`)**
 
@@ -1094,8 +1120,8 @@ alephctl restore [--from-bak | --accept-rollback] [<path>]
   - `provides=(org.freedesktop.secrets)`. It does not conflict with
     `gnome-keyring`; setup switches between them.
   - Installs:
-    - `alephctl` to `/usr/bin`; `alephd` and `aleph-tpmd` to
-      `/usr/lib/aleph/`
+    - `alephctl` and `aleph-gui` to `/usr/bin`; `alephd` and `aleph-tpmd`
+      to `/usr/lib/aleph/`
     - `/usr/lib/security/pam_aleph.so`, and `/etc/pam.d/aleph-check`
     - `/usr/share/dbus-1/services/io.aleph.Keyring.service` (only that
       name: the Secret Service name's activation file is the user's,
@@ -1111,7 +1137,7 @@ alephctl restore [--from-bak | --accept-rollback] [<path>]
       | `assets/icons/aleph-16.svg` | `hicolor/16x16/apps/aleph.svg` |
       | `assets/icons/aleph-symbolic.svg` | `hicolor/symbolic/apps/aleph-symbolic.svg` |
 
-    - `/usr/share/aleph/hypr/aleph.conf`
+    - `/usr/share/aleph/hyprland/aleph-prompt.lua`
   - A post-install hook enables `aleph-tpmd.socket`, and `alephd.socket`
     for every user (`systemctl --global enable`). `packaging/install.sh`
     does the same from a release build, until there is a package.
@@ -1188,7 +1214,10 @@ alephctl restore [--from-bak | --accept-rollback] [<path>]
   - `setup` followed by `--revert` leaves `/etc/pam.d` byte-identical and
     gnome-keyring holding every item
 - **GUI:** `egui_kittest` snapshots of every prompter screen in both
-  themes, and `colors.toml` parsing tests.
+  themes (rendered with wgpu: the tests need a GPU driver, or Mesa's
+  software Vulkan), the screens driven through AccessKit as a person
+  would (typing, Enter, Escape, clicks), `colors.toml` parsing tests, and
+  the binary's handling of `ALEPH_PROMPT_FD` and of a missing display.
 - **Before 1.0:** a written threat model and an external security review
   of `aleph-core`, `aleph-tpmd`, `aleph-unlock`, and `pam_aleph`.
 

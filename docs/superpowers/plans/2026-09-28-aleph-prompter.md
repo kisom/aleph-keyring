@@ -41,7 +41,7 @@ Every task was prototyped on a clone of `master` and the whole gate run (`make g
 ## Global Constraints
 
 - Rust stable 1.98, edition 2024; every crate `license = "Apache-2.0"` (workspace).
-- `eframe` and `egui` 0.36 with `default-features = false, features = ["default_fonts", "glow", "wayland"]` for eframe; `egui_kittest` 0.36 with `["snapshot", "wgpu"]` (dev only); `notify` 8.
+- `eframe` and `egui` 0.36 with `default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland"]` for eframe; `egui_kittest` 0.36 with `["snapshot", "wgpu"]` (dev only); `notify` 8.
 - **Exact names:** the program `aleph-gui`, run as `aleph-gui prompt`; app_id `aleph-prompt`; `ALEPH_PROMPT_FD`; `~/.config/aleph/gui.toml`; `/usr/share/aleph/hyprland/aleph-prompt.lua`; `~/.config/hypr/hyprland.lua`; the Omarchy theme at `~/.local/state/omarchy/current/theme/colors.toml`.
 - Secrets travel only over the prompter socket; typed secrets live in `Zeroizing<String>` and are moved (never copied) into the answer. Never log or print a secret, and never quote a malformed message (it may hold one).
 - Tests never open a window on the real display (kittest renders offscreen; the binary tests name a Wayland socket that does not exist), never ask the real user manager (a stand-in on a private bus), and never touch the real system, as in earlier plans.
@@ -744,7 +744,7 @@ rust-version.workspace = true
 
 [dependencies]
 aleph-prompt-proto = { path = "../aleph-prompt-proto" }
-eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland"] }
+eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland"] }
 egui = "0.36"
 libc.workspace = true
 notify = "8"
@@ -3432,6 +3432,8 @@ Run: `UPDATE_SNAPSHOTS=1 cargo test -q -p aleph-gui --test screens snapshots`
 Expected: `ok. 1 passed`, and 30 files in `crates/aleph-gui/tests/snapshots/`: `{working, ask_password, ask_both_error, ask_key, ask_back_off, old_password, pin, insert_key, touch, confirm, confirm_long_label, recovery_key, show_recovery_key, recovery_check, finished_message}_{neon, omarchy}.png`.
 
 Open every one. Each must show the `aleph` label, the title, and "Requested by secret-tool (pid 4242)"; text legible against its background in both themes; the buttons along the bottom right, none clipped (`confirm_long_label_*`: the label is cut with "…" and the buttons still show, "No" focused); the primary button filled with the accent only when it can be used (`ask_password_*`: "Unlock" plain until something is typed); `show_recovery_key_*`: 14 numbered groups in two rows of 7; `recovery_check_*`: the first group field has the keyboard. Fix and regenerate until they do. (Snapshots are compared pixel by pixel on this machine; another GPU or driver may render text slightly differently: regenerate there, and review the images as above.)
+
+(Executed: the review of these images found `confirm_long_label_omarchy` reaching the button row. The executor added `a_long_confirmation_never_covers_the_buttons` and `fitted()` in `screens.rs` (the confirmation text cut to the rows that fit); `screens` has 15 tests. DECISIONS.md H3.)
 
 - [ ] **Step 5: Run the tests, clippy, and fmt**
 
