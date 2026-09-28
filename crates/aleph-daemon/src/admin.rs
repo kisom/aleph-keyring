@@ -178,9 +178,85 @@ impl Admin {
         .await
         .map_err(failed)?
         .map_err(failed)?;
+        crate::import::record_imported(&self.paths.imported(), &summary.added).map_err(failed)?;
         let _ = self.secrets.unlocked().await;
-        tokio::spawn(importer.follow(self.keyring.clone(), self.secrets.clone()));
+        tokio::spawn(importer.follow(
+            self.keyring.clone(),
+            self.secrets.clone(),
+            self.paths.imported(),
+        ));
         Ok(summary.to_string())
+    }
+
+    /// Items imported from gnome-keyring and deleted in aleph since, as
+    /// "label (collection)" (revert offers to delete them there too).
+    async fn removed_since_import(&self) -> zbus::fdo::Result<Vec<String>> {
+        let imported = crate::import::load_imported(&self.paths.imported());
+        let removed = self
+            .keyring
+            .read(|b| crate::import::removed_since(&imported, b))
+            .map_err(failed)?;
+        Ok(removed
+            .into_iter()
+            .map(|i| format!("{} ({})", i.label, i.collection))
+            .collect())
+    }
+
+    /// Copy the keyring back to gnome-keyring for `aleph setup --revert`
+    /// (DECISIONS.md E3), deleting there the items deleted in aleph since
+    /// the import if `delete_removed`. Writes stay paused afterwards.
+    async fn export_to_gnome_keyring(
+        &self,
+        prompter: zbus::zvariant::OwnedFd,
+        delete_removed: bool,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<()> {
+        if crate::export::gnome_keyring_active(conn).await {
+            return Err(zbus::fdo::Error::Failed(
+                "gnome-keyring is running in this session: revert runs its own over the keyring files; stop it first".into(),
+            ));
+        }
+        let data_home = self
+            .paths
+            .data_dir
+            .parent()
+            .ok_or_else(|| zbus::fdo::Error::Failed("no data directory".into()))?
+            .to_path_buf();
+        let imported = crate::import::load_imported(&self.paths.imported());
+        let handle = tokio::runtime::Handle::current();
+        self.converse(prompter, move |k, chan| {
+            k.export(chan, |password, body| {
+                let delete = if delete_removed {
+                    crate::import::removed_since(&imported, &body)
+                } else {
+                    Vec::new()
+                };
+                handle.block_on(async {
+                    let private = crate::export::Private::start(&data_home, password).await?;
+                    let conn = private.connect().await?;
+                    crate::export::export(&conn, &private.address, &body, &delete)
+                        .await
+                        .map(|r| r.to_string())
+                })
+            })
+        })
+    }
+
+    /// Let go of `org.freedesktop.secrets` (the end of a revert: the bus
+    /// hands it to gnome-keyring, queued behind).
+    async fn release_secret_service(
+        &self,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<()> {
+        conn.release_name(crate::import::SECRETS_NAME)
+            .await
+            .map(|_| ())
+            .map_err(failed)
+    }
+
+    /// Resume writes paused by an export (a revert that stopped part way).
+    async fn thaw_writes(&self) {
+        self.keyring.thaw();
     }
 
     async fn lock(&self) -> zbus::fdo::Result<()> {

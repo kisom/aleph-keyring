@@ -74,6 +74,11 @@ pub enum Error {
     Sleeping,
 
     #[error(
+        "writes are paused while the keyring is copied back to gnome-keyring (aleph setup --revert)"
+    )]
+    Frozen,
+
+    #[error(
         "the recovery key just shown was not installed ({0}); discard it: your previous recovery key still works"
     )]
     RecoveryNotInstalled(Box<Error>),

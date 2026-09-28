@@ -169,6 +169,9 @@ pub struct Keyring {
     /// A vault has been here since this daemon started: deleting its files
     /// does not make this a new machine (custody proof, E7).
     seen_vault: std::sync::atomic::AtomicBool,
+    /// Writes are paused: the keyring is being copied back to
+    /// gnome-keyring (DECISIONS.md E3).
+    frozen: std::sync::atomic::AtomicBool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -202,6 +205,7 @@ impl Keyring {
             last_access: Mutex::new(Instant::now()),
             sleeping: std::sync::atomic::AtomicBool::new(false),
             seen_vault: std::sync::atomic::AtomicBool::new(seen),
+            frozen: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -292,6 +296,9 @@ impl Keyring {
     /// Change the body and write the vault. If `f` or the write fails, the
     /// in-memory body is restored, so memory never runs ahead of the file.
     pub fn modify<T>(&self, f: impl FnOnce(&mut Body) -> Result<T>) -> Result<T> {
+        if self.frozen.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Frozen);
+        }
         let mut inner = lock(&self.inner);
         *lock(&self.last_access) = Instant::now();
         let Inner {
@@ -365,6 +372,45 @@ impl Keyring {
                 Err(Error::Busy)
             }
         }
+    }
+
+    /// Copy the keyring back to gnome-keyring (`aleph setup --revert`,
+    /// DECISIONS.md E3): after the login password (checked with PAM; it
+    /// also unlocks gnome-keyring's login keyring), writes are paused and
+    /// `run` gets the password and a copy of the body. A failure resumes
+    /// writes; success leaves them paused until the revert ends (or
+    /// [`Keyring::thaw`]).
+    pub fn export(
+        &self,
+        chan: &mut Channel,
+        run: impl FnOnce(&str, Body) -> Result<String>,
+    ) -> Result<()> {
+        let _op = self.begin(chan)?;
+        converse(chan, |chan| {
+            chan.send(&ToPrompter::Begin {
+                purpose: Purpose::Reauth,
+                operation: "Copy the keyring back to gnome-keyring".into(),
+                caller: None,
+            })?;
+            if self.is_locked() {
+                return Err(Error::Locked);
+            }
+            let password = self.ask_password(chan)?;
+            self.frozen.store(true, std::sync::atomic::Ordering::SeqCst);
+            let result = self
+                .read(|b| b.clone())
+                .and_then(|body| run(&password, body));
+            if result.is_err() {
+                self.thaw();
+            }
+            result.map(Some)
+        })
+    }
+
+    /// Resume writes after an export (a revert that stopped part way).
+    pub fn thaw(&self) {
+        self.frozen
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Unlock through the prompter.

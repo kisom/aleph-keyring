@@ -11,7 +11,7 @@ name = "alephd"
 path = "src/main.rs"
 
 [features]
-testing = ["dep:aleph-tpmd", "dep:tempfile", "aleph-core/insecure-test-params"]
+testing = ["dep:aleph-tpmd", "aleph-core/insecure-test-params"]
 
 [dependencies]
 aes = "0.9"
@@ -39,7 +39,7 @@ uuid.workspace = true
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 zeroize.workspace = true
 aleph-tpmd = { path = "../aleph-tpmd", features = ["testing"], optional = true }
-tempfile = { workspace = true, optional = true }
+tempfile.workspace = true
 
 [dev-dependencies]
 aleph-core = { path = "../aleph-core", features = ["insecure-test-params"] }

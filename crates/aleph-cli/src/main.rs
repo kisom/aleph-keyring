@@ -7,6 +7,7 @@
 
 mod client;
 mod prompter;
+mod switchover;
 
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write};
@@ -34,8 +35,14 @@ enum ImportSource {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create the keyring (system integration comes in a later release).
-    Setup,
+    /// Set up aleph: create the keyring, import from gnome-keyring, and take
+    /// over the Secret Service from it.
+    Setup {
+        /// Hand everything back to gnome-keyring (copying the keyring there
+        /// first); the aleph vault is left in place.
+        #[arg(long)]
+        revert: bool,
+    },
     /// Show the keyring's state and keyslots.
     Status,
     /// Import items from another keyring (alephd reads them itself).
@@ -176,31 +183,32 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     let c = Client::connect().await?;
     match cli.cmd {
         Cmd::Completions { .. } => unreachable!(),
-        Cmd::Setup => {
+        Cmd::Setup { revert: true } => revert(&c).await?,
+        Cmd::Setup { revert: false } => {
             let status = c.status().await?;
             if status.vault {
-                eprintln!("aleph: a keyring already exists (see `aleph status`)");
-                return Ok(ExitCode::SUCCESS);
+                eprintln!("aleph: a keyring already exists; checking the rest of setup");
+            } else {
+                create_keyring(&c, status.tpm.unwrap_or(false)).await?;
             }
-            let tpm = status.tpm.unwrap_or(false);
-            let first = if tpm {
-                "the TPM and your login password (recommended)"
-            } else {
-                "your login password"
-            };
-            eprintln!("How should the keyring unlock?\n  1) {first}\n  2) a FIDO2 security key");
-            let mut term = prompter::Terminal::new();
-            let choice = term_line(&mut term, "Choice [1]: ")?;
-            let method = if choice.trim() == "2" {
-                "fido2"
-            } else {
-                "password"
-            };
-            outcome(c.converse("Create", Args::Str(method)).await?)?;
+            // Import while gnome-keyring still serves the Secret Service
+            // (E1), then take over from it (E9).
+            if c.status().await?.locked {
+                outcome(c.converse("Unlock", Args::None).await?)?;
+            }
+            eprintln!("aleph: {}", c.import_gnome_keyring().await?);
+            let dirs = switchover::Dirs::from_env()?;
+            let mut record = switchover::Record::load(&dirs)?;
+            for step in
+                switchover::switch_over(c.bus(), &switchover::Systemctl, &dirs, &mut record).await?
+            {
+                eprintln!("aleph: {step}");
+            }
             eprintln!(
-                "aleph: note: setup does not yet set up login unlock (PAM), take over from gnome-keyring, or import its items: these are not available yet (see docs/testing.md for the PAM lines)"
+                "aleph: note: setup does not yet set up login unlock (PAM): see docs/testing.md for the lines"
             );
         }
+
         Cmd::Status => {
             let s = c.status().await?;
             if cli.json {
@@ -428,6 +436,72 @@ async fn backup(c: &Client, path: &std::path::Path, force: bool) -> Result<()> {
         "aleph: note: copies of ~/.local/share/aleph made any other way hold every keyslot \
          (including a login-password slot on machines without a TPM); `aleph backup` holds only the recovery slot"
     );
+    Ok(())
+}
+
+/// `aleph setup --revert` (DECISIONS.md E3): copy the keyring back to
+/// gnome-keyring and verify it, then switch back and let go of the name.
+async fn revert(c: &Client) -> Result<()> {
+    let installed = std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|d| d.join("gnome-keyring-daemon").is_file())
+    });
+    if !installed {
+        return Err(
+            "gnome-keyring is not installed: reverting would leave no Secret Service (Arch: pacman -S gnome-keyring)"
+                .into(),
+        );
+    }
+    let removed = c.removed_since_import().await?;
+    let mut delete = false;
+    if !removed.is_empty() {
+        eprintln!(
+            "aleph: imported from gnome-keyring and deleted in aleph since: {}",
+            removed.join(", ")
+        );
+        let mut term = prompter::Terminal::new();
+        let answer = term_line(&mut term, "Delete them from gnome-keyring too? [y/N] ")?;
+        delete = matches!(answer.trim(), "y" | "Y" | "yes");
+    }
+    outcome(
+        c.converse("ExportToGnomeKeyring", Args::Bool(delete))
+            .await?,
+    )?;
+    let dirs = switchover::Dirs::from_env()?;
+    let mut record = switchover::Record::load(&dirs)?;
+    let steps =
+        match switchover::switch_back(c.bus(), &switchover::Systemctl, &dirs, &mut record).await {
+            Ok(steps) => steps,
+            Err(e) => {
+                let _ = c.thaw_writes().await;
+                return Err(e);
+            }
+        };
+    for step in steps {
+        eprintln!("aleph: {step}");
+    }
+    c.release_secret_service().await?;
+    eprintln!(
+        "aleph: gnome-keyring serves the Secret Service again; the aleph vault is left in place"
+    );
+    Ok(())
+}
+
+/// Create the keyring, asking which unlock method to use.
+async fn create_keyring(c: &Client, tpm: bool) -> Result<()> {
+    let first = if tpm {
+        "the TPM and your login password (recommended)"
+    } else {
+        "your login password"
+    };
+    eprintln!("How should the keyring unlock?\n  1) {first}\n  2) a FIDO2 security key");
+    let mut term = prompter::Terminal::new();
+    let choice = term_line(&mut term, "Choice [1]: ")?;
+    let method = if choice.trim() == "2" {
+        "fido2"
+    } else {
+        "password"
+    };
+    outcome(c.converse("Create", Args::Str(method)).await?)?;
     Ok(())
 }
 

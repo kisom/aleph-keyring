@@ -53,6 +53,10 @@ async fn run() -> Result<(), String> {
         .await
         .map_err(|e| format!("cannot own {BUS_NAME} on the session bus: {e}"))?;
     let pam_socket = paths.pam_socket();
+    let activation = paths
+        .data_dir
+        .parent()
+        .map(|data| data.join("dbus-1/services/org.freedesktop.secrets.service"));
     let secrets =
         aleph_daemon::daemon::serve(&conn, keyring.clone(), launcher, config.clone(), paths)
             .await
@@ -60,6 +64,12 @@ async fn run() -> Result<(), String> {
     // Queued behind gnome-keyring until it lets go (DECISIONS.md E1).
     match aleph_daemon::daemon::request_secrets_name(&conn).await {
         Ok(true) => tracing::info!("serving {SECRETS_NAME} and {BUS_NAME}"),
+        // After setup switched over, nothing else should hold it.
+        Ok(false) if activation.as_ref().is_some_and(|a| a.exists()) => {
+            tracing::warn!(
+                "another program owns {SECRETS_NAME} although aleph setup switched over (gnome-keyring started outside systemd?); alephd waits in the queue"
+            )
+        }
         Ok(false) => tracing::info!(
             "serving {BUS_NAME}; queued for {SECRETS_NAME}, which another program owns"
         ),

@@ -82,6 +82,11 @@ impl Paths {
         self.state_dir.join("vault-id")
     }
 
+    /// The items `aleph setup` imported from gnome-keyring (for revert).
+    pub fn imported(&self) -> PathBuf {
+        self.state_dir.join("imported.json")
+    }
+
     /// Where `pam_aleph` hands over the login password (§6).
     pub fn pam_socket(&self) -> PathBuf {
         self.runtime_dir.join("pam.sock")

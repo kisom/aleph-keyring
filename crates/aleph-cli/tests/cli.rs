@@ -7,9 +7,16 @@ use std::process::{Child, Command, Stdio};
 use aleph_daemon::testing::*;
 
 fn aleph(d: &Daemon, args: &[&str]) -> Command {
+    // Never the real home or user manager: setup writes activation files
+    // and runs systemctl (`false`: no unit exists, and any change fails).
+    let home = d.env.paths.data_dir.parent().unwrap().join("home");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aleph"));
     cmd.args(args)
         .env("DBUS_SESSION_BUS_ADDRESS", &d.bus.address)
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("ALEPH_SYSTEMCTL", "false")
         .env("ALEPH_NO_TTY", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -108,9 +115,15 @@ async fn setup_creates_the_keyring_and_status_shows_it() {
     assert!(out.contains("keyring: none"), "{out}");
     let log = setup(&d).await;
     assert!(log.contains("The keyring is ready."), "{log}");
+    // Then the import (no gnome-keyring here) and the switchover (alephd
+    // already serves the name); PAM is still by hand.
+    assert!(log.contains("gnome-keyring is not running"), "{log}");
+    assert!(log.contains("alephd serves the Secret Service"), "{log}");
+    assert!(log.contains("docs/testing.md"), "{log}");
+    let home = d.env.paths.data_dir.parent().unwrap().join("home");
     assert!(
-        log.contains("not available yet"),
-        "setup should say what is missing: {log}"
+        home.join("data/dbus-1/services/org.freedesktop.secrets.service")
+            .exists()
     );
     let (ok, out, _) = run(&d, &["status", "--json"], "").await;
     assert!(ok);
@@ -357,4 +370,45 @@ async fn import_and_status_name_the_secret_service() {
         ok && out.contains("secret service: served by alephd"),
         "{out}"
     );
+}
+
+/// `aleph setup --revert` copies the keyring to gnome-keyring (the login
+/// password unlocks it), verifies it, and lets go of the Secret Service.
+#[tokio::test(flavor = "multi_thread")]
+async fn setup_revert_hands_everything_back() {
+    let d = daemon(true, vec![]).await;
+    run(&d, &["store", "--label", "Mail", "service=mail"], "s3cret").await;
+    let (ok, _, err) = run(&d, &["setup", "--revert"], &format!("{PW}\n")).await;
+    assert!(ok, "{err}");
+    assert!(err.contains("Copied 1 item(s)"), "{err}");
+    assert!(
+        err.contains("gnome-keyring serves the Secret Service again"),
+        "{err}"
+    );
+    assert_eq!(
+        aleph_daemon::daemon::secret_service_owner(&d.conn).await,
+        "nobody"
+    );
+    let data_home = d.env.paths.data_dir.parent().unwrap().to_path_buf();
+    let gk = aleph_daemon::export::Private::start(&data_home, PW)
+        .await
+        .unwrap();
+    let c = gk.connect().await.unwrap();
+    let (found, _): (
+        Vec<zbus::zvariant::OwnedObjectPath>,
+        Vec<zbus::zvariant::OwnedObjectPath>,
+    ) = c
+        .call_method(
+            Some("org.freedesktop.secrets"),
+            "/org/freedesktop/secrets",
+            Some("org.freedesktop.Secret.Service"),
+            "SearchItems",
+            &(std::collections::HashMap::from([("service", "mail")]),),
+        )
+        .await
+        .unwrap()
+        .body()
+        .deserialize()
+        .unwrap();
+    assert_eq!(found.len(), 1);
 }

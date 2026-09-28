@@ -165,3 +165,238 @@ async fn without_gnome_keyring_there_is_nothing_to_import() {
     let summary = admin(&c, "ImportGnomeKeyring").await.unwrap();
     assert!(summary.contains("not running"), "{summary}");
 }
+
+/// `ExportToGnomeKeyring` with a prompter answering `replies`: (ok, message).
+async fn export(d: &Daemon, delete: bool, replies: Vec<FromPrompter>) -> (bool, Option<String>) {
+    use std::os::fd::OwnedFd;
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let prompter = Interactive::new(replies);
+    prompter.respond(ours);
+    let fd = zbus::zvariant::OwnedFd::from(OwnedFd::from(theirs));
+    let c = client(&d.bus.address).await;
+    c.call_method(
+        Some(aleph_daemon::admin::BUS_NAME),
+        aleph_daemon::admin::ADMIN_PATH,
+        Some("io.aleph.Admin1"),
+        "ExportToGnomeKeyring",
+        &(fd, delete),
+    )
+    .await
+    .unwrap();
+    let sent = tokio::task::spawn_blocking(move || prompter.sent())
+        .await
+        .unwrap();
+    match sent.last() {
+        Some(ToPrompter::Done { ok, message }) => (*ok, message.clone()),
+        other => panic!("the export did not finish: {other:?}"),
+    }
+}
+
+fn add(d: &Daemon, collection: Option<&str>, label: &str, attrs: &[(&str, &str)], secret: &str) {
+    d.keyring
+        .modify(|b| {
+            let id = match collection {
+                None => {
+                    b.resolve_alias(aleph_core::model::DEFAULT_ALIAS)
+                        .unwrap()
+                        .id
+                }
+                Some(name) => match b.collections.iter().find(|c| c.label == name) {
+                    Some(c) => c.id,
+                    None => {
+                        let c = aleph_core::Collection::new(name);
+                        let id = c.id;
+                        b.collections.push(c);
+                        id
+                    }
+                },
+            };
+            b.collection_mut(id).unwrap().upsert(
+                aleph_core::Item::new(
+                    label,
+                    attrs
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                    aleph_core::SecretBytes::new(secret.as_bytes().to_vec()),
+                    "text/plain",
+                ),
+                false,
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// The number of items gnome-keyring on `conn`'s bus finds for `attrs`.
+async fn found(conn: &zbus::Connection, attrs: &[(&str, &str)]) -> usize {
+    let attrs: std::collections::HashMap<&str, &str> = attrs.iter().copied().collect();
+    let (unlocked, locked): (
+        Vec<zbus::zvariant::OwnedObjectPath>,
+        Vec<zbus::zvariant::OwnedObjectPath>,
+    ) = conn
+        .call_method(
+            Some("org.freedesktop.secrets"),
+            "/org/freedesktop/secrets",
+            Some("org.freedesktop.Secret.Service"),
+            "SearchItems",
+            &(attrs,),
+        )
+        .await
+        .unwrap()
+        .body()
+        .deserialize()
+        .unwrap();
+    unlocked.len() + locked.len()
+}
+
+/// Everything goes back to gnome-keyring (a collection it lacks into its
+/// default one) and is read back; writes pause until the revert ends or
+/// they are resumed; a second export finds everything there.
+#[tokio::test(flavor = "multi_thread")]
+async fn items_are_copied_back_and_writes_pause() {
+    let d = daemon(true, vec![]).await;
+    add(&d, None, "Mail", &[("service", "mail")], "s3cret");
+    add(&d, Some("Work"), "VPN", &[("service", "vpn")], "k3y");
+    let (ok, message) = export(&d, false, vec![password(PW)]).await;
+    let message = message.unwrap_or_default();
+    assert!(ok, "{message}");
+    assert!(message.contains("Copied 2 item(s)"), "{message}");
+    assert!(message.contains("default collection"), "{message}");
+    assert!(matches!(
+        d.keyring.modify(|_| Ok(())),
+        Err(aleph_daemon::Error::Frozen)
+    ));
+    admin(&client(&d.bus.address).await, "ThawWrites")
+        .await
+        .ok();
+    d.keyring.modify(|_| Ok(())).unwrap();
+    // Read back by a gnome-keyring of our own over the same files.
+    let data_home = d.env.paths.data_dir.parent().unwrap().to_path_buf();
+    {
+        let gk = aleph_daemon::export::Private::start(&data_home, PW)
+            .await
+            .unwrap();
+        let c = gk.connect().await.unwrap();
+        assert_eq!(found(&c, &[("service", "mail")]).await, 1);
+        assert_eq!(found(&c, &[("service", "vpn")]).await, 1);
+    }
+    let (ok, message) = export(&d, false, vec![password(PW)]).await;
+    assert!(ok);
+    assert!(message.unwrap().contains("2 already there"));
+}
+
+/// A login keyring that does not open with the login password (their
+/// passwords differ) changes nothing, and writes are not paused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_login_keyring_that_does_not_unlock_changes_nothing() {
+    let d = daemon(true, vec![]).await;
+    add(&d, None, "Mail", &[("service", "mail")], "s3cret");
+    let data_home = d.env.paths.data_dir.parent().unwrap().to_path_buf();
+    drop(
+        aleph_daemon::export::Private::start(&data_home, "another password")
+            .await
+            .unwrap(),
+    );
+    let (ok, message) = export(&d, false, vec![password(PW)]).await;
+    assert!(!ok);
+    assert!(message.unwrap().contains("did not unlock"));
+    d.keyring.modify(|_| Ok(())).unwrap();
+}
+
+/// Revert does not run a second gnome-keyring over the same files.
+#[tokio::test(flavor = "multi_thread")]
+async fn revert_refuses_while_gnome_keyring_runs() {
+    let bus = bus();
+    let _gk = GnomeKeyring::start(&bus, "login password");
+    let d = daemon_on(bus, true).await;
+    use std::os::fd::OwnedFd;
+    let (_ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let fd = zbus::zvariant::OwnedFd::from(OwnedFd::from(theirs));
+    let err = client(&d.bus.address)
+        .await
+        .call_method(
+            Some(aleph_daemon::admin::BUS_NAME),
+            aleph_daemon::admin::ADMIN_PATH,
+            Some("io.aleph.Admin1"),
+            "ExportToGnomeKeyring",
+            &(fd, false),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("gnome-keyring is running"),
+        "{err}"
+    );
+}
+
+/// Items imported and deleted in aleph since are listed, and deleted in
+/// gnome-keyring too when asked; the rest stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn items_deleted_since_the_import_are_deleted_there_too() {
+    let bus = bus();
+    let address = bus.address.clone();
+    let gk = GnomeKeyring::start(&bus, "login password");
+    gk.store("Gone", &[("k", "gone")], "x");
+    gk.store("Kept", &[("k", "kept")], "y");
+    let d = daemon_on(bus, true).await;
+    let c = client(&address).await;
+    admin(&c, "ImportGnomeKeyring").await.unwrap();
+    d.keyring
+        .modify(|b| {
+            for col in &mut b.collections {
+                col.items.retain(|i| i.label != "Gone");
+            }
+            Ok(())
+        })
+        .unwrap();
+    let removed: Vec<String> = c
+        .call_method(
+            Some(aleph_daemon::admin::BUS_NAME),
+            aleph_daemon::admin::ADMIN_PATH,
+            Some("io.aleph.Admin1"),
+            "RemovedSinceImport",
+            &(),
+        )
+        .await
+        .unwrap()
+        .body()
+        .deserialize()
+        .unwrap();
+    assert_eq!(removed, ["Gone (Login)"]);
+    // (Straight to the export, against the running gnome-keyring.)
+    let body = d.keyring.read(|b| b.clone()).unwrap();
+    let delete = aleph_daemon::import::removed_since(
+        &aleph_daemon::import::load_imported(&d.env.paths.imported()),
+        &body,
+    );
+    let report = aleph_daemon::export::export(&c, &address, &body, &delete)
+        .await
+        .unwrap();
+    assert_eq!(
+        (report.exported, report.unchanged, report.deleted),
+        (0, 1, 1)
+    );
+    assert_eq!(found(&c, &[("k", "gone")]).await, 0);
+    assert_eq!(found(&c, &[("k", "kept")]).await, 1);
+}
+
+/// Nobody can take the Secret Service name from alephd: it never allows
+/// replacement, so even `ReplaceExisting` just queues.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_name_cannot_be_taken_from_alephd() {
+    let d = daemon(true, vec![]).await;
+    let other = client(&d.bus.address).await;
+    let reply = other
+        .request_name_with_flags(
+            "org.freedesktop.secrets",
+            zbus::fdo::RequestNameFlags::ReplaceExisting.into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply, zbus::fdo::RequestNameReply::InQueue);
+    assert_eq!(
+        aleph_daemon::daemon::secret_service_owner(&d.conn).await,
+        "alephd"
+    );
+}

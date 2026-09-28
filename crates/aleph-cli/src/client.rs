@@ -106,6 +106,11 @@ impl Client {
             .map_err(err)
     }
 
+    /// The session bus connection.
+    pub fn bus(&self) -> &zbus::Connection {
+        &self.conn
+    }
+
     pub async fn status(&self) -> Result<Status> {
         let json: String = self
             .admin()
@@ -124,6 +129,35 @@ impl Client {
             .call("ImportGnomeKeyring", &())
             .await
             .map_err(|e| format!("import failed: {e}"))
+    }
+
+    /// Items imported from gnome-keyring and deleted in aleph since.
+    pub async fn removed_since_import(&self) -> Result<Vec<String>> {
+        self.admin()
+            .await?
+            .call("RemovedSinceImport", &())
+            .await
+            .map_err(err)
+    }
+
+    /// Let go of the Secret Service name (the end of a revert).
+    pub async fn release_secret_service(&self) -> Result<()> {
+        self.admin()
+            .await?
+            .call_method("ReleaseSecretService", &())
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// Resume writes paused by an export (a revert that stopped part way).
+    pub async fn thaw_writes(&self) -> Result<()> {
+        self.admin()
+            .await?
+            .call_method("ThawWrites", &())
+            .await
+            .map_err(err)?;
+        Ok(())
     }
 
     pub async fn lock(&self) -> Result<()> {

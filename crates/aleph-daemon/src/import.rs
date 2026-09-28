@@ -20,6 +20,7 @@
 //! stored in between is lost.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,6 +62,56 @@ pub struct FetchedCollection {
     pub items: Vec<Fetched>,
 }
 
+/// An item an import added, as it was (for revert: items imported and
+/// deleted in aleph since are listed, E3).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ImportedItem {
+    pub id: uuid::Uuid,
+    pub collection: String,
+    pub is_default: bool,
+    pub label: String,
+    pub attributes: BTreeMap<String, String>,
+}
+
+/// The items imported so far (`imported.json`).
+pub fn load_imported(path: &Path) -> Vec<ImportedItem> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Add `items` to the record.
+pub fn record_imported(path: &Path, items: &[ImportedItem]) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut all = load_imported(path);
+    all.extend_from_slice(items);
+    let bytes = serde_json::to_vec_pretty(&all).map_err(gk)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Imported items no longer in `body` (deleted in aleph since).
+pub fn removed_since(imported: &[ImportedItem], body: &Body) -> Vec<ImportedItem> {
+    imported
+        .iter()
+        .filter(|i| {
+            !body
+                .collections
+                .iter()
+                .any(|c| c.items.iter().any(|x| x.id == i.id))
+        })
+        .cloned()
+        .collect()
+}
+
 /// What an import did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Summary {
@@ -70,6 +121,8 @@ pub struct Summary {
     pub conflicts: Vec<String>,
     /// Collections skipped, with the reason.
     pub skipped: Vec<String>,
+    /// The items added (recorded for revert).
+    pub added: Vec<ImportedItem>,
 }
 
 impl std::fmt::Display for Summary {
@@ -142,10 +195,18 @@ pub fn merge(body: &mut Body, fetched: Vec<FetchedCollection>, summary: &mut Sum
                     .push(format!("{} ({})", f.label, collection.label));
                 continue;
             }
+            summary.added.push(ImportedItem {
+                id: uuid::Uuid::nil(),
+                collection: collection.label.clone(),
+                is_default: collection.is_default,
+                label: f.label.clone(),
+                attributes: f.attributes.clone(),
+            });
             let mut item = Item::new(f.label, f.attributes, f.secret, f.content_type);
             item.created = f.created;
             item.modified = f.modified;
-            target.upsert(item, false);
+            let id = target.upsert(item, false);
+            summary.added.last_mut().expect("just pushed").id = id;
             summary.imported += 1;
         }
     }
@@ -300,7 +361,12 @@ impl Importer {
 
     /// Keep importing items gnome-keyring creates or changes until
     /// `org.freedesktop.secrets` changes hands (E1).
-    pub async fn follow(mut self, keyring: Arc<Keyring>, secrets: Arc<SecretService>) {
+    pub async fn follow(
+        mut self,
+        keyring: Arc<Keyring>,
+        secrets: Arc<SecretService>,
+        record: PathBuf,
+    ) {
         let Ok(dbus) = zbus::fdo::DBusProxy::new(&self.conn).await else {
             return;
         };
@@ -335,7 +401,7 @@ impl Importer {
                 continue;
             }
             if let Err(e) = self
-                .import_one(&keyring, &mut labels, &collection, item)
+                .import_one(&keyring, &mut labels, &collection, item, &record)
                 .await
             {
                 tracing::warn!("following gnome-keyring: {e}");
@@ -351,6 +417,7 @@ impl Importer {
         labels: &mut HashMap<String, (String, bool)>,
         collection: &str,
         item: OwnedObjectPath,
+        record: &Path,
     ) -> Result<()> {
         if !labels.contains_key(collection) {
             let c = proxy(&self.conn, &self.owner, collection, COLLECTION).await?;
@@ -383,6 +450,7 @@ impl Importer {
         })
         .await
         .map_err(gk)??;
+        record_imported(record, &summary.added)?;
         if !summary.conflicts.is_empty() {
             tracing::info!(
                 "gnome-keyring changed an item after it was imported; kept aleph's: {}",
