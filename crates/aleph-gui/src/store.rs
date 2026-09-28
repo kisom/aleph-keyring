@@ -100,6 +100,11 @@ pub enum Request {
 }
 
 impl Request {
+    /// Whether it may change what the lists show (a listing follows it).
+    pub fn changes(&self) -> bool {
+        !matches!(self, Self::Secret(_) | Self::Reauth(_))
+    }
+
     /// What it was, for `Done` and the log (never a secret or a label).
     pub fn name(&self) -> &'static str {
         match self {
@@ -124,6 +129,11 @@ pub enum StoreEvent {
         path: String,
         secret: Zeroizing<Vec<u8>>,
         content_type: String,
+    },
+    /// The secret of `path` could not be fetched (a `Done` follows).
+    SecretFailed {
+        path: String,
+        error: String,
     },
     /// A request finished; `error` if it failed (a dismissed prompt is
     /// not an error: `dismissed`).
@@ -273,17 +283,22 @@ impl Client {
             *guard = None;
         }
         if guard.is_none() {
-            let service = proxy(&self.conn, SERVICE_PATH, SERVICE).await?;
-            let dh = ClientDh::new().map_err(err)?;
-            let (output, path): (OwnedValue, OwnedObjectPath) = service
-                .call("OpenSession", &(DH, Value::from(dh.public.clone())))
-                .await
-                .map_err(err)?;
-            let server: Vec<u8> = output.try_into().map_err(err)?;
-            *guard = Some((dh.finish(&server).map_err(err)?, path, owner));
+            *guard = Some(self.open(owner).await?);
         }
         let (session, path, _) = guard.as_ref().expect("just opened");
         f(session, path)
+    }
+
+    /// Open a session with the alephd that is `owner`.
+    async fn open(&self, owner: String) -> Result<Opened, String> {
+        let service = proxy(&self.conn, SERVICE_PATH, SERVICE).await?;
+        let dh = ClientDh::new().map_err(err)?;
+        let (output, path): (OwnedValue, OwnedObjectPath) = service
+            .call("OpenSession", &(DH, Value::from(dh.public.clone())))
+            .await
+            .map_err(err)?;
+        let server: Vec<u8> = output.try_into().map_err(err)?;
+        Ok((dh.finish(&server).map_err(err)?, path, owner))
     }
 
     /// Drop the session (it failed: alephd forgot it, or it is not ours),
@@ -308,13 +323,17 @@ impl Client {
             .await;
         match alias {
             Ok(locked) => Ok(locked),
-            Err(_) => {
-                let _: Vec<OwnedObjectPath> = proxy(&self.conn, SERVICE_PATH, SERVICE)
-                    .await?
-                    .get_property("Collections")
-                    .await
-                    .map_err(err)?;
-                Ok(false)
+            // (Asked of the bus, not alephd: reading alephd's collections
+            // would count as using the keyring, and its idle lock would
+            // never come while the manager is open.)
+            Err(e) => {
+                let dbus = zbus::fdo::DBusProxy::new(&self.conn).await.map_err(err)?;
+                let name = zbus::names::BusName::try_from(SECRETS).map_err(err)?;
+                if dbus.name_has_owner(name).await.map_err(err)? {
+                    Ok(false)
+                } else {
+                    Err(err(e))
+                }
             }
         }
     }
@@ -401,21 +420,26 @@ impl Client {
         .await
     }
 
+    /// One item's secret, fetched and decrypted under the same session
+    /// (held for both: one replaced in between would decrypt with the
+    /// wrong key).
     async fn fetch(&self, path: &str) -> Result<StoreEvent, String> {
-        let session_path = self.with_session(|_, p| Ok(p.clone())).await?;
+        let owner = self.owner().await?;
+        let mut guard = self.session.lock().await;
+        if guard.as_ref().is_some_and(|(_, _, o)| *o != owner) {
+            *guard = None;
+        }
+        if guard.is_none() {
+            *guard = Some(self.open(owner).await?);
+        }
+        let (session, session_path, _) = guard.as_ref().expect("just opened");
         type Wrapped = ((OwnedObjectPath, Vec<u8>, Vec<u8>, String),);
         let ((_, params, value, content_type),): Wrapped = proxy(&self.conn, path, ITEM)
             .await?
-            .call("GetSecret", &(session_path,))
+            .call("GetSecret", &(session_path.clone(),))
             .await
             .map_err(err)?;
-        let secret = self
-            .with_session(|session, _| {
-                Ok(Zeroizing::new(
-                    session.decrypt(&params, &value).map_err(err)?.to_vec(),
-                ))
-            })
-            .await?;
+        let secret = Zeroizing::new(session.decrypt(&params, &value).map_err(err)?.to_vec());
         Ok(StoreEvent::Secret {
             path: path.to_string(),
             secret,
@@ -637,6 +661,11 @@ async fn run(
                 let (client, emit, refresh_tx) = (client.clone(), emit.clone(), refresh_tx.clone());
                 tokio::spawn(async move {
                     let name = r.name();
+                    let changes = r.changes();
+                    let fetching = match &r {
+                        Request::Secret(p) => Some(p.clone()),
+                        _ => None,
+                    };
                     match client.handle(r).await {
                         Ok((dismissed, secret)) => {
                             if let Some(s) = secret {
@@ -648,10 +677,17 @@ async fn run(
                             // (Operations and reasons only: never a secret
                             // or a label.)
                             eprintln!("aleph-gui: cannot {name}: {e}");
+                            if let Some(path) = fetching {
+                                emit.send(StoreEvent::SecretFailed { path, error: e.clone() });
+                            }
                             emit.send(StoreEvent::Done { request: name, error: Some(e), dismissed: false });
                         }
                     }
-                    let _ = refresh_tx.send(());
+                    // (Only after a change: a listing costs a few calls
+                    // per item.)
+                    if changes {
+                        let _ = refresh_tx.send(());
+                    }
                 });
                 false
             }

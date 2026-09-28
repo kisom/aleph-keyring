@@ -577,6 +577,111 @@ fn a_save_answer_belongs_to_its_form() {
     );
 }
 
+/// A failed fetch of an earlier secret does not drop the one asked for
+/// last.
+#[test]
+fn a_failed_fetch_does_not_drop_the_one_asked_for_last() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.state_mut().reauth.confirmed(Instant::now());
+    h.get_by_label("GitHub token").click();
+    frames(&mut h);
+    h.get_by_label("SHOW").click();
+    frames(&mut h);
+    h.get_by_label("VPN").click();
+    frames(&mut h);
+    h.get_by_label("SHOW").click();
+    frames(&mut h);
+    store.take();
+    store.send(StoreEvent::SecretFailed {
+        path: "/c/login/1".into(),
+        error: "gone".into(),
+    });
+    done(&store, "fetch the secret", Some("gone"));
+    secret(&store, "/c/work/1", b"vpn-pw");
+    frames(&mut h);
+    h.get_by_label("vpn-pw");
+}
+
+/// Moving to another item cancels a secret still on its way: it is never
+/// held unseen.
+#[test]
+fn moving_on_cancels_a_secret_still_coming() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.state_mut().reauth.confirmed(Instant::now());
+    h.get_by_label("GitHub token").click();
+    frames(&mut h);
+    h.get_by_label("SHOW").click();
+    frames(&mut h);
+    store.take();
+    h.get_by_label("VPN").click();
+    frames(&mut h);
+    secret(&store, "/c/login/1", b"ghp_s3cret");
+    frames(&mut h);
+    assert!(h.state().shown.is_none());
+}
+
+/// Leaving the window hides a shown secret and ends a confirmation (which
+/// would otherwise hold alephd's conversation lock).
+#[test]
+fn leaving_the_window_hides_the_secret_and_ends_the_confirmation() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.state_mut().reauth.confirmed(Instant::now());
+    h.get_by_label("GitHub token").click();
+    frames(&mut h);
+    h.get_by_label("SHOW").click();
+    frames(&mut h);
+    store.take();
+    secret(&store, "/c/login/1", b"ghp_s3cret");
+    frames(&mut h);
+    h.get_by_label("ghp_s3cret");
+    h.event(egui::Event::WindowFocused(false));
+    frames(&mut h);
+    assert!(h.query_by_label("ghp_s3cret").is_none());
+    // A confirmation in progress ends: alephd sees its socket close.
+    h.state_mut().reauth.forget();
+    h.get_by_label("SHOW").click();
+    frames(&mut h);
+    let Request::Reauth(fd) = only(store.take()) else {
+        panic!("no confirmation");
+    };
+    h.event(egui::Event::WindowFocused(false));
+    frames(&mut h);
+    let mut theirs = std::os::unix::net::UnixStream::from(fd);
+    theirs
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut buf = [0u8; 16];
+    assert_eq!(std::io::Read::read(&mut theirs, &mut buf).unwrap(), 0);
+}
+
+/// An item deleted elsewhere while its form is open closes the form, and
+/// says why.
+#[test]
+fn an_item_deleted_elsewhere_closes_its_form() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("VPN").click();
+    frames(&mut h);
+    h.get_by_label("EDIT").click();
+    frames(&mut h);
+    let Vault::Unlocked(mut cols) = vault() else {
+        unreachable!()
+    };
+    cols[1].items.clear();
+    store.send(StoreEvent::Vault(Vault::Unlocked(cols)));
+    frames(&mut h);
+    assert!(h.query_by_label("Label").is_none());
+    h.get_by_label_contains("deleted elsewhere");
+}
+
+/// With no folder at all, a new item says to create one first.
+#[test]
+fn a_new_item_without_a_folder_says_so() {
+    let (mut h, _, _) = window(ThemeChoice::Neon, Vault::Unlocked(vec![]));
+    h.get_by_label("+ ITEM").click();
+    frames(&mut h);
+    h.get_by_label_contains("create a folder first");
+}
+
 /// Enter on the delete question answers its default: No.
 #[test]
 fn enter_on_the_delete_question_says_no() {

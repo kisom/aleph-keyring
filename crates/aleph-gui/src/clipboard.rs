@@ -52,20 +52,22 @@ impl<B: Backend> Clipboard<B> {
     /// Offer `secret`, and clear it after the expiry if it is still ours
     /// and nothing was copied through here since.
     pub fn copy(&self, secret: Zeroizing<Vec<u8>>) -> Result<(), String> {
-        self.backend
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .offer(secret)?;
-        let this = self.copies.fetch_add(1, Ordering::SeqCst) + 1;
+        // (Offered and numbered under the backend's lock, and checked under
+        // it: an older timer can never clear this copy.)
+        let this = {
+            let mut b = self.backend.lock().unwrap_or_else(|e| e.into_inner());
+            b.offer(secret)?;
+            self.copies.fetch_add(1, Ordering::SeqCst) + 1
+        };
         let (backend, copies, keep) = (self.backend.clone(), self.copies.clone(), self.keep);
         std::thread::Builder::new()
             .name("aleph-clipboard".into())
             .spawn(move || {
                 std::thread::sleep(keep);
+                let mut b = backend.lock().unwrap_or_else(|e| e.into_inner());
                 if copies.load(Ordering::SeqCst) != this {
                     return;
                 }
-                let mut b = backend.lock().unwrap_or_else(|e| e.into_inner());
                 if b.still_ours() {
                     b.clear();
                 }

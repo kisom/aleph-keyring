@@ -212,19 +212,27 @@ impl<S: Store, B: Backend> Manager<S, B> {
         self.store.request(Request::Reauth(theirs.into()));
     }
 
+    /// End the confirmation, if one runs (alephd holds its conversation
+    /// lock until it ends).
+    fn end_confirm(&mut self) {
+        if let Some(app) = self.confirm.take() {
+            app.shutdown();
+        }
+    }
+
     /// Hide and forget what the keyring's lock makes unreadable.
     fn sealed(&mut self) {
         self.reauth.forget();
         self.shown = None;
         self.awaiting = None;
         self.pending = None;
-        self.confirm = None;
+        self.end_confirm();
         if let Mode::Edit {
             secret, original, ..
         } = &mut self.mode
         {
-            // (The form stays. A fetched secret must be fetched again; one
-            // typed stays, and is saved as typed.)
+            // (The form stays. A fetched secret left as it was must be
+            // fetched again; one typed or edited stays, and is saved as is.)
             if *secret == *original {
                 *secret = None;
             }
@@ -252,6 +260,30 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     if gone && matches!(self.vault, Vault::Unlocked(_)) {
                         self.selected = None;
                         self.shown = None;
+                    }
+                    // (A form on an item deleted elsewhere closes, saying
+                    // so: its save would go nowhere.)
+                    let form_gone = match &self.mode {
+                        Mode::Edit { path, label, .. } | Mode::DeleteItem { path, label }
+                            if matches!(self.vault, Vault::Unlocked(_))
+                                && self.item(path).is_none() =>
+                        {
+                            Some(label.clone())
+                        }
+                        _ => None,
+                    };
+                    if let Some(label) = form_gone {
+                        self.mode = Mode::Browse;
+                        self.saving = 0;
+                        self.status =
+                            Some(format!("'{}' was deleted elsewhere", shown(&label, NAME)));
+                    }
+                }
+                StoreEvent::SecretFailed { path, .. } => {
+                    // (Only if it is the one asked for last; the error is
+                    // in the `Done` that follows.)
+                    if self.awaiting.as_ref().is_some_and(|(p, _)| *p == path) {
+                        self.awaiting = None;
                     }
                 }
                 StoreEvent::Secret { path, secret, .. } => {
@@ -306,9 +338,6 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     match error {
                         Some(e) => {
                             self.status = Some(format!("cannot {request}: {e}"));
-                            if request == "fetch the secret" {
-                                self.awaiting = None;
-                            }
                             // (The form stays, with what was typed.)
                             if save {
                                 self.saving = 0;
@@ -333,6 +362,20 @@ impl<S: Store, B: Backend> Manager<S, B> {
         if self.watch.as_ref().is_some_and(theme::Watch::changed) {
             self.palette = theme::resolve(&self.settings, self.home.as_deref());
             theme::apply(ui.ctx(), &self.palette);
+        }
+        // Leaving the window hides a shown secret and ends a confirmation
+        // (which holds alephd's conversation lock until it ends).
+        if ui.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::WindowFocused(false)))
+        }) {
+            self.shown = None;
+            self.end_confirm();
+            self.pending = None;
+            if matches!(self.awaiting, Some((_, Want::Show))) {
+                self.awaiting = None;
+            }
         }
         self.take_events();
         let p = self.palette.clone();
@@ -511,6 +554,8 @@ impl<S: Store, B: Backend> Manager<S, B> {
     fn select(&mut self, s: Selection) {
         if self.selected.as_ref() != Some(&s) {
             self.shown = None;
+            // (A secret still coming for the old one is not kept unseen.)
+            self.awaiting = None;
             self.mode = Mode::Browse;
             // (The form was left: its answer, still to come, closes nothing.)
             self.saving = 0;
@@ -537,7 +582,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 app.ui.conversation.screen,
                 Screen::Finished { ok: true, .. }
             );
-            self.confirm = None;
+            self.end_confirm();
             if let Some((path, want)) = self.pending.take()
                 && ok
             {
@@ -629,6 +674,12 @@ impl<S: Store, B: Backend> Manager<S, B> {
                         .color(p.accent),
                 );
                 ui.add_space(6.0);
+                if collection.is_empty() {
+                    ui.label(
+                        RichText::new("No folder to put it in: create a folder first (+ FOLDER).")
+                            .color(p.warning),
+                    );
+                }
                 field(ui, &mut label, "Label", "label_", false);
                 field(ui, &mut secret, "Secret", "secret_", true);
                 ui.add_space(4.0);
@@ -834,6 +885,8 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 }
                 if hide {
                     self.shown = None;
+                    // (A secret still coming is not shown after HIDE.)
+                    self.awaiting = None;
                 }
                 if copy {
                     self.want(&ui.ctx().clone(), path.clone(), Want::Copy, now);

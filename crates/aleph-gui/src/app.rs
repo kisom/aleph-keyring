@@ -79,6 +79,12 @@ impl PromptApp {
         }
     }
 
+    /// End the conversation now: alephd sees the socket close (its reader
+    /// thread holds a copy, so dropping this is not enough).
+    pub fn shutdown(&self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+
     /// Re-theme live when the Omarchy theme changes (spec §7).
     pub fn watch_theme(&mut self, ctx: &egui::Context) {
         self.watch = self

@@ -75,6 +75,8 @@ uninstall)
         /usr/lib/systemd/user/alephd.service /usr/lib/systemd/user/alephd.socket \
         /usr/share/dbus-1/services/io.aleph.Keyring.service
     rmdir /usr/lib/aleph /usr/share/aleph/hyprland /usr/share/aleph 2>/dev/null || true
+    gtk-update-icon-cache -q -t /usr/share/icons/hicolor 2>/dev/null || true
+    update-desktop-database -q /usr/share/applications 2>/dev/null || true
     systemctl daemon-reload
     echo "install.sh: uninstalled (the vault in ~/.local/share/aleph is left in place)"
     ;;

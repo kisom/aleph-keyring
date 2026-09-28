@@ -33,8 +33,8 @@ Adopted, each with a test that failed without it:
   if it differs, and a secret that is not text cannot be loaded into the
   editor (it would be mangled).
 - **A form stays until its save succeeds:** a failed save keeps what was
-  typed, with the error; a lock keeps a secret the person typed (a fetched
-  one must be fetched again).
+  typed, with the error; a lock keeps a secret the person typed or edited
+  (only one fetched and left as it was must be fetched again).
 - **Only the store's loop lists,** so what it last sent is what the window
   shows; a folder or item that vanishes mid-listing is skipped; a burst of
   signals means one listing; signals are taken only from the service's
@@ -77,8 +77,9 @@ while prototyping") and pinned by a test that was seen to fail without it.
   per item.
 - **Each request runs on its own** on the store's thread: an unlock prompt
   may wait for the person indefinitely (H5), and nothing else waits for
-  it. Only the session is shared, under a lock held just to encrypt or
-  decrypt.
+  it. Only the session is shared, under a lock held for one exchange with
+  it: opening it, or a call and the encryption or decryption that goes
+  with it (a session re-opened mid-call would not match the answer).
 - **The confirmation reuses the prompter:** the prompt window's own code
   (`PromptApp`), drawn inside the manager (`embedded`: it never closes or
   resizes the window), on a socketpair whose other end goes to alephd's

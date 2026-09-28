@@ -128,8 +128,8 @@ async fn items_are_listed_created_shown_changed_and_deleted() {
     store.unlocked(|c| item(c, "GitHub").is_none()).await;
 }
 
-/// A lock shows as locked (alephd sends no signal: the store polls); an
-/// unlock through alephd's prompt shows the items again.
+/// A lock shows as locked (alephd signals it, and the store also polls);
+/// an unlock through alephd's prompt shows the items again.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lock_shows_and_an_unlock_through_the_prompt_restores() {
     let d = daemon(true, vec![vec![password(PW)]]).await;
@@ -349,6 +349,38 @@ async fn a_burst_of_signals_does_not_hang_the_store() {
     }
     assert!(answered, "the store stopped answering");
     assert!(most >= 300, "listed at most {most} items");
+}
+
+/// With the default folder deleted, the store's polling does not count as
+/// using the keyring (alephd's idle lock still comes).
+#[tokio::test(flavor = "multi_thread")]
+async fn polling_without_the_default_folder_is_not_use() {
+    let yes = || vec![FromPrompter::Confirm { yes: true }];
+    let d = daemon(true, vec![yes()]).await;
+    let mut store = Probe::new(&d.bus.address);
+    let cols = store.unlocked(|c| !c.is_empty()).await;
+    store.request(Request::DeleteCollection(cols[0].path.clone()));
+    assert_eq!(store.done("delete the folder").await, (None, false));
+    store.unlocked(|c| c.is_empty()).await;
+    tokio::time::sleep(aleph_gui::store::POLL * 3).await;
+    let idle = d.keyring.idle_for();
+    assert!(idle >= aleph_gui::store::POLL * 2, "idle for only {idle:?}");
+}
+
+/// Only requests that change something are followed by a listing.
+#[test]
+fn only_changes_are_followed_by_a_listing() {
+    assert!(!Request::Secret("/i".into()).changes());
+    assert!(!Request::Reauth(std::os::unix::net::UnixStream::pair().unwrap().0.into()).changes());
+    assert!(Request::Unlock.changes());
+    assert!(Request::DeleteItem("/i".into()).changes());
+    assert!(
+        Request::SetLabel {
+            path: "/i".into(),
+            label: "x".into()
+        }
+        .changes()
+    );
 }
 
 /// With no alephd, the store says so (and keeps trying).
