@@ -97,12 +97,14 @@ fn a_slot_that_rejects_the_current_password_goes_stale() {
     k.lock();
     // The login password "changed": PAM now accepts only the new one.
     drop(k);
-    let backends = Backends {
-        tpm: Box::new(TpmClient::new(env.socket.clone())),
-        keys: Box::new(MockKeys::default()),
-        password: Box::new(Fixed(|p| p == "new password")),
-    };
-    let k = Keyring::new(&env.paths, backends).unwrap();
+    // (Through `keyring_with`, which waits out a forked child's brief copy
+    // of the daemon lock; `Keyring::new` here failed with AlreadyRunning.)
+    let k = keyring_with(
+        &env,
+        Box::new(TpmClient::new(env.socket.clone())),
+        MockKeys::default(),
+        Box::new(Fixed(|p| p == "new password")),
+    );
     let p = Interactive::new(vec![password("new password"), FromPrompter::Cancel {}]);
     assert!(matches!(
         k.unlock(&mut p.channel(), None),
