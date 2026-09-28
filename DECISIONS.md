@@ -29,6 +29,12 @@ Adopted, each with a test that failed without it:
 - **The clipboard clears itself** on a timer thread 30 s after the copy
   (if it is still that copy), not with the window's frames: a window on a
   hidden workspace draws none.
+- **A shown secret scrolls, and JSON is indented:** it is drawn
+  unwrapped in its own scroll area (both ways, at most 220 px high), so a
+  long token or document stays in the pane. An object or array is
+  re-indented for reading, by a walk over the text into a zeroized string
+  sized beforehand (parsing it into values would leave unzeroized copies);
+  COPY and EDIT use the secret as stored.
 - **An edit saves only what changed:** a loaded secret is rewritten only
   if it differs, and a secret that is not text cannot be loaded into the
   editor (it would be mangled).

@@ -7,6 +7,7 @@ pub mod clipboard;
 pub mod conversation;
 pub mod link;
 pub mod manager;
+pub mod pretty;
 pub mod reauth;
 pub mod screens;
 pub mod settings;

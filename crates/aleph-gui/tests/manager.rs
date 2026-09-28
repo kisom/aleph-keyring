@@ -421,6 +421,33 @@ fn a_binary_secret_is_not_shown() {
     h.get_by_label("binary secret, 4 bytes");
 }
 
+const JSON: &[u8] = br#"{"user":"kyle","scopes":["repo","read:org"],"token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ"}"#;
+
+/// A JSON secret is shown indented (what is copied or edited is the
+/// secret as stored).
+#[test]
+fn a_json_secret_is_shown_indented() {
+    let (mut h, store, clip) = window(ThemeChoice::Neon, vault());
+    h.state_mut().reauth.confirmed(Instant::now());
+    h.get_by_label("GitHub token").click();
+    frames(&mut h);
+    h.get_by_label("SHOW").click();
+    frames(&mut h);
+    store.take();
+    secret(&store, "/c/login/1", br#"{"user":"kyle","n":[1,2]}"#);
+    frames(&mut h);
+    h.get_by_label("{\n  \"user\": \"kyle\",\n  \"n\": [\n    1,\n    2\n  ]\n}");
+    h.get_by_label("COPY").click();
+    frames(&mut h);
+    store.take();
+    secret(&store, "/c/login/1", br#"{"user":"kyle","n":[1,2]}"#);
+    frames(&mut h);
+    assert_eq!(
+        clip.0.lock().unwrap().as_deref(),
+        Some(&br#"{"user":"kyle","n":[1,2]}"#[..])
+    );
+}
+
 /// A label another program chose (long, with line breaks of its own) is
 /// shown on one line, cut short, in the list.
 #[test]
@@ -728,6 +755,19 @@ fn snapshots() {
         });
         frames(&mut h);
         shot(&mut h, "shown");
+        // Too wide and too long for the pane: it scrolls, both ways.
+        h.get_by_label("HIDE").click();
+        frames(&mut h);
+        h.get_by_label("SHOW").click();
+        frames(&mut h);
+        store.take();
+        let mut long = JSON.to_vec();
+        long.truncate(long.len() - 1);
+        long.extend((0..12).flat_map(|i| format!(",\"k{i}\":{i}").into_bytes()));
+        long.push(b'}');
+        secret(&store, "/c/login/1", &long);
+        frames(&mut h);
+        shot(&mut h, "shown_json");
         h.get_by_label("EDIT").click();
         frames(&mut h);
         shot(&mut h, "edit");

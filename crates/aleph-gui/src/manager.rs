@@ -55,6 +55,9 @@ pub enum Shown {
     Binary(usize),
 }
 
+/// The most of a shown secret's height the pane gives it (it scrolls).
+const SECRET_HEIGHT: f32 = 220.0;
+
 /// What the detail pane is doing.
 pub enum Mode {
     Browse,
@@ -301,7 +304,12 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     match want {
                         Want::Show => {
                             let shown = match std::str::from_utf8(&secret) {
-                                Ok(t) => Shown::Text(Zeroizing::new(t.to_string())),
+                                // (JSON indented, for reading; COPY and EDIT
+                                // fetch the secret as stored.)
+                                Ok(t) => Shown::Text(
+                                    crate::pretty::json(t)
+                                        .unwrap_or_else(|| Zeroizing::new(t.to_string())),
+                                ),
                                 Err(_) => Shown::Binary(secret.len()),
                             };
                             self.shown = Some((path, shown));
@@ -856,9 +864,8 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("secret").color(p.foreground.gamma_multiply(0.7)));
                     match showing.map(|(_, s)| s) {
-                        Some(Shown::Text(t)) => {
-                            ui.label(RichText::new(t.as_str()).monospace());
-                        }
+                        // (Below, where it has the pane's width.)
+                        Some(Shown::Text(_)) => {}
                         Some(Shown::Binary(n)) => {
                             ui.label(format!("binary secret, {n} bytes"));
                         }
@@ -867,6 +874,19 @@ impl<S: Store, B: Backend> Manager<S, B> {
                         }
                     }
                 });
+                if let Some(Shown::Text(t)) = showing.map(|(_, s)| s) {
+                    // Unwrapped, and scrolled both ways when it does not fit
+                    // (a long token, a JSON document).
+                    egui::ScrollArea::both()
+                        .id_salt("secret")
+                        .max_height(SECRET_HEIGHT)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(RichText::new(t.as_str()).monospace()).extend(),
+                            );
+                        });
+                }
                 ui.add_space(6.0);
                 let (mut show, mut hide, mut copy, mut edit, mut delete) =
                     (false, false, false, false, false);
