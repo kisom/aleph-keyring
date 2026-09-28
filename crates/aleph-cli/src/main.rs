@@ -629,11 +629,6 @@ async fn revert(c: &Client) -> Result<()> {
         for step in steps {
             eprintln!("aleph: {step}");
         }
-        record.revert_phase = Some(switchover::SWITCHED_BACK.into());
-        if let Err(e) = record.save(&dirs) {
-            let _ = c.thaw_writes().await;
-            return Err(e);
-        }
     }
     match wizard::remove_omarchy_hook(&dirs.config_home) {
         Ok(Some(hook)) => eprintln!("aleph: removed {}", hook.display()),

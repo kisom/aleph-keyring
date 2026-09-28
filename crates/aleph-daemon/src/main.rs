@@ -65,7 +65,7 @@ async fn run() -> Result<(), String> {
     // only while setup's activation file is in place: before setup (which
     // claims it through the admin interface) and after a revert, the
     // Secret Service is gnome-keyring's.
-    let claim = activation.as_ref().is_some_and(|a| a.exists());
+    let claim = aleph_daemon::daemon::claims_at_start(activation.as_deref());
     if !claim {
         tracing::info!(
             "serving {BUS_NAME}; not claiming {SECRETS_NAME} (aleph setup has not switched over)"

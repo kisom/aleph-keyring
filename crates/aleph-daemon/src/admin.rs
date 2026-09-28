@@ -168,10 +168,17 @@ impl Admin {
             .fetch_all(&mut summary.skipped)
             .await
             .map_err(failed)?;
+        // (Items an earlier import brought follow gnome-keyring's changes:
+        // it still owns them until the switchover.)
+        let updatable: std::collections::HashSet<uuid::Uuid> =
+            crate::import::load_imported(&self.paths.imported())
+                .into_iter()
+                .map(|i| i.id)
+                .collect();
         let keyring = self.keyring.clone();
         let summary = tokio::task::spawn_blocking(move || {
             keyring.modify(|body| {
-                crate::import::merge(body, fetched, &mut summary);
+                crate::import::merge_following(body, fetched, &mut summary, &updatable);
                 Ok(summary)
             })
         })
@@ -223,6 +230,8 @@ impl Admin {
             .ok_or_else(|| zbus::fdo::Error::Failed("no data directory".into()))?
             .to_path_buf();
         let imported = crate::import::load_imported(&self.paths.imported());
+        let imported_ids: std::collections::HashSet<uuid::Uuid> =
+            imported.iter().map(|i| i.id).collect();
         let handle = tokio::runtime::Handle::current();
         self.converse(prompter, move |k, chan| {
             k.export(chan, |password, body| {
@@ -234,7 +243,7 @@ impl Admin {
                 handle.block_on(async {
                     let private = crate::export::Private::start(&data_home, password).await?;
                     let conn = private.connect().await?;
-                    crate::export::export(&conn, &private.address, &body, &delete)
+                    crate::export::export(&conn, &private.address, &body, &delete, &imported_ids)
                         .await
                         .map(|r| r.to_string())
                 })

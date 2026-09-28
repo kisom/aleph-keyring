@@ -976,8 +976,9 @@ aleph restore [--from-bak | --accept-rollback] [<path>]
   check too). `revert` restores each file byte for byte if it is still
   what `apply` wrote, else takes aleph's lines out if that applies
   cleanly, else leaves it (dropping its backup) and says what to remove.
-  A backup without a manifest entry is not trusted: it is rewritten from
-  the file as it is. It reads
+  A backup without a manifest entry is rewritten from the file as it is,
+  unless that file is already exactly what apply writes (a run cut short
+  before its manifest): then the backup is the original, and is kept. It reads
   no user configuration or D-Bus, and warns if its own binary is not
   root-owned and root-only-writable. On NixOS it prints the configuration
   to add instead.

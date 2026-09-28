@@ -31,6 +31,13 @@ pub async fn request_secrets_name(conn: &Connection) -> zbus::Result<bool> {
     ))
 }
 
+/// Whether alephd claims the Secret Service at start: only while setup's
+/// activation file (`activation`) is in place. Before setup (which claims it
+/// through the admin interface) and after a revert, it is gnome-keyring's.
+pub fn claims_at_start(activation: Option<&std::path::Path>) -> bool {
+    activation.is_some_and(|a| a.exists())
+}
+
 /// Who owns `org.freedesktop.secrets` on `conn`'s bus, for `Status`:
 /// `alephd`, `another program`, or `nobody`.
 pub async fn secret_service_owner(conn: &Connection) -> String {
@@ -71,4 +78,19 @@ pub async fn serve(
         )
         .await?;
     Ok(secrets)
+}
+
+#[cfg(test)]
+mod claim_tests {
+    /// alephd claims the Secret Service at start only while setup's
+    /// activation file is in place.
+    #[test]
+    fn the_name_is_claimed_only_with_the_activation_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("org.freedesktop.secrets.service");
+        assert!(!super::claims_at_start(Some(&file)));
+        assert!(!super::claims_at_start(None));
+        std::fs::write(&file, "x").unwrap();
+        assert!(super::claims_at_start(Some(&file)));
+    }
 }

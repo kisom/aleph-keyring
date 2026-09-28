@@ -131,9 +131,13 @@ impl std::fmt::Display for Summary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Imported {} item(s) from gnome-keyring ({} already here).",
+            "Imported {} item(s) from gnome-keyring ({} already here",
             self.imported, self.unchanged
         )?;
+        if self.updated > 0 {
+            write!(f, ", {} updated", self.updated)?;
+        }
+        write!(f, ").")?;
         if !self.conflicts.is_empty() {
             write!(
                 f,
@@ -145,6 +149,26 @@ impl std::fmt::Display for Summary {
             write!(f, " Not imported: {}.", self.skipped.join("; "))?;
         }
         Ok(())
+    }
+}
+
+/// The schema gnome-keyring adds to an item stored without one.
+const GENERIC_SCHEMA: &str = "org.freedesktop.Secret.Generic";
+
+/// Whether `a` and `b` are the same item's attributes: equal, except that
+/// one may carry the generic schema gnome-keyring adds (at times after the
+/// item is first read) where the other has none.
+pub fn same_attributes(a: &BTreeMap<String, String>, b: &BTreeMap<String, String>) -> bool {
+    fn schema(m: &BTreeMap<String, String>) -> Option<&str> {
+        m.get("xdg:schema").map(String::as_str)
+    }
+    fn rest(m: &BTreeMap<String, String>) -> impl Iterator<Item = (&String, &String)> {
+        m.iter().filter(|(k, _)| *k != "xdg:schema")
+    }
+    match (schema(a), schema(b)) {
+        (x, y) if x == y => a == b,
+        (None, Some(GENERIC_SCHEMA)) | (Some(GENERIC_SCHEMA), None) => rest(a).eq(rest(b)),
+        _ => false,
     }
 }
 
@@ -201,7 +225,7 @@ pub fn merge_following(
         for f in collection.items {
             let same: Vec<_> = before
                 .iter()
-                .filter(|(_, l, a, _)| *l == f.label && *a == f.attributes)
+                .filter(|(_, l, a, _)| *l == f.label && same_attributes(a, &f.attributes))
                 .collect();
             if same.iter().any(|(_, _, _, s)| s == f.secret.expose()) {
                 summary.unchanged += 1;
@@ -211,6 +235,7 @@ pub fn merge_following(
                 && let Some(item) = target.items.iter_mut().find(|i| i.id == *id)
             {
                 item.secret = f.secret;
+                item.attributes = f.attributes;
                 item.content_type = f.content_type;
                 item.modified = f.modified.max(aleph_core::model::now());
                 summary.updated += 1;
@@ -531,6 +556,59 @@ mod tests {
 
     fn body() -> Body {
         Body::default()
+    }
+
+    /// Attributes match exactly: an item with more (or fewer) is another
+    /// item (`SearchItems` alone matches at least the attributes given).
+    #[test]
+    fn attributes_match_exactly() {
+        let m = |p: &[(&str, &str)]| -> BTreeMap<String, String> {
+            p.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        assert!(same_attributes(&m(&[("k", "t")]), &m(&[("k", "t")])));
+        assert!(!same_attributes(
+            &m(&[("k", "t")]),
+            &m(&[("k", "t"), ("extra", "1")])
+        ));
+        assert!(!same_attributes(
+            &m(&[("k", "t"), ("extra", "1")]),
+            &m(&[("k", "t")])
+        ));
+        assert!(!same_attributes(&m(&[("k", "t")]), &m(&[("k", "u")])));
+    }
+
+    /// gnome-keyring adds the generic schema to an item stored without one,
+    /// sometimes after the item is first read: the same item either way.
+    #[test]
+    fn the_generic_schema_gnome_keyring_adds_is_the_same_item() {
+        let one = |attrs: &[(&str, &str)], secret: &[u8]| {
+            vec![FetchedCollection {
+                label: "Login".into(),
+                is_default: true,
+                items: vec![fetched("token", attrs, secret)],
+            }]
+        };
+        let mut b = body();
+        let mut s = Summary::default();
+        merge(&mut b, one(&[("k", "t")], b"v1"), &mut s);
+        let ids = s.added.iter().map(|i| i.id).collect();
+        let generic = [("k", "t"), ("xdg:schema", "org.freedesktop.Secret.Generic")];
+        let mut s = Summary::default();
+        merge_following(&mut b, one(&generic, b"v2"), &mut s, &ids);
+        assert_eq!((s.imported, s.updated), (0, 1));
+        let items = &b.collections[0].items;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].secret.expose(), b"v2");
+        // (Another schema is another item.)
+        let mut s = Summary::default();
+        merge(
+            &mut b,
+            one(&[("k", "t"), ("xdg:schema", "org.x")], b"v2"),
+            &mut s,
+        );
+        assert_eq!(s.imported, 1);
     }
 
     /// Default collection to aleph's default; others by label (created);

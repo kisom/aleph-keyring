@@ -70,6 +70,26 @@ pub const PRIVATE_BUS_CONFIG: &str = r#"<!DOCTYPE busconfig PUBLIC "-//freedeskt
 </busconfig>
 "#;
 
+/// Let a child inherit nothing above stderr: alephd's own descriptors (its
+/// TPM connection, `pam.sock`) must not live on in a long-running child.
+fn no_inherited_fds(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: close_range is async-signal-safe and touches no memory.
+    // CLOSE_RANGE_CLOEXEC, not closing: std's exec-error pipe must stay
+    // open until the exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_uint,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            );
+            Ok(())
+        })
+    }
+}
+
 /// A gnome-keyring (secrets component) alephd runs itself on a private
 /// bus, over the keyring files in `data_home`; killed on drop.
 pub struct Private {
@@ -92,7 +112,7 @@ impl Private {
             .map_err(gk)?;
         let config = dirs.path().join("bus.conf");
         std::fs::write(&config, PRIVATE_BUS_CONFIG).map_err(gk)?;
-        let mut bus = std::process::Command::new("dbus-daemon")
+        let mut bus = no_inherited_fds(&mut std::process::Command::new("dbus-daemon"))
             .arg(format!("--config-file={}", config.display()))
             .args(["--nofork", "--nopidfile", "--print-address=1"])
             .stdout(std::process::Stdio::piped())
@@ -104,7 +124,7 @@ impl Private {
             .read_line(&mut address)
             .map_err(gk)?;
         let address = address.trim().to_string();
-        let daemon = std::process::Command::new("gnome-keyring-daemon")
+        let daemon = no_inherited_fds(&mut std::process::Command::new("gnome-keyring-daemon"))
             .args(["--foreground", "--components=secrets", "--unlock"])
             .env("HOME", dirs.path())
             .env("XDG_RUNTIME_DIR", &run)
@@ -253,7 +273,10 @@ impl Remote {
         for path in paths {
             let item = self.proxy(path.as_str(), ITEM).await?;
             let l: String = item.get_property("Label").await.map_err(gk)?;
-            if l != label {
+            // (SearchItems matches items with at least these attributes;
+            // an item with more is another item.)
+            let a: HashMap<String, String> = item.get_property("Attributes").await.map_err(gk)?;
+            if l != label || !crate::import::same_attributes(&a.into_iter().collect(), attributes) {
                 continue;
             }
             let (_, parameters, value, _): (OwnedObjectPath, Vec<u8>, Vec<u8>, String) = item
@@ -292,6 +315,7 @@ pub async fn export(
     address: &str,
     body: &Body,
     delete: &[ImportedItem],
+    imported: &std::collections::HashSet<uuid::Uuid>,
 ) -> Result<Report> {
     let remote = Remote::open(conn).await?;
     let service = remote.proxy(SECRETS_PATH, SERVICE).await?;
@@ -313,12 +337,14 @@ pub async fn export(
     let mut by_label = HashMap::new();
     let paths: Vec<OwnedObjectPath> = service.get_property("Collections").await.map_err(gk)?;
     for path in paths {
-        let label: String = remote
-            .proxy(path.as_str(), COLLECTION)
-            .await?
-            .get_property("Label")
-            .await
-            .map_err(gk)?;
+        let c = remote.proxy(path.as_str(), COLLECTION).await?;
+        // A collection only its own password opens (the private instance
+        // unlocks the login keyring alone) is left out: items for it go to
+        // the default collection.
+        if c.get_property::<bool>("Locked").await.map_err(gk)? {
+            continue;
+        }
+        let label: String = c.get_property("Label").await.map_err(gk)?;
         by_label.entry(label).or_insert(path);
     }
     let aleph_default = body
@@ -339,9 +365,9 @@ pub async fn export(
     // and stored again with the same label and attributes).
     let held = |label: &str, attributes: &BTreeMap<String, String>| {
         body.collections.iter().any(|c| {
-            c.items
-                .iter()
-                .any(|i| i.label == label && i.attributes == *attributes)
+            c.items.iter().any(|i| {
+                i.label == label && crate::import::same_attributes(&i.attributes, attributes)
+            })
         })
     };
     for d in delete {
@@ -366,19 +392,45 @@ pub async fn export(
             report.deleted += 1;
         }
     }
+    // An aleph item standing where a deleted imported item was (the same
+    // label and attributes: deleted and stored again) is its successor, and
+    // updates it in place like an imported item.
+    let successors: std::collections::HashSet<uuid::Uuid> = body
+        .collections
+        .iter()
+        .flat_map(|c| c.items.iter())
+        .filter(|i| {
+            delete.iter().any(|d| {
+                d.label == i.label && crate::import::same_attributes(&d.attributes, &i.attributes)
+            })
+        })
+        .map(|i| i.id)
+        .collect();
     let mut written = Vec::new();
+    // Each gnome-keyring item stands for one aleph item at most.
+    let mut used: std::collections::HashSet<OwnedObjectPath> = Default::default();
     for collection in &body.collections {
         for item in &collection.items {
             let target = target_of(collection.id, &collection.label, &mut report);
-            let found = remote.find(&target, &item.attributes, &item.label).await?;
-            if found.iter().any(|(_, s)| s == item.secret.expose()) {
+            let found: Vec<_> = remote
+                .find(&target, &item.attributes, &item.label)
+                .await?
+                .into_iter()
+                .filter(|(p, _)| !used.contains(p))
+                .collect();
+            if let Some((path, _)) = found.iter().find(|(_, s)| s == item.secret.expose()) {
+                used.insert(path.clone());
                 report.unchanged += 1;
+                written.push((target, item));
                 continue;
             }
-            // The same item there with another secret: updated in place
-            // (gnome-keyring's own replace matches attributes only, and
-            // would take an item with another label).
-            if let Some((path, _)) = found.first() {
+            // An item the import brought, changed in aleph since: updated
+            // in place (no duplicate). Anything else is added beside
+            // whatever gnome-keyring has, never over it.
+            if (imported.contains(&item.id) || successors.contains(&item.id))
+                && let Some((path, _)) = found.first()
+            {
+                used.insert(path.clone());
                 let (parameters, value) =
                     remote.session.encrypt(item.secret.expose()).map_err(gk)?;
                 let secret = (
@@ -419,7 +471,7 @@ pub async fn export(
                 value,
                 item.content_type.clone(),
             );
-            let (_, prompt): (OwnedObjectPath, OwnedObjectPath) = remote
+            let (created, prompt): (OwnedObjectPath, OwnedObjectPath) = remote
                 .proxy(target.as_str(), COLLECTION)
                 .await?
                 .call("CreateItem", &(properties, secret, false))
@@ -428,11 +480,13 @@ pub async fn export(
             if prompt.as_str() != "/" {
                 return Err(gk("it asked for a prompt to store an item"));
             }
+            used.insert(created);
             report.exported += 1;
             written.push((target, item));
         }
     }
-    // Read everything written back, on a fresh connection and session.
+    // Read every item back (the unchanged ones too), on a fresh
+    // connection and session.
     let fresh = zbus::connection::Builder::address(address)
         .map_err(gk)?
         .build()

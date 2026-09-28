@@ -445,21 +445,36 @@ fn manual_lines(service: Service) -> String {
 /// its backup, byte for byte; their manifest entries go.
 pub fn roll_back(root: &Root, services: &[Service]) -> Result<()> {
     let mut manifest = Manifest::load(root)?;
+    let mut errors = Vec::new();
     for service in services {
         let backup = root.backup(*service);
         let path = root.pam_dir.join(service.file());
-        let bytes = std::fs::read(&backup).map_err(|e| format!("{}: {e}", backup.display()))?;
-        let meta = std::fs::metadata(&backup).map_err(|e| e.to_string())?;
-        write_atomic(
-            &path,
-            &bytes,
-            meta.mode() & 0o7777,
-            Some((meta.uid(), meta.gid())),
-        )?;
-        let _ = std::fs::remove_file(&backup);
-        manifest.files.remove(service.file());
+        let restored = std::fs::read(&backup)
+            .and_then(|bytes| Ok((bytes, std::fs::metadata(&backup)?)))
+            .map_err(|e| format!("{}: {e}", backup.display()))
+            .and_then(|(bytes, meta)| {
+                write_atomic(
+                    &path,
+                    &bytes,
+                    meta.mode() & 0o7777,
+                    Some((meta.uid(), meta.gid())),
+                )
+            });
+        match restored {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&backup);
+                manifest.files.remove(service.file());
+            }
+            // (The others are still put back; this one is reported.)
+            Err(e) => errors.push(e),
+        }
     }
-    manifest.save(root)
+    manifest.save(root)?;
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("could not put back: {}", errors.join("; ")))
+    }
 }
 
 /// Undo what the manifest records (E4's conditional revert). Returns one
@@ -475,6 +490,8 @@ pub fn revert(root: &Root) -> Result<Vec<String>> {
         };
         let path = root.pam_dir.join(&name);
         if let Some(why) = not_ordinary(&path, root.owner) {
+            // (Its backup would be stale for a later apply.)
+            let _ = std::fs::remove_file(root.backup(service));
             done.push(format!("{why}: left alone; {}", undo_lines(service)));
             manifest.files.remove(&name);
             continue;
@@ -914,6 +931,36 @@ mod tests {
             std::fs::read_to_string(root.pam_dir.join("passwd")).unwrap(),
             fixture("omarchy-applied", "passwd")
         );
+    }
+
+    /// A missing backup does not stop the rollback of the others; the error
+    /// names it, and the manifest is saved.
+    #[test]
+    fn roll_back_goes_on_past_a_missing_backup() {
+        let (_dir, root) = tree();
+        let report = apply(&root).unwrap();
+        std::fs::remove_file(root.backup(Service::Sddm)).unwrap();
+        let err = roll_back(&root, &report.changed).unwrap_err();
+        assert!(err.contains("sddm"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(root.pam_dir.join("passwd")).unwrap(),
+            fixture("omarchy", "passwd")
+        );
+        let manifest = Manifest::load(&root).unwrap();
+        assert!(!manifest.files.contains_key("passwd"));
+    }
+
+    /// Revert drops the backup of a file that is no longer ordinary (a
+    /// later apply must not trust it).
+    #[test]
+    fn revert_drops_the_backup_of_a_file_no_longer_ordinary() {
+        let (dir, root) = tree();
+        apply(&root).unwrap();
+        let real = dir.path().join("real-passwd");
+        std::fs::rename(root.pam_dir.join("passwd"), &real).unwrap();
+        std::os::unix::fs::symlink(&real, root.pam_dir.join("passwd")).unwrap();
+        revert(&root).unwrap();
+        assert!(!root.backup(Service::Passwd).exists());
     }
 
     /// A symlinked service is left for the user, with the lines to add.

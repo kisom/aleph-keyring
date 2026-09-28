@@ -35,6 +35,8 @@ fn aleph(d: &Daemon, args: &[&str]) -> Command {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // (No test descriptor, a TPM connection above all, lives on in it.)
+    no_inherited_fds(&mut cmd);
     cmd
 }
 

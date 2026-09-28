@@ -9,6 +9,44 @@ made directly are marked as such.
 
 ## 2026-09-27: Plan 4c (setup), design
 
+### G4. The final review of the executed Plan 4c branch: fixes
+
+Nothing critical: the forward path (`aleph setup`, then `sudo aleph
+system apply`) has no lockout or data-loss path the reviewer could find.
+Fixed, each with a test that failed first:
+- **Revert's export could overwrite the wrong gnome-keyring item:**
+  `SearchItems` matches items with at least the given attributes, and two
+  aleph items with the same label and attributes shared one there. The
+  export now matches exact attributes, lets each gnome-keyring item stand
+  for one aleph item, updates in place only items the import brought (or
+  one deleted and stored again under the same label and attributes), and
+  reads every item back, the unchanged ones too.
+- **gnome-keyring adds `xdg:schema: org.freedesktop.Secret.Generic`** to
+  an item stored without one, at times after an import first read it:
+  import and export treat that item as the same one (any other schema is
+  another item), so it is neither duplicated nor missed.
+- **Following gnome-keyring's updates raced** (a signal can run ahead of
+  its data): the import itself now updates the items it brought, and
+  setup runs one last import right before stopping gnome-keyring.
+- **The TPM test flake's remaining cause:** the TPM library's sockets
+  were inherited by every child the tests start (the `aleph` CLI, test
+  dbus-daemons, gnome-keyring), which then held them open (seen with
+  `ss`). Every such child, and alephd's private gnome-keyring, now starts
+  with inherited descriptors close-on-exec.
+
+Minor fixes adopted: the revert phase is saved with the unit record; the
+rollback goes on past a missing backup and reports it; revert drops a
+not-ordinary file's backup; when alephd claims the name at start is a
+tested function; the emergency revert says to stop gnome-keyring before
+`setup --revert`; the spec's backup wording matches the code.
+
+Ruled, not fixed: a locked (second, password-protected) gnome-keyring
+collection is left out of revert's collection lookup, so its items go to
+the default collection; untested (a password-protected collection cannot
+be made without a prompter). Deferred: writes stay paused if the CLI is
+killed between the export and the switch back, until alephd restarts or
+the revert is run again.
+
 ### G3. The pre-execution review of the Plan 4c document: fixes adopted
 
 No path was found where the PAM edits make a correct password fail or a

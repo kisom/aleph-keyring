@@ -205,5 +205,8 @@ from a TTY (Ctrl-Alt-F3) or a root shell:
    gnome-keyring-daemon.socket` and `systemctl --user start
    gnome-keyring-daemon.socket`.
 3. Items stored in aleph since setup stay in its vault
-   (`~/.local/share/aleph`); `aleph setup --revert` copies them back once
-   alephd runs again (`aleph restore` if the vault itself needs recovery).
+   (`~/.local/share/aleph`). To copy them back, stop gnome-keyring again
+   (`systemctl --user stop gnome-keyring-daemon.service
+   gnome-keyring-daemon.socket`; revert refuses while it runs), then run
+   `aleph setup --revert` (`aleph restore` if the vault itself needs
+   recovery).

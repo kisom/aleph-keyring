@@ -370,7 +370,7 @@ async fn items_deleted_since_the_import_are_deleted_there_too() {
         &aleph_daemon::import::load_imported(&d.env.paths.imported()),
         &body,
     );
-    let report = aleph_daemon::export::export(&c, &address, &body, &delete)
+    let report = aleph_daemon::export::export(&c, &address, &body, &delete, &Default::default())
         .await
         .unwrap();
     assert_eq!(
@@ -428,7 +428,7 @@ async fn revert_never_deletes_what_aleph_still_holds() {
         &body,
     );
     assert_eq!(delete.len(), 1);
-    let report = aleph_daemon::export::export(&c, &address, &body, &delete)
+    let report = aleph_daemon::export::export(&c, &address, &body, &delete, &Default::default())
         .await
         .unwrap();
     assert_eq!(report.deleted, 0);
@@ -449,16 +449,17 @@ async fn export_does_not_replace_an_item_with_another_label() {
     let c = client(&address).await;
     add(&d, None, "Ours", &[("k", "same")], "ours");
     let body = d.keyring.read(|b| b.clone()).unwrap();
-    aleph_daemon::export::export(&c, &address, &body, &[])
+    aleph_daemon::export::export(&c, &address, &body, &[], &Default::default())
         .await
         .unwrap();
     assert_eq!(found(&c, &[("k", "same")]).await, 2);
 }
 
-/// A secret gnome-keyring changes after the import (a token refresh) is
-/// followed into aleph, for the items the import brought.
+/// A secret gnome-keyring changes after the import (a token refresh)
+/// reaches aleph by the next import (setup runs one right before stopping
+/// gnome-keyring), for the items the import brought.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_update_in_gnome_keyring_is_followed() {
+async fn an_update_in_gnome_keyring_reaches_aleph_by_the_next_import() {
     let bus = bus();
     let address = bus.address.clone();
     let gk = GnomeKeyring::start(&bus, "login password");
@@ -467,13 +468,17 @@ async fn an_update_in_gnome_keyring_is_followed() {
     let c = client(&address).await;
     admin(&c, "ImportGnomeKeyring").await.unwrap();
     gk.store("Token", &[("k", "token")], "v2");
-    eventually("the updated secret", async || {
+    // (gnome-keyring may take a moment to serve the replaced secret, and
+    // alephd's following may bring it first.)
+    eventually("the update by the next import", async || {
+        admin(&c, "ImportGnomeKeyring").await.unwrap();
         items_labelled(&d, "Token")
-            .first()
-            .is_some_and(|(_, _, s)| s == b"v2")
+            .iter()
+            .any(|(_, _, s)| s == b"v2")
     })
     .await;
-    assert_eq!(items_labelled(&d, "Token").len(), 1);
+    let token = items_labelled(&d, "Token");
+    assert_eq!(token.len(), 1, "{token:?}");
 }
 
 /// `ClaimSecretService` queues for the name (setup calls it once its
@@ -498,4 +503,109 @@ async fn claiming_the_name_queues_behind_gnome_keyring() {
         aleph_daemon::daemon::secret_service_owner(&d.conn).await,
         "another program"
     );
+}
+
+/// Exact attributes only: an item in gnome-keyring with extra attributes
+/// is another item, never overwritten.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_matches_exact_attributes_only() {
+    let bus = bus();
+    let address = bus.address.clone();
+    let gk = GnomeKeyring::start(&bus, "login password");
+    gk.store("Same", &[("k", "same"), ("extra", "1")], "theirs");
+    let d = daemon_on(bus, true).await;
+    let c = client(&address).await;
+    add(&d, None, "Same", &[("k", "same")], "ours");
+    let body = d.keyring.read(|b| b.clone()).unwrap();
+    let report = aleph_daemon::export::export(&c, &address, &body, &[], &Default::default())
+        .await
+        .unwrap();
+    assert_eq!(report.exported, 1);
+    assert_eq!(found(&c, &[("k", "same")]).await, 2);
+    assert_eq!(found(&c, &[("extra", "1")]).await, 1);
+}
+
+/// Two aleph items with the same label and attributes (an imported one and
+/// a later one) both end up in gnome-keyring; neither overwrites the other,
+/// and the check covers the unchanged one too.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_keeps_both_of_two_same_items() {
+    let bus = bus();
+    let address = bus.address.clone();
+    let gk = GnomeKeyring::start(&bus, "login password");
+    gk.store("Mail", &[("k", "mail")], "gk-secret");
+    let d = daemon_on(bus, true).await;
+    let c = client(&address).await;
+    admin(&c, "ImportGnomeKeyring").await.unwrap();
+    add(&d, None, "Mail", &[("k", "mail")], "aleph-secret");
+    let body = d.keyring.read(|b| b.clone()).unwrap();
+    let imported: std::collections::HashSet<uuid::Uuid> =
+        aleph_daemon::import::load_imported(&d.env.paths.imported())
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+    let report = aleph_daemon::export::export(&c, &address, &body, &[], &imported)
+        .await
+        .unwrap();
+    assert_eq!((report.unchanged, report.exported), (1, 1));
+    assert_eq!(found(&c, &[("k", "mail")]).await, 2);
+}
+
+/// An imported item changed in aleph since is updated in gnome-keyring in
+/// place (no duplicate); an item aleph had before the import (a conflict
+/// then) is added beside gnome-keyring's, never over it.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_updates_only_imported_items_in_place() {
+    let bus = bus();
+    let address = bus.address.clone();
+    let gk = GnomeKeyring::start(&bus, "login password");
+    gk.store("Token", &[("k", "token")], "v1");
+    gk.store("Mine", &[("k", "mine")], "theirs");
+    let d = daemon_on(bus, true).await;
+    add(&d, None, "Mine", &[("k", "mine")], "ours");
+    let c = client(&address).await;
+    admin(&c, "ImportGnomeKeyring").await.unwrap();
+    d.keyring
+        .modify(|b| {
+            for col in &mut b.collections {
+                for i in &mut col.items {
+                    if i.label == "Token" {
+                        i.secret = aleph_core::SecretBytes::new(b"v2".to_vec());
+                    }
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    let body = d.keyring.read(|b| b.clone()).unwrap();
+    let imported: std::collections::HashSet<uuid::Uuid> =
+        aleph_daemon::import::load_imported(&d.env.paths.imported())
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+    aleph_daemon::export::export(&c, &address, &body, &[], &imported)
+        .await
+        .unwrap();
+    assert_eq!(found(&c, &[("k", "token")]).await, 1);
+    assert_eq!(found(&c, &[("k", "mine")]).await, 2);
+}
+
+/// Two aleph items alike in label, attributes, and secret are two items in
+/// gnome-keyring too: one gnome-keyring item never stands for both.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_keeps_both_of_two_identical_items() {
+    let bus = bus();
+    let address = bus.address.clone();
+    let gk = GnomeKeyring::start(&bus, "login password");
+    gk.store("Mail", &[("k", "mail")], "s");
+    let d = daemon_on(bus, true).await;
+    let c = client(&address).await;
+    admin(&c, "ImportGnomeKeyring").await.unwrap();
+    add(&d, None, "Mail", &[("k", "mail")], "s");
+    let body = d.keyring.read(|b| b.clone()).unwrap();
+    let report = aleph_daemon::export::export(&c, &address, &body, &[], &Default::default())
+        .await
+        .unwrap();
+    assert_eq!((report.unchanged, report.exported), (1, 1));
+    assert_eq!(found(&c, &[("k", "mail")]).await, 2);
 }

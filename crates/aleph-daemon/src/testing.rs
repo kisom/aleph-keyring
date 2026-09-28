@@ -13,7 +13,7 @@ pub use crate::paths::Paths;
 pub use crate::prompt::scripted::Scripted;
 pub use crate::prompt::{FromPrompter, Launcher, Method, Secret, ToPrompter};
 pub use aleph_tpmd::server::Policy;
-pub use aleph_tpmd::testing::SwTpm;
+pub use aleph_tpmd::testing::{SwTpm, no_inherited_fds};
 pub use aleph_unlock::TpmClient;
 pub use aleph_unlock::fido2::mock::{MockAuthenticator, MockKeys};
 
@@ -311,6 +311,13 @@ pub struct Bus {
     _config: tempfile::TempDir,
 }
 
+impl Bus {
+    /// The dbus-daemon's process id.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
 impl Drop for Bus {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -324,7 +331,7 @@ pub fn bus() -> Bus {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("bus.conf");
     std::fs::write(&config, crate::export::PRIVATE_BUS_CONFIG).unwrap();
-    let mut child = std::process::Command::new("dbus-daemon")
+    let mut child = no_inherited_fds(&mut std::process::Command::new("dbus-daemon"))
         .arg(format!("--config-file={}", config.display()))
         .args(["--nofork", "--nopidfile", "--print-address=1"])
         .stdout(std::process::Stdio::piped())
@@ -485,7 +492,7 @@ impl GnomeKeyring {
     }
 
     fn owns_secrets(&self) -> bool {
-        std::process::Command::new("busctl")
+        no_inherited_fds(&mut std::process::Command::new("busctl"))
             .args([
                 "--address",
                 &self.address,
@@ -506,6 +513,7 @@ impl GnomeKeyring {
             &self.address,
             self.home.path(),
         );
+        no_inherited_fds(&mut cmd);
         cmd.args(["store", "--label", label]);
         for (k, v) in attributes {
             cmd.args([*k, *v]);
@@ -539,11 +547,13 @@ impl Drop for GnomeKeyring {
 }
 
 fn gkr_command(address: &str, home: &std::path::Path) -> std::process::Command {
-    gkr_env(
+    let mut cmd = gkr_env(
         std::process::Command::new("gnome-keyring-daemon"),
         address,
         home,
-    )
+    );
+    no_inherited_fds(&mut cmd);
+    cmd
 }
 
 fn gkr_env(

@@ -18,7 +18,7 @@ static START_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// without close-on-exec: a long-lived swtpm that inherits another test's
 /// connection keeps it open after its owner closes it, and that test's
 /// swtpm (one client at a time) never accepts the next one.
-fn no_inherited_fds(cmd: &mut Command) -> &mut Command {
+pub fn no_inherited_fds(cmd: &mut Command) -> &mut Command {
     use std::os::unix::process::CommandExt;
     // SAFETY: close_range is async-signal-safe and touches no memory.
     // CLOSE_RANGE_CLOEXEC, not closing: std's exec-error pipe must stay

@@ -290,6 +290,19 @@ pub async fn switch_over(
         .map(|(u, _)| *u)
         .collect();
     if !to_stop.is_empty() {
+        // One last import, just before gnome-keyring stops: what it stored
+        // or changed since (a signal can run ahead of its data) is not lost.
+        let _: String = bus
+            .call_method(
+                Some(ALEPH_NAME),
+                "/io/aleph/Admin",
+                Some("io.aleph.Admin1"),
+                "ImportGnomeKeyring",
+                &(),
+            )
+            .await
+            .and_then(|m| m.body().deserialize())
+            .map_err(|e| format!("the last import before the switchover: {e}"))?;
         units.stop(&to_stop)?;
         done.push("stopped gnome-keyring (its pkcs11 component goes away with it)".into());
     }
@@ -385,6 +398,8 @@ pub async fn switch_back(
         done.push("started gnome-keyring".into());
     }
     record.units.clear();
+    // (In the same save: a stop right after never loses the phase.)
+    record.revert_phase = Some(SWITCHED_BACK.into());
     record.save(dirs)?;
     Ok(done)
 }
@@ -521,7 +536,10 @@ mod tests {
                 format!("start {} {}", GNOME_UNITS[0], GNOME_UNITS[1]),
             ]
         );
-        assert!(Record::load(&dirs).unwrap().units.is_empty());
+        let saved = Record::load(&dirs).unwrap();
+        assert!(saved.units.is_empty());
+        // (In the same save: a stop right after never loses the phase.)
+        assert_eq!(saved.revert_phase.as_deref(), Some(SWITCHED_BACK));
     }
 
     #[tokio::test(flavor = "multi_thread")]
