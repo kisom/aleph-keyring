@@ -9,6 +9,7 @@ mod client;
 mod prompter;
 mod switchover;
 mod system;
+mod wizard;
 
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write};
@@ -213,10 +214,25 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Setup { revert: true } => revert(&c).await?,
         Cmd::Setup { revert: false } => {
             let status = c.status().await?;
+            let tpm = status.tpm.unwrap_or(false);
+            eprintln!(
+                "aleph: TPM: {}",
+                match status.tpm {
+                    Some(true) => "usable",
+                    Some(false) => "not usable (a login-password keyslot is used instead)",
+                    None => "busy (could not check now)",
+                }
+            );
+            let autologin = wizard::autologin_user(&wizard::SddmConfig::system());
+            if let Some(user) = &autologin {
+                eprintln!(
+                    "aleph: SDDM logs {user} in automatically: there is no password at login, so the keyring stays locked until first use, then asks for a security key or your login password"
+                );
+            }
             if status.vault {
                 eprintln!("aleph: a keyring already exists; checking the rest of setup");
             } else {
-                create_keyring(&c, status.tpm.unwrap_or(false)).await?;
+                create_keyring(&c, tpm, autologin.is_some()).await?;
             }
             // Import while gnome-keyring still serves the Secret Service
             // (E1), then take over from it (E9).
@@ -231,9 +247,33 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             {
                 eprintln!("aleph: {step}");
             }
-            eprintln!(
-                "aleph: note: setup does not yet set up login unlock (PAM): see docs/testing.md for the lines"
-            );
+            if let Some(hook) = wizard::install_omarchy_hook(&dirs.config_home)? {
+                eprintln!(
+                    "aleph: installed {}: the keyring locks with the screen once Omarchy's lock runs `omarchy-hook lock`",
+                    hook.display()
+                );
+            }
+            let mut term = prompter::Terminal::new();
+            if tpm {
+                offer_lockout_auth(&mut term)?;
+            }
+            // The root side comes last, and is optional (E10).
+            let user = std::env::var("USER").map_err(|_| "USER is not set")?;
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let exe = exe.to_string_lossy();
+            let apply = [exe.as_ref(), "system", "apply", "--user", user.as_str()];
+            let answer = ask(
+                &mut term,
+                "Set up login and screen unlock now (runs sudo)? [Y/n] ",
+            )?;
+            if matches!(answer.trim(), "" | "y" | "Y" | "yes") {
+                if let Err(e) = wizard::run_as_root(&apply) {
+                    eprintln!("aleph: {e}; run `sudo aleph system apply --user {user}` later");
+                }
+            } else {
+                eprintln!("aleph: later: `sudo aleph system apply --user {user}`");
+            }
+            eprintln!("aleph: setup is done (`aleph status` shows the keyring)");
         }
 
         Cmd::Status => {
@@ -546,7 +586,7 @@ async fn revert(c: &Client) -> Result<()> {
             removed.join(", ")
         );
         let mut term = prompter::Terminal::new();
-        let answer = term_line(&mut term, "Delete them from gnome-keyring too? [y/N] ")?;
+        let answer = ask(&mut term, "Delete them from gnome-keyring too? [y/N] ")?;
         delete = matches!(answer.trim(), "y" | "Y" | "yes");
     }
     outcome(
@@ -566,34 +606,98 @@ async fn revert(c: &Client) -> Result<()> {
     for step in steps {
         eprintln!("aleph: {step}");
     }
+    if let Some(hook) = wizard::remove_omarchy_hook(&dirs.config_home)? {
+        eprintln!("aleph: removed {}", hook.display());
+    }
     c.release_secret_service().await?;
     eprintln!(
         "aleph: gnome-keyring serves the Secret Service again; the aleph vault is left in place"
     );
+    // The root side last (E3).
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = exe.to_string_lossy();
+    if let Err(e) = wizard::run_as_root(&[exe.as_ref(), "system", "revert"]) {
+        eprintln!("aleph: {e}; run `sudo aleph system revert` to undo the PAM changes");
+    }
     Ok(())
 }
 
-/// Create the keyring, asking which unlock method to use.
-async fn create_keyring(c: &Client, tpm: bool) -> Result<()> {
+/// Offer to set the TPM's lockoutAuth (D9): shown once, typed back, then
+/// set through sudo from standard input; declined, the command is printed.
+fn offer_lockout_auth(term: &mut prompter::Terminal) -> Result<()> {
+    let command = format!(
+        "sudo {} (the value on standard input)",
+        wizard::LOCKOUT_COMMAND.join(" ")
+    );
+    let answer = ask(
+        term,
+        "Protect the TPM's dictionary-attack lockout with a password of its own (recommended if nobody set one)? [y/N] ",
+    )?;
+    if !matches!(answer.trim(), "y" | "Y" | "yes") {
+        eprintln!("aleph: later: {command}");
+        return Ok(());
+    }
+    let value = zeroize::Zeroizing::new(wizard::lockout_value()?);
+    eprintln!(
+        "\nThe TPM lockout password. Keep it with your recovery key; it is needed only to clear a dictionary-attack lockout:\n\n    {}\n",
+        value.as_str()
+    );
+    let typed = zeroize::Zeroizing::new(term_line(term, "Type it back to confirm: ")?);
+    if typed.trim().to_uppercase() != value.as_str() {
+        eprintln!(
+            "aleph: that does not match; the lockout password was not set (later: {command})"
+        );
+        return Ok(());
+    }
+    if let Err(e) = wizard::set_lockout_auth(&value) {
+        eprintln!("aleph: {e}");
+    }
+    Ok(())
+}
+
+/// Create the keyring, asking which unlock method to use (a security key
+/// by default with autologin, where no login password unlocks it).
+async fn create_keyring(c: &Client, tpm: bool, autologin: bool) -> Result<()> {
     let first = if tpm {
-        "the TPM and your login password (recommended)"
+        "the TPM and your login password"
     } else {
         "your login password"
     };
-    eprintln!("How should the keyring unlock?\n  1) {first}\n  2) a FIDO2 security key");
-    let mut term = prompter::Terminal::new();
-    let choice = term_line(&mut term, "Choice [1]: ")?;
-    let method = if choice.trim() == "2" {
-        "fido2"
+    let (default, first, second) = if autologin {
+        (
+            "2",
+            first.to_string(),
+            "a FIDO2 security key (recommended with autologin)",
+        )
     } else {
-        "password"
+        (
+            "1",
+            format!("{first} (recommended)"),
+            "a FIDO2 security key",
+        )
     };
+    eprintln!("How should the keyring unlock?\n  1) {first}\n  2) {second}");
+    let mut term = prompter::Terminal::new();
+    let choice = term_line(&mut term, &format!("Choice [{default}]: "))?;
+    let choice = match choice.trim() {
+        "" => default,
+        other => other,
+    };
+    let method = if choice == "2" { "fido2" } else { "password" };
     outcome(c.converse("Create", Args::Str(method)).await?)?;
     Ok(())
 }
 
 fn term_line(term: &mut prompter::Terminal, prompt: &str) -> Result<String> {
     term.line(prompt).map_err(|e| e.to_string())
+}
+
+/// A question with a default: no more input (end of file) takes it.
+fn ask(term: &mut prompter::Terminal, prompt: &str) -> Result<String> {
+    match term.line(prompt) {
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(String::new()),
+        other => other.map_err(|e| e.to_string()),
+    }
 }
 
 /// A keyslot id from its full form or a unique prefix (as `status` shows).

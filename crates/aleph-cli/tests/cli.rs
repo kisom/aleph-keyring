@@ -7,8 +7,9 @@ use std::process::{Child, Command, Stdio};
 use aleph_daemon::testing::*;
 
 fn aleph(d: &Daemon, args: &[&str]) -> Command {
-    // Never the real home or user manager: setup writes activation files
-    // and runs systemctl (`false`: no unit exists, and any change fails).
+    // Never the real home, user manager, or sudo: setup writes activation
+    // files, runs systemctl (`false`: no unit exists, and any change
+    // fails), and offers the root side through sudo (`false`: it fails).
     let home = d.env.paths.data_dir.parent().unwrap().join("home");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aleph"));
     cmd.args(args)
@@ -16,7 +17,9 @@ fn aleph(d: &Daemon, args: &[&str]) -> Command {
         .env("HOME", &home)
         .env("XDG_DATA_HOME", home.join("data"))
         .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_CONFIG_HOME", home.join("config"))
         .env("ALEPH_SYSTEMCTL", "false")
+        .env("ALEPH_SUDO", "false")
         .env("ALEPH_NO_TTY", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -115,11 +118,14 @@ async fn setup_creates_the_keyring_and_status_shows_it() {
     assert!(out.contains("keyring: none"), "{out}");
     let log = setup(&d).await;
     assert!(log.contains("The keyring is ready."), "{log}");
-    // Then the import (no gnome-keyring here) and the switchover (alephd
-    // already serves the name); PAM is still by hand.
+    // Then the import (no gnome-keyring here), the switchover (alephd
+    // already serves the name), and the root side, which fails here (the
+    // tests' sudo is `false`) and says how to run it later.
+    assert!(log.contains("TPM: usable"), "{log}");
     assert!(log.contains("gnome-keyring is not running"), "{log}");
     assert!(log.contains("alephd serves the Secret Service"), "{log}");
-    assert!(log.contains("docs/testing.md"), "{log}");
+    assert!(log.contains("sudo aleph system apply --user"), "{log}");
+    assert!(log.contains("setup is done"), "{log}");
     let home = d.env.paths.data_dir.parent().unwrap().join("home");
     assert!(
         home.join("data/dbus-1/services/org.freedesktop.secrets.service")

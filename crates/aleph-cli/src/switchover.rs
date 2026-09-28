@@ -136,6 +136,8 @@ pub struct Dirs {
     pub data_home: PathBuf,
     /// `$XDG_STATE_HOME` (setup's record under `aleph`).
     pub state_home: PathBuf,
+    /// `$XDG_CONFIG_HOME` (Omarchy's hooks).
+    pub config_home: PathBuf,
 }
 
 impl Dirs {
@@ -152,6 +154,7 @@ impl Dirs {
         Ok(Self {
             data_home: xdg("XDG_DATA_HOME", ".local/share"),
             state_home: xdg("XDG_STATE_HOME", ".local/state"),
+            config_home: xdg("XDG_CONFIG_HOME", ".config"),
         })
     }
 
@@ -468,6 +471,7 @@ mod tests {
         let dirs = Dirs {
             data_home: home.path().join("data"),
             state_home: home.path().join("state"),
+            config_home: home.path().join("config"),
         };
         let units = FakeUnits::new(gk);
         let mut record = Record::load(&dirs).unwrap();
@@ -514,6 +518,7 @@ mod tests {
         let dirs = Dirs {
             data_home: home.path().join("data"),
             state_home: home.path().join("state"),
+            config_home: home.path().join("config"),
         };
         let units = FakeUnits::new(gk);
         let mut record = Record::load(&dirs).unwrap();
@@ -572,6 +577,7 @@ mod tests {
         let dirs = Dirs {
             data_home: home.path().join("data"),
             state_home: home.path().join("state"),
+            config_home: home.path().join("config"),
         };
         let units = FakeUnits::new(gk);
         // (systemd stops nothing: the fixture outlives the "stop".)
