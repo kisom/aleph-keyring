@@ -49,12 +49,12 @@ async fn run(d: &Daemon, args: &[&str], stdin: &str) -> (bool, String, String) {
     let stdin = stdin.to_string();
     tokio::task::spawn_blocking(move || {
         let mut child = cmd.spawn().unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(stdin.as_bytes())
-            .unwrap();
+        // (A command that ends before reading its input, a refusal, say,
+        // closes the pipe first: not a failure of the test.)
+        match child.stdin.take().unwrap().write_all(stdin.as_bytes()) {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            other => other.unwrap(),
+        }
         let out = child.wait_with_output().unwrap();
         (
             out.status.success(),
@@ -318,8 +318,12 @@ async fn backup_and_restore_through_the_cli() {
             .keyslots()
             .all(|s| matches!(s.kind, aleph_core::SlotKind::Recovery(_)))
     );
-    let (ok, _, _) = run(&d, &["backup", f], &format!("{PW}\n")).await;
+    let (ok, _, err) = run(&d, &["backup", f], &format!("{PW}\n")).await;
     assert!(!ok, "an existing file is not replaced without --force");
+    assert!(
+        err.contains("already exists") && err.contains("--force"),
+        "{err}"
+    );
     assert_eq!(std::fs::read(&file).unwrap(), first);
     // A symlink is never followed.
     let target = dir.path().join("elsewhere");

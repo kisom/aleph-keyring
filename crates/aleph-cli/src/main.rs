@@ -539,6 +539,11 @@ async fn backup(c: &Client, path: &std::path::Path, force: bool) -> Result<()> {
                     "{}: left by an interrupted `alephctl backup --force`; remove it and try again",
                     target.display()
                 )
+            } else if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "{} already exists; choose another name, or replace it with `alephctl backup --force`",
+                    target.display()
+                )
             } else {
                 format!("{}: {e}", target.display())
             }
