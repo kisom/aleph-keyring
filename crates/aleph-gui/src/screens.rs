@@ -122,7 +122,17 @@ impl PromptUi {
         } else {
             c.operation.as_str()
         };
-        ui.add(egui::Label::new(RichText::new(title).heading().strong()).truncate());
+        // (In capitals and the warning color, like the manager's "VAULT
+        // SEALED".)
+        ui.add(
+            egui::Label::new(
+                RichText::new(title.to_uppercase())
+                    .heading()
+                    .strong()
+                    .color(p.warning),
+            )
+            .truncate(),
+        );
         if let Some(caller) = &c.caller {
             let who = match (&caller.name, caller.pid) {
                 (Some(n), Some(pid)) => format!("REQUEST FROM {n} :: PID {pid}"),

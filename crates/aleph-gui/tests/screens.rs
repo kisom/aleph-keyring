@@ -116,6 +116,17 @@ fn ask(methods: Vec<Method>, error: Option<&str>, retry_after: Option<u64>) -> T
     }
 }
 
+/// The title reads like the manager's banners ("VAULT SEALED"): in
+/// capitals.
+#[test]
+fn the_title_is_in_capitals() {
+    let (mut h, mut d) = window(ThemeChoice::Neon);
+    begin(&mut d, Purpose::Unlock, "Unlock the keyring");
+    d.say(&ask(vec![Method::Password], None, None));
+    settle(&mut h);
+    h.get_by_label("UNLOCK THE KEYRING");
+}
+
 #[test]
 fn a_typed_password_and_enter_answer_the_question() {
     let (mut h, mut d) = window(ThemeChoice::Neon);
@@ -499,7 +510,7 @@ fn the_unlock_prompt_speaks_the_part() {
     ));
     settle(&mut h);
     h.get_by_label("ALEPH // UNLOCK VAULT");
-    h.get_by_label("Unlock the keyring");
+    h.get_by_label("UNLOCK THE KEYRING");
     h.get_by_label("REQUEST FROM secret-tool :: PID 4242");
     h.get_by_label("ACCESS DENIED :: wrong password");
     h.get_by_label("UNLOCK");

@@ -35,6 +35,17 @@ Adopted, each with a test that failed without it:
   re-indented for reading, by a walk over the text into a zeroized string
   sized beforehand (parsing it into values would leave unzeroized copies);
   COPY and EDIT use the secret as stored.
+- **Both windows run without vsync:** Mesa's Wayland swap waits for a
+  frame callback, which Hyprland never sends a window on a hidden
+  workspace, so the first repaint there (a store event, a timer) blocked
+  the window's thread, and Hyprland called it not responding. Neither
+  window animates, so nothing spins without it.
+- **A prompt's title is in capitals and the warning color,** like the
+  manager's "VAULT SEALED" (a name in it is capitalized too; the body
+  shows it as it is).
+- **A private bus listens in its owner's temporary directory,** not
+  `/tmp`: it is killed, so it never removes its socket (the test buses
+  had left thousands).
 - **An edit saves only what changed:** a loaded secret is rewritten only
   if it differs, and a secret that is not text cannot be loaded into the
   editor (it would be mangled).
