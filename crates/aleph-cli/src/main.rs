@@ -8,6 +8,7 @@
 mod client;
 mod prompter;
 mod switchover;
+mod system;
 
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write};
@@ -25,6 +26,25 @@ struct Cli {
     json: bool,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum SystemCmd {
+    /// Add aleph to the login, lock-screen, and passwd PAM services, then
+    /// check the login and lock screen with a real login (undone at once
+    /// if that fails).
+    Apply {
+        /// Whose login password checks the edited services.
+        #[arg(long)]
+        user: String,
+    },
+    /// Check the login and lock-screen services with a real login.
+    Verify {
+        #[arg(long)]
+        user: String,
+    },
+    /// Undo what `apply` did (only what it did).
+    Revert,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -45,6 +65,9 @@ enum Cmd {
     },
     /// Show the keyring's state and keyslots.
     Status,
+    /// The root side of setup (run with sudo): login and screen unlock.
+    #[command(subcommand)]
+    System(SystemCmd),
     /// Import items from another keyring (alephd reads them itself).
     Import {
         #[arg(value_enum)]
@@ -180,9 +203,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         clap_complete::generate(shell, &mut Cli::command(), "aleph", &mut std::io::stdout());
         return Ok(ExitCode::SUCCESS);
     }
+    // The root side: no session bus, no user configuration.
+    if let Cmd::System(action) = cli.cmd {
+        return run_system(action).map(|()| ExitCode::SUCCESS);
+    }
     let c = Client::connect().await?;
     match cli.cmd {
-        Cmd::Completions { .. } => unreachable!(),
+        Cmd::Completions { .. } | Cmd::System(_) => unreachable!(),
         Cmd::Setup { revert: true } => revert(&c).await?,
         Cmd::Setup { revert: false } => {
             let status = c.status().await?;
@@ -436,6 +463,66 @@ async fn backup(c: &Client, path: &std::path::Path, force: bool) -> Result<()> {
         "aleph: note: copies of ~/.local/share/aleph made any other way hold every keyslot \
          (including a login-password slot on machines without a TPM); `aleph backup` holds only the recovery slot"
     );
+    Ok(())
+}
+
+/// `aleph system ...`, as root (DECISIONS.md E4–E6).
+fn run_system(action: SystemCmd) -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("run it as root: sudo aleph system ...".into());
+    }
+    if let Some(w) = system::writable_binary_warning() {
+        eprintln!("aleph: {w}");
+    }
+    let root = system::Root::system();
+    match action {
+        SystemCmd::Apply { user } => {
+            if std::path::Path::new("/etc/NIXOS").exists() {
+                eprintln!(
+                    "aleph: NixOS manages /etc/pam.d: add to your configuration, for each of the login and lock-screen services,
+  security.pam.services.<name>.text lines: `{}` (and for the login `{}`; for passwd `{}`)",
+                    system::AUTH,
+                    system::SESSION,
+                    system::PASSWORD
+                );
+                return Ok(());
+            }
+            let report = system::apply(&root)?;
+            for m in &report.manual {
+                eprintln!("aleph: by hand: {m}");
+            }
+            if report.changed.is_empty() {
+                eprintln!("aleph: the PAM services were already set up");
+                return Ok(());
+            }
+            let password = zeroize::Zeroizing::new(
+                rpassword::prompt_password(format!(
+                    "Login password for {user} (checks the login and lock screen once): "
+                ))
+                .map_err(|e| e.to_string())?,
+            );
+            if let Err(e) = system::verify(&root, &user, &password) {
+                system::roll_back(&root, &report.changed)?;
+                return Err(format!(
+                    "the check failed ({e}); the PAM changes were undone"
+                ));
+            }
+            eprintln!("aleph: login and screen unlock now reach aleph");
+        }
+        SystemCmd::Verify { user } => {
+            let password = zeroize::Zeroizing::new(
+                rpassword::prompt_password(format!("Login password for {user}: "))
+                    .map_err(|e| e.to_string())?,
+            );
+            system::verify(&root, &user, &password)?;
+            eprintln!("aleph: the login and lock-screen services accept the password");
+        }
+        SystemCmd::Revert => {
+            for line in system::revert(&root)? {
+                eprintln!("aleph: {line}");
+            }
+        }
+    }
     Ok(())
 }
 
