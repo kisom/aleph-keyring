@@ -3,6 +3,34 @@
 Results of the manual checks in [testing.md](testing.md), newest first.
 Each release's notes summarize the entries since the previous release.
 
+## 2026-09-28, commits 46686ef and f1daf20 (Plan 5a)
+
+Host: as below (Framework Laptop 12, Intel PTT), Omarchy 4.0.4, kernel
+7.2.5-3-omarchy, Hyprland 0.56.2, Mesa 26.2.2, libsecret 0.21.7,
+tpm2-tss 4.2.0, libfido2 1.17.0. The owner's own account, set up on
+2026-09-27 (SDDM autologin at boot).
+
+### alephd with real clients (testing.md)
+
+Steps 1–3 on 46686ef (installed 09:21); steps 7–8 on f1daf20 (installed
+10:14, with the prompter's new words and size, DECISIONS.md H6).
+
+| Step | Result |
+|---|---|
+| 1. `alephctl setup` re-run after installing | Pass: nothing redone, the root step skipped, and the new Hyprland offer accepted (`~/.config/hypr/hyprland.lua` includes `/usr/share/aleph/hyprland/aleph-prompt.lua`) |
+| 2. `secret-tool store` / `lookup` | Pass |
+| 3. The unlock prompt | Pass, as reported by the owner (the checks were not recorded one by one). Owner's notes: too much empty space, a label not needed, and plainer words than wanted: fixed in f1daf20 (H6) |
+| 4. Chromium | n/a: not used on this machine |
+| 5. NetworkManager | n/a: the Wi-Fi password is system-wide |
+| 6. Setup and login unlock | Done on 2026-09-27 (below); revert not run on the live account |
+| 7. `alephctl status`, the journal | Pass. `journalctl --user -u alephd` since 2026-09-27 reviewed: no passwords, PINs, keys, or item contents; before 46686ef, only the expected "no prompter" lines (no `aleph-gui` yet); after it, none, and only lines from the owner's own testing. Two findings fixed in 5b62c39: alephd took its bus name before registering its interfaces (a zbus warning on every start), and unlocks through the prompt were not logged |
+| 8. Backup | `alephctl backup ~/aleph.bak`: pass (mode `0600`; the message says it holds only the recovery slot). A second run refuses to overwrite, before asking for the password (`/home/kyle/aleph.bak: File exists (os error 17)`: correct, if terse). Restore, rollback, and `--from-bak` not run (they need a second account or the vault moved aside) |
+
+Not confirmed individually (part of step 3, reported as a whole): the
+prompt after a reboot with SDDM autologin; `passwd` with the window open;
+the prompt unanswered past `prompt.timeout`. Not installed during these
+checks: 5b62c39.
+
 ## 2026-09-27, commit 429f5e4 (Plan 4c)
 
 Host: Framework Laptop 12 (13th Gen Intel Core), Intel PTT (firmware
