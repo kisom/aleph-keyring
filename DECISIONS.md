@@ -23,6 +23,15 @@ and the spec's install list now names `alephd`'s place
 (`/usr/lib/aleph/`), the `io.aleph.Keyring` activation file,
 `/etc/pam.d/aleph-check`, and the global enabling of `alephd.socket`.
 
+The same run found alephd's password check failing under systemd
+(PAM_AUTHINFO_UNAVAIL; `unix_chkpwd`: "user unknown"): the unit's
+seccomp-based hardening (`LockPersonality`, `MemoryDenyWriteExecute`,
+`RestrictRealtime`, `SystemCallArchitectures`) implies `NoNewPrivileges`
+in a user unit, so the setuid helper could not read `/etc/shadow`. The
+tests run alephd directly, never under systemd. Those options are gone;
+a static test (`tests/units.rs`) keeps every option that implies
+`NoNewPrivileges` out of the unit.
+
 ### G4. The final review of the executed Plan 4c branch: fixes
 
 Nothing critical: the forward path (`aleph setup`, then `sudo aleph

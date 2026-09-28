@@ -13,9 +13,8 @@ Restart=on-failure
 # alephd holds the master key while unlocked: no core dumps (it also sets
 # PR_SET_DUMPABLE=0 itself).
 LimitCORE=0
-LockPersonality=yes
-MemoryDenyWriteExecute=yes
-RestrictRealtime=yes
-SystemCallArchitectures=native
-# Not NoNewPrivileges: checking the login password with pam_unix runs the
-# setuid unix_chkpwd helper.
+# No NoNewPrivileges, and none of the seccomp-based options (LockPersonality,
+# MemoryDenyWriteExecute, RestrictRealtime, SystemCallArchitectures, ...):
+# in a user unit each implies NoNewPrivileges, and checking the login
+# password with pam_unix runs the setuid unix_chkpwd helper, which cannot
+# read /etc/shadow without its privileges (tests/units.rs).
