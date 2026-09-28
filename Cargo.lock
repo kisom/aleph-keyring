@@ -214,20 +214,18 @@ dependencies = [
 name = "aleph-daemon"
 version = "0.1.0"
 dependencies = [
- "aes",
  "aleph-core",
  "aleph-daemon",
  "aleph-pam-proto",
  "aleph-prompt-proto",
+ "aleph-secret-session",
  "aleph-tpm-proto",
  "aleph-tpmd",
  "aleph-unlock",
- "cbc",
  "enumflags2",
  "futures-util",
  "hkdf",
  "libc",
- "num-bigint",
  "pam_aleph",
  "serde",
  "serde_json",
@@ -274,6 +272,20 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "zeroize",
+]
+
+[[package]]
+name = "aleph-secret-session"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "cbc",
+ "getrandom 0.4.3",
+ "hkdf",
+ "num-bigint",
+ "sha2",
+ "thiserror 2.0.21",
  "zeroize",
 ]
 

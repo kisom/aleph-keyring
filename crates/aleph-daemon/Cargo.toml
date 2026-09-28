@@ -14,16 +14,14 @@ path = "src/main.rs"
 testing = ["dep:aleph-tpmd", "aleph-core/insecure-test-params"]
 
 [dependencies]
-aes = "0.9"
-cbc = { version = "0.2", features = ["alloc"] }
 enumflags2 = "0.7"
 futures-util = { version = "0.3", default-features = false }
 hkdf.workspace = true
-num-bigint = "0.4"
 sha2.workspace = true
 aleph-core = { path = "../aleph-core" }
 aleph-pam-proto = { path = "../aleph-pam-proto" }
 aleph-prompt-proto = { path = "../aleph-prompt-proto" }
+aleph-secret-session = { path = "../aleph-secret-session" }
 aleph-tpm-proto = { path = "../aleph-tpm-proto" }
 aleph-unlock = { path = "../aleph-unlock" }
 libc.workspace = true

@@ -1,2 +1,2 @@
 pub mod service;
-pub mod session;
+pub use aleph_secret_session as session;

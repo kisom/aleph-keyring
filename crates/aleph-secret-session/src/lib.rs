@@ -1,4 +1,7 @@
-//! Secret Service transfer sessions (spec §6 "Secret Service").
+//! Secret Service transfer sessions (spec §6 "Secret Service"), both
+//! halves: alephd serves them, and uses the client half to read another
+//! Secret Service (the gnome-keyring import); the manager window
+//! (`aleph-gui`) uses the client half to read alephd.
 //!
 //! - `plain`: secrets travel as-is on the (per-user) session bus.
 //! - `dh-ietf1024-sha256-aes128-cbc-pkcs7`, which libsecret requires:
@@ -62,15 +65,17 @@ fn prime() -> BigUint {
 }
 
 fn random<const N: usize>() -> Result<[u8; N], SessionError> {
-    aleph_core::crypto::random_array::<N>().map_err(|_| SessionError::Random)
+    let mut out = [0u8; N];
+    getrandom::fill(&mut out).map_err(|_| SessionError::Random)?;
+    Ok(out)
 }
 
 /// A random DH exponent in [2, p-2].
 fn exponent(p: &BigUint) -> Result<BigUint, SessionError> {
-    Ok(
-        BigUint::from_bytes_be(&*Zeroizing::new(random::<PRIME_LEN>()?)) % (p - BigUint::from(3u8))
-            + BigUint::from(2u8),
-    )
+    // (Filled in place: the exponent's bytes never sit in a copy.)
+    let mut bytes = Zeroizing::new([0u8; PRIME_LEN]);
+    getrandom::fill(&mut *bytes).map_err(|_| SessionError::Random)?;
+    Ok(BigUint::from_bytes_be(&*bytes) % (p - BigUint::from(3u8)) + BigUint::from(2u8))
 }
 
 /// The session key from our exponent and the peer's public value (checked
@@ -94,8 +99,9 @@ fn derive(peer_bytes: &[u8], x: &BigUint, p: &BigUint) -> Result<Session, Sessio
     Ok(Session::Dh { key })
 }
 
-/// The client half of a `dh-ietf1024-sha256-aes128-cbc-pkcs7` exchange,
-/// for alephd reading another Secret Service (the gnome-keyring import).
+/// The client half of a `dh-ietf1024-sha256-aes128-cbc-pkcs7` exchange:
+/// alephd reading another Secret Service (the gnome-keyring import), the
+/// manager window reading alephd.
 pub struct ClientDh {
     x: BigUint,
     /// Our public value, the `OpenSession` input.
