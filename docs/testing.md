@@ -136,8 +136,9 @@ gnome-keyring-daemon.service gnome-keyring-daemon.socket`):
    then the PIN and touch screens. Switch the Omarchy theme while a prompt
    is open: it re-themes. Leave a prompt unanswered past `prompt.timeout`
    (`alephctl config set prompt.timeout 30` to wait less; set it back to
-   300 after): the window closes and the lookup keeps waiting; `alephctl
-   unlock` ends it with the secret. Without a graphical session (a text
+   300 after): the window stays. With it open, `alephctl unlock` in a
+   terminal: the window closes, the terminal asks, and the lookup prints
+   the secret. Without a graphical session (a text
    console, `WAYLAND_DISPLAY` unset), the lookup waits, and `alephctl
    unlock` in another terminal ends it. After a reboot with SDDM autologin
    (alephd starts before Hyprland), the first lookup opens the prompt.

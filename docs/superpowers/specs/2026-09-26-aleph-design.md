@@ -387,7 +387,7 @@ classic case) create a new key that orphans their existing data.
 - No method call ever blocks waiting for the user. `Unlock()` returns a
   prompt with no reply timeout. If no prompter can start (no graphical
   session), or its conversation ends any way but the user's Cancel (the
-  prompter timed out, crashed, or could not open its window; the typed
+  prompter crashed or could not open its window, a question timed out; the typed
   attempts ran out; the machine went to sleep), the prompt is not
   dismissed (only Cancel dismisses it): it waits until the vault is
   unlocked some other way (`alephctl unlock`, PAM), then completes. Every
@@ -919,7 +919,11 @@ idle_timeout = 0         # seconds without secret access; 0 = disabled
   `systemd-ask-password`. With `ALEPH_NO_TTY=1` its answers are lines of
   standard input (scripts, tests).
 - The prompter settings are `prompt.program` and `prompt.timeout`
-  (seconds before an unanswered prompt ends) in `config.toml`.
+  (seconds before an unanswered question ends) in `config.toml`. The
+  unlock window's choice of method has no timeout (DECISIONS.md H5): it
+  waits for the person, who may be away, and closes when the vault is
+  unlocked another way, when another operation (`alephctl`, `passwd`)
+  needs to run, or when alephd stops.
 
 ### Logging
 

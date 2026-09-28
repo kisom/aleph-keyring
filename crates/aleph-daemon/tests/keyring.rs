@@ -382,13 +382,12 @@ fn a_waiting_prompter_is_released_when_the_vault_unlocks_elsewhere() {
 }
 
 /// Prompter trouble is not the user's answer: a prompter that closes
-/// without answering (it could not open its window) or stays silent until
-/// the prompt timeout leaves the unlock waiting (`Ok(false)`, as with no
-/// prompter: spec §4), and is told `Done` without a message. Only Cancel
-/// dismisses.
+/// without answering (it could not open its window) or answers nonsense
+/// leaves the unlock waiting (`Ok(false)`, as with no prompter: spec §4),
+/// and is told `Done` without a message. Only Cancel dismisses.
 #[test]
 fn a_prompter_that_ends_without_an_answer_leaves_the_unlock_waiting() {
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
     let env = env();
@@ -405,24 +404,174 @@ fn a_prompter_that_ends_without_an_answer_leaves_the_unlock_waiting() {
     );
     assert!(matches!(closed, Ok(false)), "{closed:?}");
     let (ours, theirs) = UnixStream::pair().unwrap();
-    let silent = k.unlock_prompting(
+    let prompter = std::thread::spawn(move || {
+        let mut writer = theirs.try_clone().unwrap();
+        let mut seen = Vec::new();
+        for line in BufReader::new(theirs).lines() {
+            let msg: ToPrompter = serde_json::from_str(&line.unwrap()).unwrap();
+            if matches!(msg, ToPrompter::Ask { .. }) {
+                writer.write_all(b"nonsense\n").unwrap();
+            }
+            seen.push(msg);
+        }
+        seen
+    });
+    let nonsense = k.unlock_prompting(
+        || aleph_daemon::prompt::Channel::new(ours, Duration::from_secs(5)),
+        None,
+    );
+    assert!(matches!(nonsense, Ok(false)), "{nonsense:?}");
+    assert_eq!(
+        prompter.join().unwrap().last(),
+        Some(&ToPrompter::Done {
+            ok: false,
+            message: None
+        })
+    );
+    assert!(k.is_locked());
+}
+
+/// An unlock prompt's window waits for its answer as long as it takes
+/// (`prompt.timeout` does not end it): the person may be away, and should
+/// find the prompt waiting when they come back.
+#[test]
+fn an_unlock_prompt_waits_for_its_answer_past_the_prompt_timeout() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+    let env = env();
+    let k = keyring(&env, MockKeys::default());
+    create_with_password(&k);
+    k.lock();
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let prompter = std::thread::spawn(move || {
+        let mut writer = theirs.try_clone().unwrap();
+        for line in BufReader::new(theirs).lines() {
+            let msg: ToPrompter = serde_json::from_str(&line.unwrap()).unwrap();
+            if matches!(msg, ToPrompter::Ask { .. }) {
+                // Well past the channel's timeout.
+                std::thread::sleep(Duration::from_millis(900));
+                writer
+                    .write_all(
+                        format!("{{\"type\":\"password\",\"password\":\"{PW}\"}}\n").as_bytes(),
+                    )
+                    .unwrap();
+            }
+            if matches!(msg, ToPrompter::Done { .. }) {
+                break;
+            }
+        }
+    });
+    let r = k.unlock_prompting(
         || aleph_daemon::prompt::Channel::new(ours, Duration::from_millis(300)),
         None,
     );
-    assert!(matches!(silent, Ok(false)), "{silent:?}");
-    let last: ToPrompter = BufReader::new(theirs)
-        .lines()
-        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
-        .last()
-        .unwrap();
-    assert_eq!(
-        last,
-        ToPrompter::Done {
-            ok: false,
-            message: None
+    assert!(matches!(r, Ok(true)), "{r:?}");
+    assert!(!k.is_locked());
+    prompter.join().unwrap();
+}
+
+/// An open unlock window (which has no timeout) gives way to an admin
+/// conversation (`alephctl unlock` in a terminal): the window closes, its
+/// unlock goes back to waiting (`Ok(false)`), and the admin one runs,
+/// instead of answering "busy" for as long as the window stays open.
+#[test]
+fn an_open_unlock_window_gives_way_to_an_admin_conversation() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use std::time::Duration;
+    let env = env();
+    let k = Arc::new(keyring(&env, MockKeys::default()));
+    create_with_password(&k);
+    k.lock();
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let (asked, wait_asked) = std::sync::mpsc::channel();
+    // A person who is away: the question is never answered.
+    let prompter = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for line in BufReader::new(theirs).lines() {
+            let msg: ToPrompter = serde_json::from_str(&line.unwrap()).unwrap();
+            if matches!(msg, ToPrompter::Ask { .. }) {
+                asked.send(()).unwrap();
+            }
+            seen.push(msg);
         }
+        seen
+    });
+    let window = {
+        let k = k.clone();
+        std::thread::spawn(move || {
+            k.unlock_prompting(
+                || aleph_daemon::prompt::Channel::new(ours, Duration::from_millis(300)),
+                None,
+            )
+        })
+    };
+    wait_asked.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let (done, wait_done) = std::sync::mpsc::channel();
+    {
+        let k = k.clone();
+        std::thread::spawn(move || {
+            let p = Interactive::new(vec![password(PW)]);
+            done.send(k.unlock(&mut p.channel(), None).is_ok()).unwrap();
+        });
+    }
+    assert!(
+        wait_done
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the admin unlock ran instead of waiting for the window"),
+        "the admin unlock failed"
     );
-    assert!(k.is_locked());
+    assert!(!k.is_locked());
+    assert!(matches!(window.join().unwrap(), Ok(false)));
+    assert!(matches!(
+        prompter.join().unwrap().last(),
+        Some(ToPrompter::Done { message: None, .. })
+    ));
+}
+
+/// Stopping alephd closes an open unlock window (it has no timeout, and the
+/// runtime waits for it before the process can exit).
+#[test]
+fn stopping_closes_an_open_unlock_window() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use std::time::Duration;
+    let env = env();
+    let k = Arc::new(keyring(&env, MockKeys::default()));
+    create_with_password(&k);
+    k.lock();
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let (asked, wait_asked) = std::sync::mpsc::channel();
+    let _prompter = std::thread::spawn(move || {
+        for line in BufReader::new(theirs).lines() {
+            let msg: ToPrompter = serde_json::from_str(&line.unwrap()).unwrap();
+            if matches!(msg, ToPrompter::Ask { .. }) {
+                let _ = asked.send(());
+            }
+        }
+    });
+    let (done, wait_done) = std::sync::mpsc::channel();
+    {
+        let k = k.clone();
+        std::thread::spawn(move || {
+            let r = k.unlock_prompting(
+                || aleph_daemon::prompt::Channel::new(ours, Duration::from_millis(300)),
+                None,
+            );
+            done.send(matches!(r, Ok(false))).unwrap();
+        });
+    }
+    wait_asked.recv().unwrap();
+    k.stopping();
+    assert!(
+        wait_done
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the window closed")
+    );
 }
 
 /// An admin conversation (`alephctl unlock`, answered in the terminal) that

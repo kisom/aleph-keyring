@@ -615,14 +615,17 @@ async fn unlock_prompts_share_one_prompter() {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(held(&holding), 1);
     assert_eq!(s.svc.waiting_count(), 2);
+    // (The held window has no timeout: close it, as alephd does when it
+    // stops, or the runtime would wait for it.)
+    s.svc.keyring.stopping();
 }
 
-/// A prompter that times out (or crashes) is not the user's answer: the
-/// unlock prompt that started it and those that joined it keep waiting
-/// (as with no prompter, spec §4), and complete, undismissed, when the
-/// vault is unlocked some other way. (Only Cancel dismisses.)
+/// An unlock prompt's window stays until it is answered (the prompt
+/// timeout, 2 s here, does not end it): the prompt that started it and
+/// those that joined it wait with it, and complete, undismissed, when the
+/// vault is unlocked some other way, which also ends the conversation.
 #[tokio::test(flavor = "multi_thread")]
-async fn unlock_prompts_wait_when_the_prompter_times_out() {
+async fn an_unlock_prompt_window_stays_until_answered() {
     use futures_util::StreamExt;
     let (s, holding) = served_holding().await;
     s.svc.lock().await.unwrap();
@@ -654,17 +657,22 @@ async fn unlock_prompts_wait_when_the_prompter_times_out() {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     assert_eq!(held(&holding), 1);
-    // The held conversation times out after 2 s: both prompts wait on.
+    // Past the 2 s prompt timeout: the conversation still runs (its
+    // prompter has not been told `Done`), and no prompt has completed.
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     for (_, completed) in &mut prompts {
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), completed.next())
                 .await
                 .is_err(),
-            "a prompt completed after the prompter timed out"
+            "a prompt completed while its window was still open"
         );
     }
-    assert_eq!(s.svc.waiting_count(), 2);
+    let peer = holding.peers.lock().unwrap()[0].try_clone().unwrap();
+    peer.set_nonblocking(true).unwrap();
+    let mut told = String::new();
+    let _ = std::io::Read::read_to_string(&mut &peer, &mut told);
+    assert!(!told.contains("\"done\""), "{told}");
     // "alephctl unlock" in a terminal: both complete, undismissed.
     let keyring = s.svc.keyring.clone();
     tokio::task::spawn_blocking(move || {
@@ -727,6 +735,8 @@ async fn no_prompter_opens_while_an_admin_conversation_runs() {
     assert!(admin.join().unwrap().is_err());
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert_eq!(held(&holding), 1);
+    // (As alephd does when it stops: the held window has no timeout.)
+    s.svc.keyring.stopping();
 }
 
 /// A prompt dismissed while its conversation runs completes once: the

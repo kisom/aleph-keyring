@@ -117,6 +117,7 @@ async fn run() -> Result<(), String> {
     // Login unlock needs pam.sock; without it the rest still works.
     match aleph_daemon::pamsock::listener(&pam_socket) {
         Ok(listener) => {
+            let keyring = keyring.clone();
             tokio::spawn(async move {
                 if let Err(e) = aleph_daemon::pamsock::serve(listener, keyring, secrets).await {
                     tracing::error!("pam.sock stopped: {e}");
@@ -135,6 +136,9 @@ async fn run() -> Result<(), String> {
         _ = tokio::signal::ctrl_c() => {}
     }
     tracing::info!("stopping");
+    // (An open unlock window has no timeout: close it, or the runtime would
+    // wait for it before the process can exit.)
+    keyring.stopping();
     Ok(())
 }
 

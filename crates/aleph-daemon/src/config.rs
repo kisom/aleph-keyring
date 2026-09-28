@@ -43,7 +43,8 @@ impl Default for LockConfig {
 pub struct PromptConfig {
     /// The prompter program, run as `<program> prompt`.
     pub program: String,
-    /// Seconds a prompt may stay open before it is dismissed.
+    /// Seconds a question may stay unanswered. (Not the Secret Service
+    /// unlock window's choice of method: that one waits for the person.)
     pub timeout: u64,
 }
 

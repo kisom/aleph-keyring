@@ -26,7 +26,8 @@ pub use aleph_prompt_proto::*;
 const POLL: Duration = Duration::from_millis(250);
 
 /// The daemon's end of a prompter conversation. Blocking; every read is
-/// bounded by the prompt timeout.
+/// bounded by the prompt timeout, except the unlock window's method
+/// question ([`Channel::wait_for_answers`]).
 pub struct Channel {
     stream: UnixStream,
     /// Received bytes not yet parsed (answers carry passwords and PINs).
@@ -35,6 +36,8 @@ pub struct Channel {
     /// drop.
     buf: Zeroizing<Vec<u8>>,
     timeout: Duration,
+    /// Answers are waited for without a deadline.
+    patient: bool,
 }
 
 impl Channel {
@@ -50,7 +53,22 @@ impl Channel {
             // A full line and its newline.
             buf: Zeroizing::new(Vec::with_capacity(MAX_LINE + 1)),
             timeout,
+            patient: false,
         })
+    }
+
+    /// Wait for [`Channel::ask_while`]'s answer as long as it takes: the
+    /// prompt timeout no longer ends that question (other questions, and
+    /// writes, stay bounded by it: a prompter that stops reading still
+    /// cannot block the daemon). For the Secret Service's unlock window,
+    /// which the person should find waiting when they come back; it closes
+    /// when its `waiting` check turns false.
+    pub fn wait_for_answers(&mut self) {
+        self.patient = true;
+    }
+
+    pub fn waits_for_answers(&self) -> bool {
+        self.patient
     }
 
     pub fn from_fd(fd: OwnedFd, timeout: Duration) -> Result<Self> {
@@ -110,9 +128,9 @@ impl Channel {
     ) -> Result<FromPrompter> {
         debug_assert!(msg.needs_reply());
         self.send(msg)?;
-        let deadline = Instant::now() + self.timeout;
+        let deadline = (!self.patient).then(|| Instant::now() + self.timeout);
         loop {
-            let left = deadline.saturating_duration_since(Instant::now());
+            let left = deadline.map_or(POLL, |d| d.saturating_duration_since(Instant::now()));
             if left.is_zero() {
                 return Err(Error::Prompt("the prompt timed out".into()));
             }

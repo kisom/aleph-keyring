@@ -158,6 +158,12 @@ pub struct Keyring {
     inner: Mutex<Inner>,
     hw: Mutex<Backends>,
     ops: Mutex<()>,
+    /// The Secret Service's unlock window holds `ops`: it has no timeout,
+    /// so it gives way to anyone who wants `ops` (`ops_wanted`).
+    window_open: std::sync::atomic::AtomicBool,
+    ops_wanted: std::sync::atomic::AtomicUsize,
+    /// alephd is stopping: no window stays open, and none opens.
+    stopping: std::sync::atomic::AtomicBool,
     /// Argon2 parameters for new login-password slots.
     pub argon2: Argon2Params,
     /// How long to wait for a FIDO2 key to be plugged in.
@@ -200,6 +206,9 @@ impl Keyring {
             }),
             hw: Mutex::new(backends),
             ops: Mutex::new(()),
+            window_open: Default::default(),
+            ops_wanted: Default::default(),
+            stopping: Default::default(),
             argon2: Argon2Params::LOGIN_PASSWORD_FLOOR,
             key_wait: Duration::from_secs(120),
             last_access: Mutex::new(Instant::now()),
@@ -368,6 +377,12 @@ impl Keyring {
         match self.ops.try_lock() {
             Ok(guard) => Ok(guard),
             Err(std::sync::TryLockError::Poisoned(e)) => Ok(e.into_inner()),
+            // The unlock window gives way (it has no timeout).
+            Err(std::sync::TryLockError::WouldBlock)
+                if self.window_open.load(std::sync::atomic::Ordering::SeqCst) =>
+            {
+                Ok(self.ops_giving_way())
+            }
             Err(std::sync::TryLockError::WouldBlock) => {
                 chan.done(false, Some(Error::Busy.to_string()));
                 Err(Error::Busy)
@@ -443,6 +458,18 @@ impl Keyring {
         if !self.is_locked() {
             return Ok(true);
         }
+        if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(false);
+        }
+        struct Open<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Open<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        self.window_open
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _open = Open(&self.window_open);
         let mut chan = match launch() {
             Ok(chan) => chan,
             Err(e) => {
@@ -450,6 +477,10 @@ impl Keyring {
                 return Ok(false);
             }
         };
+        // The window waits for its answer as long as it takes: the person
+        // may be away, and should find it when they come back. (It closes
+        // when the vault is unlocked another way.)
+        chan.wait_for_answers();
         match converse_in_window(&mut chan, |chan| self.unlock_conversation(chan, caller)) {
             Err(_) if !self.is_locked() => Ok(true),
             // Only the user's Cancel dismisses (§4). Anything else that ends
@@ -463,8 +494,36 @@ impl Keyring {
                 tracing::info!("the unlock prompt waits for an unlock from elsewhere: {e}");
                 Ok(false)
             }
-            other => other.map(|()| true),
+            // (Ended without unlocking: it gave way to another operation.)
+            other => other.map(|()| !self.is_locked()),
         }
+    }
+
+    /// Whether a question waiting for its answer is still needed: the vault
+    /// is still locked, and (for the unlock window, `window`) nobody is
+    /// waiting to start another operation.
+    fn keep_asking(&self, window: bool) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.is_locked()
+            && !(window && (self.ops_wanted.load(SeqCst) > 0 || self.stopping.load(SeqCst)))
+    }
+
+    /// alephd is stopping: close the unlock window, if one is open (it has
+    /// no timeout, and the runtime waits for it before the process exits),
+    /// and open no other.
+    pub fn stopping(&self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Take `ops`, asking an open unlock window to give way meanwhile.
+    fn ops_giving_way(&self) -> MutexGuard<'_, ()> {
+        self.ops_wanted
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let guard = lock(&self.ops);
+        self.ops_wanted
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        guard
     }
 
     fn unlock_conversation(
@@ -554,13 +613,14 @@ impl Keyring {
         // Previous-password tries so far (each goes straight to the TPM).
         let mut old_tries = 0;
         for _ in 0..MAX_ATTEMPTS {
+            let window = chan.waits_for_answers();
             let reply = chan.ask_while(
                 &ToPrompter::Ask {
                     methods: methods.clone(),
                     error: error.take(),
                     retry_after: retry_after.take(),
                 },
-                &|| self.is_locked(),
+                &|| self.keep_asking(window),
             )?;
             let attempt = match reply {
                 FromPrompter::Password { password } if methods.contains(&Method::Password) => {
@@ -783,11 +843,12 @@ impl Keyring {
             if let Some(wait) = lock(&self.inner).typed.blocked(now) {
                 return Err(Error::TooManyAttempts { retry_after: wait });
             }
+            let window = chan.waits_for_answers();
             let reply = chan.ask_while(
                 &ToPrompter::OldPassword {
                     error: error.take(),
                 },
-                &|| self.is_locked(),
+                &|| self.keep_asking(window),
             )?;
             let FromPrompter::Password { password: old } = reply else {
                 return Err(Error::Prompt(format!("unexpected reply {reply:?}")));
@@ -1427,7 +1488,7 @@ impl Keyring {
             }
             Err(_) => false,
         };
-        let _op = lock(&self.ops);
+        let _op = self.ops_giving_way();
         // The vault may be unlocked (pam.sock does not wait for `ops`) or
         // locked (sleep, idle) while this runs: then once more, the other way.
         for _ in 0..2 {

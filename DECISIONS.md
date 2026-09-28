@@ -9,6 +9,27 @@ made directly are marked as such.
 
 ## 2026-09-28: Plan 5a (the prompter), design
 
+### H5. The unlock window waits for the person — owner's decision
+
+After `prompt.timeout` the unlock window closed and the request waited,
+with nothing on screen when the person came back (an autologin boot and a
+long absence: the everyday case). Of the options (no timeout for the
+Secret Service's unlock window; reopen it when the session becomes active
+again; leave it), the owner chose the first. The method question (and the
+previous-password one) now waits without a deadline; follow-up questions
+(a PIN) keep `prompt.timeout`, and so does every terminal (`alephctl`)
+conversation. Because the window holds the conversation lock:
+
+- it gives way to anyone who needs it: an admin conversation (`alephctl
+  unlock`, which answered "busy" before) or `passwd` makes it close, its
+  request goes back to waiting, and the other operation runs
+  (`an_open_unlock_window_gives_way_to_an_admin_conversation`);
+- alephd closes it when it stops, or the runtime would wait for it
+  forever (`stopping_closes_an_open_unlock_window`).
+
+Tests: `an_unlock_prompt_waits_for_its_answer_past_the_prompt_timeout`,
+`an_unlock_prompt_window_stays_until_answered`.
+
 ### H4. The final review's minor findings, fixed (owner's request)
 
 Each with a test that failed first, except where noted:
@@ -90,15 +111,8 @@ test that failed without it:
   conversation itself still ends on those, as before. And the 400 ms key
   guard also starts when the window gets the keyboard, IME input included
   (`keys_arriving_with_the_focus_are_ignored`).
-- **Ruling (for the owner): nothing offers a timed-out prompt again.**
-  After `prompt.timeout` (300 s) the window closes and the request waits,
-  as §4 says; when the person comes back, nothing is on screen until
-  another request, a screen lock and unlock, or `alephctl unlock`. Options
-  for a later change: reopen the prompter for waiting unlocks when the
-  session becomes active again (logind), or give Secret Service unlock
-  windows no timeout. Left as specified — cost if wrong: after an
-  autologin boot and a long absence, a client waits until the next screen
-  unlock.
+- **Ruling put to the owner: nothing offered a timed-out prompt again.**
+  Decided in H5: the unlock window has no timeout.
 - **Noted for later:** §4 says prompts that joined a *cancelled*
   conversation keep waiting; the code (since Plan 3) ends them with it.
   This plan does not change Cancel; the mismatch is left for its own fix.
