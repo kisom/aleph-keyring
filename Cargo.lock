@@ -91,6 +91,7 @@ dependencies = [
  "aleph-tpmd",
  "aleph-unlock",
  "cbc",
+ "enumflags2",
  "futures-util",
  "hkdf",
  "libc",

@@ -368,15 +368,7 @@ pub async fn daemon_with(
         create_with_password(&keyring);
     }
     let bus = bus();
-    let conn = zbus::connection::Builder::address(bus.address.as_str())
-        .unwrap()
-        .name("org.freedesktop.secrets")
-        .unwrap()
-        .name(crate::admin::BUS_NAME)
-        .unwrap()
-        .build()
-        .await
-        .unwrap();
+    let conn = connect_as_daemon(&bus).await;
     let launcher = Arc::new(InteractiveLauncher::new(prompts));
     let secrets = crate::daemon::serve(
         &conn,
@@ -387,6 +379,7 @@ pub async fn daemon_with(
     )
     .await
     .unwrap();
+    crate::daemon::request_secrets_name(&conn).await.unwrap();
     Daemon {
         secrets,
         keyring,
@@ -394,6 +387,170 @@ pub async fn daemon_with(
         conn,
         env,
     }
+}
+
+/// A connection owning `io.aleph.Keyring` on `bus` (the Secret Service
+/// name is requested, queued, once served).
+async fn connect_as_daemon(bus: &Bus) -> zbus::Connection {
+    zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .name(crate::admin::BUS_NAME)
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+}
+
+/// `daemon_with` on a bus something else may already serve the Secret
+/// Service on (gnome-keyring): alephd queues behind it.
+pub async fn daemon_on(bus: Bus, create: bool) -> Daemon {
+    let env = env();
+    let keyring = Arc::new(keyring_with(
+        &env,
+        Box::new(TpmClient::new(env.socket.clone())),
+        MockKeys::default(),
+        Box::new(Fixed(|p| p == PW)),
+    ));
+    if create {
+        create_with_password(&keyring);
+    }
+    let conn = connect_as_daemon(&bus).await;
+    let secrets = crate::daemon::serve(
+        &conn,
+        keyring.clone(),
+        Arc::new(InteractiveLauncher::new(vec![])),
+        Arc::new(std::sync::Mutex::new(crate::config::Config::default())),
+        env.paths.clone(),
+    )
+    .await
+    .unwrap();
+    crate::daemon::request_secrets_name(&conn).await.unwrap();
+    Daemon {
+        secrets,
+        keyring,
+        bus,
+        conn,
+        env,
+    }
+}
+
+/// A real gnome-keyring (secrets component) on `bus`, with a throwaway
+/// home and its login keyring unlocked with `password`. Killed on drop.
+pub struct GnomeKeyring {
+    child: std::process::Child,
+    address: String,
+    home: tempfile::TempDir,
+}
+
+impl GnomeKeyring {
+    pub fn start(bus: &Bus, password: &str) -> Self {
+        use std::io::Write;
+        let home = tempfile::tempdir().unwrap();
+        let run = home.path().join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::set_permissions(&run, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let mut child = self::gkr_command(&bus.address, home.path())
+            .args(["--foreground", "--components=secrets", "--unlock"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("gnome-keyring-daemon (Arch: pacman -S gnome-keyring)");
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(password.as_bytes()).unwrap();
+        drop(stdin);
+        let gk = Self {
+            child,
+            address: bus.address.clone(),
+            home,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !gk.owns_secrets() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "gnome-keyring did not start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        gk
+    }
+
+    fn owns_secrets(&self) -> bool {
+        std::process::Command::new("busctl")
+            .args([
+                "--address",
+                &self.address,
+                "status",
+                "org.freedesktop.secrets",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// Store an item in gnome-keyring's default collection (`secret-tool`).
+    pub fn store(&self, label: &str, attributes: &[(&str, &str)], secret: &str) {
+        use std::io::Write;
+        let mut cmd = self::gkr_env(
+            std::process::Command::new("secret-tool"),
+            &self.address,
+            self.home.path(),
+        );
+        cmd.args(["store", "--label", label]);
+        for (k, v) in attributes {
+            cmd.args([*k, *v]);
+        }
+        let mut child = cmd
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("secret-tool (Arch: pacman -S libsecret)");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(secret.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success(), "secret-tool store failed");
+    }
+
+    /// Stop it (it releases `org.freedesktop.secrets`).
+    pub fn stop(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for GnomeKeyring {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn gkr_command(address: &str, home: &std::path::Path) -> std::process::Command {
+    gkr_env(
+        std::process::Command::new("gnome-keyring-daemon"),
+        address,
+        home,
+    )
+}
+
+fn gkr_env(
+    mut cmd: std::process::Command,
+    address: &str,
+    home: &std::path::Path,
+) -> std::process::Command {
+    cmd.env("HOME", home)
+        .env("XDG_RUNTIME_DIR", home.join("run"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("DBUS_SESSION_BUS_ADDRESS", address)
+        .env_remove("GNOME_KEYRING_CONTROL")
+        .env_remove("SSH_AUTH_SOCK");
+    cmd
 }
 
 /// A stand-in for logind on a test bus: it hands out sleep inhibitors

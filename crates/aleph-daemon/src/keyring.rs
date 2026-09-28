@@ -96,6 +96,9 @@ pub struct Status {
     /// A password change replaced slots without rotating MK (FIDO2 slots
     /// need a touch): `aleph keyslot rotate-master` should follow.
     pub rotation_pending: bool,
+    /// Who owns `org.freedesktop.secrets` (`alephd`, `another program`,
+    /// `nobody`); filled in by the admin interface.
+    pub secret_service: Option<String>,
 }
 
 /// Answers a conversation accepts before giving up.
@@ -264,6 +267,7 @@ impl Keyring {
             tpm,
             keyslots,
             rotation_pending: inner.state.rotation_pending(),
+            secret_service: None,
         })
     }
 

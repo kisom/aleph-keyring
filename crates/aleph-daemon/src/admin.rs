@@ -42,6 +42,9 @@ fn slot_id(id: &str) -> zbus::fdo::Result<Uuid> {
         .map_err(|_| zbus::fdo::Error::InvalidArgs(format!("not a keyslot id: {id:?}")))
 }
 
+/// How long an import waits for gnome-keyring's own unlock prompt.
+const IMPORT_PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// The largest backup file read (a vault this size holds a great deal).
 const MAX_BACKUP: u64 = 64 * 1024 * 1024;
 
@@ -128,14 +131,56 @@ impl Admin {
 #[interface(name = "io.aleph.Admin1")]
 impl Admin {
     /// The keyring's state as JSON (`keyring::Status`).
-    async fn status(&self) -> zbus::fdo::Result<String> {
+    async fn status(
+        &self,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<String> {
         // Reads the vault header and asks the TPM helper: off the runtime.
         let keyring = self.keyring.clone();
-        let status = tokio::task::spawn_blocking(move || keyring.status())
+        let mut status = tokio::task::spawn_blocking(move || keyring.status())
             .await
             .map_err(failed)?
             .map_err(failed)?;
+        status.secret_service = Some(crate::daemon::secret_service_owner(conn).await);
         serde_json::to_string(&status).map_err(failed)
+    }
+
+    /// Import every gnome-keyring item (DECISIONS.md E1, E2) while
+    /// gnome-keyring still owns `org.freedesktop.secrets`, then keep
+    /// following it until the name changes hands. Returns the summary.
+    async fn import_gnome_keyring(
+        &self,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> zbus::fdo::Result<String> {
+        if self.keyring.is_locked() {
+            return Err(zbus::fdo::Error::Failed(
+                "the keyring is locked: unlock it first (`aleph unlock`)".into(),
+            ));
+        }
+        let Some(importer) = crate::import::Importer::connect(conn, IMPORT_PROMPT_TIMEOUT)
+            .await
+            .map_err(failed)?
+        else {
+            return Ok("gnome-keyring is not running: nothing to import.".into());
+        };
+        let mut summary = crate::import::Summary::default();
+        let fetched = importer
+            .fetch_all(&mut summary.skipped)
+            .await
+            .map_err(failed)?;
+        let keyring = self.keyring.clone();
+        let summary = tokio::task::spawn_blocking(move || {
+            keyring.modify(|body| {
+                crate::import::merge(body, fetched, &mut summary);
+                Ok(summary)
+            })
+        })
+        .await
+        .map_err(failed)?
+        .map_err(failed)?;
+        let _ = self.secrets.unlocked().await;
+        tokio::spawn(importer.follow(self.keyring.clone(), self.secrets.clone()));
+        Ok(summary.to_string())
     }
 
     async fn lock(&self) -> zbus::fdo::Result<()> {

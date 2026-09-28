@@ -65,6 +65,57 @@ fn random<const N: usize>() -> Result<[u8; N], SessionError> {
     aleph_core::crypto::random_array::<N>().map_err(|_| SessionError::Random)
 }
 
+/// A random DH exponent in [2, p-2].
+fn exponent(p: &BigUint) -> Result<BigUint, SessionError> {
+    Ok(
+        BigUint::from_bytes_be(&*Zeroizing::new(random::<PRIME_LEN>()?)) % (p - BigUint::from(3u8))
+            + BigUint::from(2u8),
+    )
+}
+
+/// The session key from our exponent and the peer's public value (checked
+/// to be in range), as both sides derive it.
+fn derive(peer_bytes: &[u8], x: &BigUint, p: &BigUint) -> Result<Session, SessionError> {
+    let peer = BigUint::from_bytes_be(peer_bytes);
+    let one = BigUint::from(1u8);
+    if peer_bytes.len() > PRIME_LEN || peer <= one || peer >= p - &one {
+        return Err(SessionError::BadInput);
+    }
+    // The byte forms are zeroized; num-bigint cannot zeroize its own limbs
+    // (the exponent and shared value), which is accepted for an ephemeral
+    // per-session key.
+    let shared = Zeroizing::new(peer.modpow(x, p).to_bytes_be());
+    let mut ikm = Zeroizing::new([0u8; PRIME_LEN]);
+    ikm[PRIME_LEN - shared.len()..].copy_from_slice(&shared);
+    let mut key = Zeroizing::new([0u8; 16]);
+    Hkdf::<Sha256>::new(None, &*ikm)
+        .expand(&[], &mut *key)
+        .expect("16 bytes is a valid HKDF length");
+    Ok(Session::Dh { key })
+}
+
+/// The client half of a `dh-ietf1024-sha256-aes128-cbc-pkcs7` exchange,
+/// for alephd reading another Secret Service (the gnome-keyring import).
+pub struct ClientDh {
+    x: BigUint,
+    /// Our public value, the `OpenSession` input.
+    pub public: Vec<u8>,
+}
+
+impl ClientDh {
+    pub fn new() -> Result<Self, SessionError> {
+        let p = prime();
+        let x = exponent(&p)?;
+        let public = BigUint::from(2u8).modpow(&x, &p).to_bytes_be();
+        Ok(Self { x, public })
+    }
+
+    /// The session, from the server's `OpenSession` output.
+    pub fn finish(self, server_public: &[u8]) -> Result<Session, SessionError> {
+        derive(server_public, &self.x, &prime())
+    }
+}
+
 impl Session {
     /// Negotiate a session: returns it and the output for the client (our
     /// DH public value, or nothing for `plain`).
@@ -74,26 +125,9 @@ impl Session {
             PLAIN => Err(SessionError::BadInput),
             DH => {
                 let p = prime();
-                let peer = BigUint::from_bytes_be(input);
-                let one = BigUint::from(1u8);
-                if input.len() > PRIME_LEN || peer <= one || peer >= &p - &one {
-                    return Err(SessionError::BadInput);
-                }
-                let x = BigUint::from_bytes_be(&*Zeroizing::new(random::<PRIME_LEN>()?))
-                    % (&p - BigUint::from(3u8))
-                    + BigUint::from(2u8);
+                let x = exponent(&p)?;
                 let public = BigUint::from(2u8).modpow(&x, &p);
-                // The byte forms are zeroized; num-bigint cannot zeroize
-                // its own limbs (the exponent and shared value), which is
-                // accepted for an ephemeral per-session key.
-                let shared = Zeroizing::new(peer.modpow(&x, &p).to_bytes_be());
-                let mut ikm = Zeroizing::new([0u8; PRIME_LEN]);
-                ikm[PRIME_LEN - shared.len()..].copy_from_slice(&shared);
-                let mut key = Zeroizing::new([0u8; 16]);
-                Hkdf::<Sha256>::new(None, &*ikm)
-                    .expand(&[], &mut *key)
-                    .expect("16 bytes is a valid HKDF length");
-                Ok((Self::Dh { key }, public.to_bytes_be()))
+                Ok((derive(input, &x, &p)?, public.to_bytes_be()))
             }
             other => Err(SessionError::Unsupported(other.into())),
         }
@@ -164,6 +198,18 @@ mod tests {
         assert_ne!(&ct[..], b"s3cret");
         assert_eq!(&**session.decrypt(&iv, &ct).unwrap(), b"s3cret");
         assert_eq!(session.decrypt(&iv[..8], &ct), Err(SessionError::Decrypt));
+    }
+
+    /// Our client half (the gnome-keyring import) and a server agree, and
+    /// a bad server value is refused.
+    #[test]
+    fn the_client_half_agrees_with_a_server() {
+        let client = ClientDh::new().unwrap();
+        let (server, server_public) = Session::open(DH, &client.public).unwrap();
+        let (iv, ct) = server.encrypt(b"from gnome-keyring").unwrap();
+        let session = client.finish(&server_public).unwrap();
+        assert_eq!(&**session.decrypt(&iv, &ct).unwrap(), b"from gnome-keyring");
+        assert!(ClientDh::new().unwrap().finish(&[1]).is_err());
     }
 
     #[test]

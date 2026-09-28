@@ -5,7 +5,9 @@ Documentation=https://github.com/kisom/aleph-keyring
 [Service]
 # Started by D-Bus activation (org.freedesktop.secrets, io.aleph.Keyring).
 Type=dbus
-BusName=org.freedesktop.secrets
+# (io.aleph.Keyring, not org.freedesktop.secrets: alephd may wait in the
+# queue for the latter while gnome-keyring still owns it.)
+BusName=io.aleph.Keyring
 ExecStart=/usr/lib/aleph/alephd
 Restart=on-failure
 # alephd holds the master key while unlocked: no core dumps (it also sets

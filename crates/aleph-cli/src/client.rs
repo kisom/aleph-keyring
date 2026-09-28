@@ -35,6 +35,8 @@ pub struct Status {
     pub keyslots: Vec<SlotInfo>,
     #[serde(default)]
     pub rotation_pending: bool,
+    #[serde(default)]
+    pub secret_service: Option<String>,
 }
 
 /// One item, as the CLI shows it.
@@ -112,6 +114,16 @@ impl Client {
             .await
             .map_err(|e| format!("cannot reach alephd: {e}"))?;
         serde_json::from_str(&json).map_err(err)
+    }
+
+    /// Import gnome-keyring's items (alephd reads them itself); returns
+    /// the summary.
+    pub async fn import_gnome_keyring(&self) -> Result<String> {
+        self.admin()
+            .await?
+            .call("ImportGnomeKeyring", &())
+            .await
+            .map_err(|e| format!("import failed: {e}"))
     }
 
     pub async fn lock(&self) -> Result<()> {

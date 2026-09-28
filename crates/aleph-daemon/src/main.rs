@@ -47,20 +47,24 @@ async fn run() -> Result<(), String> {
         config: config.clone(),
     });
     let conn = zbus::connection::Builder::session()
-        .and_then(|b| b.name(SECRETS_NAME))
         .and_then(|b| b.name(BUS_NAME))
         .map_err(|e| e.to_string())?
         .build()
         .await
-        .map_err(|e| {
-            format!("cannot own {SECRETS_NAME} on the session bus (is gnome-keyring still running?): {e}")
-        })?;
+        .map_err(|e| format!("cannot own {BUS_NAME} on the session bus: {e}"))?;
     let pam_socket = paths.pam_socket();
     let secrets =
         aleph_daemon::daemon::serve(&conn, keyring.clone(), launcher, config.clone(), paths)
             .await
             .map_err(|e| e.to_string())?;
-    tracing::info!("serving {SECRETS_NAME} and {BUS_NAME}");
+    // Queued behind gnome-keyring until it lets go (DECISIONS.md E1).
+    match aleph_daemon::daemon::request_secrets_name(&conn).await {
+        Ok(true) => tracing::info!("serving {SECRETS_NAME} and {BUS_NAME}"),
+        Ok(false) => tracing::info!(
+            "serving {BUS_NAME}; queued for {SECRETS_NAME}, which another program owns"
+        ),
+        Err(e) => return Err(format!("cannot request {SECRETS_NAME}: {e}")),
+    }
     // The lock policy: logind (sleep, screen lock) on the system bus, and
     // the idle timer. Without logind the rest still works.
     match zbus::Connection::system().await {

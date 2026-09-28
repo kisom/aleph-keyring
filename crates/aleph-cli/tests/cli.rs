@@ -344,3 +344,17 @@ async fn restore_says_when_there_is_nothing_to_do() {
     let (ok, _, err) = run(&d, &["restore", fifo.to_str().unwrap()], "").await;
     assert!(!ok && err.contains("not a regular file"), "{err}");
 }
+
+/// `aleph import gnome-keyring` says when there is nothing to import, and
+/// `aleph status` names who serves the Secret Service.
+#[tokio::test(flavor = "multi_thread")]
+async fn import_and_status_name_the_secret_service() {
+    let d = daemon(true, vec![]).await;
+    let (ok, out, err) = run(&d, &["import", "gnome-keyring"], "").await;
+    assert!(ok && out.contains("not running"), "{out}{err}");
+    let (ok, out, _) = run(&d, &["status"], "").await;
+    assert!(
+        ok && out.contains("secret service: served by alephd"),
+        "{out}"
+    );
+}

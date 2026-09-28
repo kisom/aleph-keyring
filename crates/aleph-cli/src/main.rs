@@ -26,12 +26,23 @@ struct Cli {
     cmd: Cmd,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ImportSource {
+    /// gnome-keyring, while it still runs (its items stay there).
+    GnomeKeyring,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Create the keyring (system integration comes in a later release).
     Setup,
     /// Show the keyring's state and keyslots.
     Status,
+    /// Import items from another keyring (alephd reads them itself).
+    Import {
+        #[arg(value_enum)]
+        source: ImportSource,
+    },
     Lock,
     Unlock,
     #[command(subcommand)]
@@ -201,6 +212,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     (true, false) => "unlocked",
                 };
                 println!("keyring: {state}");
+                if let Some(owner) = &s.secret_service {
+                    println!("secret service: served by {owner}");
+                }
                 if let Some(why) = &s.untrusted {
                     println!("warning: the vault file was {why}; writes are refused");
                 }
@@ -217,6 +231,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 print_slots(&s.keyslots);
             }
         }
+        Cmd::Import {
+            source: ImportSource::GnomeKeyring,
+        } => println!("{}", c.import_gnome_keyring().await?),
         Cmd::Lock => c.lock().await?,
         Cmd::Unlock => outcome(c.converse("Unlock", Args::None).await?)?,
         Cmd::Keyslot(k) => match k {
