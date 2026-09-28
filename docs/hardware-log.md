@@ -3,6 +3,24 @@
 Results of the manual checks in [testing.md](testing.md), newest first.
 Each release's notes summarize the entries since the previous release.
 
+## 2026-09-28, commit 35b9544 (the manager, Plan 5b)
+
+Host: as below. Installed with `make install` after 35b9544.
+
+### The manager (testing.md)
+
+| Step | Result |
+|---|---|
+| 1–8 | Pass, as reported by the owner (the steps were not recorded one by one) |
+
+Found while testing, with the manager beside another window (Hyprland's
+side-by-side tiling):
+
+| Finding | Result |
+|---|---|
+| The detail pane was too narrow to use at half a screen | Fixed in 9c00a16: the list and the detail split the width evenly |
+| The divider showed the resize cursor but did not move | The detail's width floor (fixed in 4bd83a2), then the real cause: long labels held the list at its widest (fixed in 35b9544, rows cut to the list's width). Confirmed by the owner: the divider drags |
+
 ## 2026-09-28, commit f07550b (Plan 5b and follow-ups)
 
 Host: as below. Installed with `make && make install` at about 15:30.
