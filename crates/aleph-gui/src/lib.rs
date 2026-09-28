@@ -3,3 +3,5 @@
 
 pub mod conversation;
 pub mod link;
+pub mod settings;
+pub mod theme;
