@@ -52,6 +52,23 @@ test that failed without it:
   rows that fit above the buttons, ending in "…" (the snapshot review
   showed a long label reaching the button row; a label of capitals ran
   under it). Test: `a_long_confirmation_never_covers_the_buttons`.
+- **The final review of the executed branch** found "only Cancel
+  dismisses" still untrue for refusals: a sixth typed password during the
+  attempt limit, a sleep, or a key never plugged in ended the conversation
+  and dismissed the unlock. Now every end but Cancel leaves the prompt
+  waiting (`a_refusal_other_than_cancel_leaves_the_unlock_waiting`); the
+  conversation itself still ends on those, as before. And the 400 ms key
+  guard also starts when the window gets the keyboard, IME input included
+  (`keys_arriving_with_the_focus_are_ignored`).
+- **Ruling (for the owner): nothing offers a timed-out prompt again.**
+  After `prompt.timeout` (300 s) the window closes and the request waits,
+  as §4 says; when the person comes back, nothing is on screen until
+  another request, a screen lock and unlock, or `alephctl unlock`. Options
+  for a later change: reopen the prompter for waiting unlocks when the
+  session becomes active again (logind), or give Secret Service unlock
+  windows no timeout. Left as specified — cost if wrong: after an
+  autologin boot and a long absence, a client waits until the next screen
+  unlock.
 - **Noted for later:** §4 says prompts that joined a *cancelled*
   conversation keep waiting; the code (since Plan 3) ends them with it.
   This plan does not change Cancel; the mismatch is left for its own fix.

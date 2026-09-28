@@ -21,11 +21,12 @@ fn prompter(runtime: &std::path::Path) -> Command {
 /// Run with `fd` (any descriptor) as descriptor 10 and `ALEPH_PROMPT_FD=10`.
 fn with_fd(mut c: Command, fd: i32) -> Output {
     c.env("ALEPH_PROMPT_FD", "10");
-    // SAFETY: dup2 is async-signal-safe; it only duplicates the
-    // descriptor in the child (the copy is inheritable).
+    // SAFETY: dup2 and fcntl are async-signal-safe; they only touch the
+    // descriptor in the child. (Close-on-exec is cleared explicitly: when
+    // `fd` already is 10, dup2 does nothing and would leave it set.)
     unsafe {
         c.pre_exec(move || {
-            if libc::dup2(fd, 10) < 0 {
+            if libc::dup2(fd, 10) < 0 || libc::fcntl(10, libc::F_SETFD, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())

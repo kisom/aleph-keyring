@@ -169,12 +169,24 @@ impl PromptApp {
         if self.closed {
             return;
         }
+        // (The guard starts again when the window gets the keyboard: it may
+        // have opened unfocused, behind the lock screen, say.)
+        if ctx.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::WindowFocused(true)))
+        }) {
+            self.shown_at = now;
+        }
         if now < self.shown_at + self.input_guard {
             ctx.input_mut(|i| {
                 i.events.retain(|e| {
                     !matches!(
                         e,
-                        egui::Event::Key { .. } | egui::Event::Text(_) | egui::Event::Paste(_)
+                        egui::Event::Key { .. }
+                            | egui::Event::Text(_)
+                            | egui::Event::Paste(_)
+                            | egui::Event::Ime(_)
                     )
                 })
             });

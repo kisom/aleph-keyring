@@ -315,6 +315,27 @@ fn the_first_keys_after_a_screen_appears_are_ignored() {
     assert!(d.heard_nothing());
 }
 
+/// The guard starts again when the window gets the keyboard (a prompt that
+/// opened behind the lock screen, or unfocused): what was being typed for
+/// another window is not taken as an answer.
+#[test]
+fn keys_arriving_with_the_focus_are_ignored() {
+    let (mut h, mut d) = window(ThemeChoice::Neon);
+    h.state_mut().input_guard = Duration::from_millis(300);
+    begin(&mut d, Purpose::Unlock, "Unlock the keyring");
+    d.say(&ask(vec![Method::Password], None, None));
+    settle(&mut h);
+    std::thread::sleep(Duration::from_millis(400));
+    frames(&mut h);
+    h.event(egui::Event::WindowFocused(true));
+    h.get_by_label("Login password").type_text("hunter2");
+    frames(&mut h);
+    h.key_press(Key::Enter);
+    frames(&mut h);
+    assert!(h.state().ui.secret.is_empty());
+    assert!(d.heard_nothing());
+}
+
 /// A closing message closes itself: the window holds the keyboard while it
 /// is open.
 #[test]

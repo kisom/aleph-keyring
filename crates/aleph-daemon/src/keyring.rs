@@ -452,12 +452,15 @@ impl Keyring {
         };
         match converse(&mut chan, |chan| self.unlock_conversation(chan, caller)) {
             Err(_) if !self.is_locked() => Ok(true),
-            // Prompter trouble (it timed out, closed or crashed before an
-            // answer, could not open its window) is not the user's no: the
-            // prompt waits for an unlock from elsewhere, as with no
-            // prompter (§4). Only Cancel dismisses.
-            Err(Error::Prompt(e)) => {
-                tracing::info!("the prompter ended without an answer: {e}");
+            // Only the user's Cancel dismisses (§4). Anything else that ends
+            // the conversation (prompter trouble: it timed out, closed or
+            // crashed, could not open its window; or a refusal: the typed
+            // attempts used up, a sleep, a key never plugged in) leaves the
+            // prompt waiting for an unlock from elsewhere, as with no
+            // prompter.
+            Err(Error::Cancelled) => Err(Error::Cancelled),
+            Err(e) => {
+                tracing::info!("the unlock prompt waits for an unlock from elsewhere: {e}");
                 Ok(false)
             }
             other => other.map(|()| true),

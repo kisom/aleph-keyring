@@ -425,6 +425,28 @@ fn a_prompter_that_ends_without_an_answer_leaves_the_unlock_waiting() {
     assert!(k.is_locked());
 }
 
+/// No refusal but the user's Cancel dismisses an unlock prompt: typing the
+/// wrong password until the attempt limit blocks the next (the right one)
+/// ends the conversation, but the unlock waits for one from elsewhere
+/// (`Ok(false)`, spec §4), as for a sleep or a key never plugged in.
+#[test]
+fn a_refusal_other_than_cancel_leaves_the_unlock_waiting() {
+    let env = env();
+    let k = keyring(&env, MockKeys::default());
+    create_with_password(&k);
+    k.lock();
+    let mut replies: Vec<_> = (0..5).map(|_| password("typo")).collect();
+    replies.push(password(PW));
+    let p = Interactive::new(replies);
+    let r = k.unlock_prompting(|| Ok(p.channel()), None);
+    assert!(matches!(r, Ok(false)), "{r:?}");
+    assert!(k.is_locked());
+    // Cancel still dismisses.
+    let p = Interactive::new(vec![FromPrompter::Cancel {}]);
+    let r = k.unlock_prompting(|| Ok(p.channel()), None);
+    assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+}
+
 /// A FIDO2 unlock waiting for its key to be plugged in is released by a
 /// login password too, and the prompter is not asked again.
 #[test]
