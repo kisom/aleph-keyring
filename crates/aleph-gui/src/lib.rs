@@ -3,8 +3,10 @@
 //! §7).
 
 pub mod app;
+pub mod clipboard;
 pub mod conversation;
 pub mod link;
+pub mod reauth;
 pub mod screens;
 pub mod settings;
 pub mod store;
