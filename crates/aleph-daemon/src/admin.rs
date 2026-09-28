@@ -326,6 +326,12 @@ impl Admin {
         self.converse(prompter, move |k, chan| k.remove_keyslot(chan, id))
     }
 
+    /// Prove an enrolled method again, and nothing else (the manager's
+    /// guard before it shows a secret).
+    async fn reauth(&self, prompter: zbus::zvariant::OwnedFd) -> zbus::fdo::Result<()> {
+        self.converse(prompter, |k, chan| k.confirm(chan))
+    }
+
     async fn rotate_master(&self, prompter: zbus::zvariant::OwnedFd) -> zbus::fdo::Result<()> {
         self.converse(prompter, |k, chan| k.rotate_master(chan))
     }

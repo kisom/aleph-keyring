@@ -194,3 +194,34 @@ async fn setting_config_reauthenticates_and_saves() {
         900
     );
 }
+
+/// `Reauth` proves an enrolled method again and does nothing else: the
+/// manager's guard before it shows or copies a secret (the manager spec).
+#[tokio::test(flavor = "multi_thread")]
+async fn reauth_confirms_and_changes_nothing() {
+    let d = daemon().await;
+    converse(&d, "Create", &["password"], vec![password(PW)]).await;
+    let before = status(&d).await;
+    let sent = converse(&d, "Reauth", &[], vec![password(PW)]).await;
+    assert!(
+        matches!(
+            sent.first(),
+            Some(ToPrompter::Begin {
+                purpose: aleph_daemon::prompt::Purpose::Reauth,
+                ..
+            })
+        ),
+        "{sent:?}"
+    );
+    assert_eq!(done(&sent), (true, None));
+    assert_eq!(status(&d).await, before);
+    // A wrong password is refused (and a typo never reaches the TPM).
+    let sent = converse(
+        &d,
+        "Reauth",
+        &[],
+        vec![password("typo"), FromPrompter::Cancel {}],
+    )
+    .await;
+    assert!(!done(&sent).0, "{sent:?}");
+}

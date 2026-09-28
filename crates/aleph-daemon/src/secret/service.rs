@@ -351,6 +351,12 @@ impl SecretService {
         self.sessions.lock().unwrap().len()
     }
 
+    /// Forget every session, as a restart does (the manager's tests).
+    #[cfg(feature = "testing")]
+    pub fn forget_sessions(&self) {
+        self.sessions.lock().unwrap().clear();
+    }
+
     /// `Keyring::modify` on a blocking thread: it encrypts, writes, and
     /// fsyncs, which must not stall the async runtime.
     pub async fn modify<T: Send + 'static>(
@@ -531,10 +537,18 @@ impl SecretService {
         })?
     }
 
-    fn session(&self, p: &ObjectPath<'_>) -> Result<SessionGuard<'_>> {
+    /// The session at `p`, if `sender` opened it: a session is its
+    /// opener's (another client naming the path, such as a stale one kept
+    /// across an alephd restart, where numbering starts again, gets
+    /// `NoSession`).
+    fn session(&self, p: &ObjectPath<'_>, sender: Option<&str>) -> Result<SessionGuard<'_>> {
         let sessions = self.sessions.lock().unwrap();
-        if !sessions.contains_key(&OwnedObjectPath::from(p.to_owned())) {
-            return Err(SecretError::NoSession(format!("no session {p}")));
+        let owner = sessions
+            .get(&OwnedObjectPath::from(p.to_owned()))
+            .map(|(_, owner)| owner.as_deref());
+        match owner {
+            Some(owner) if owner.is_none() || sender.is_none() || owner == sender => {}
+            _ => return Err(SecretError::NoSession(format!("no session {p}"))),
         }
         Ok(SessionGuard {
             sessions,
@@ -542,8 +556,13 @@ impl SecretService {
         })
     }
 
-    fn secret_for(&self, session: &ObjectPath<'_>, item: &Item) -> Result<SecretStruct> {
-        let guard = self.session(session)?;
+    fn secret_for(
+        &self,
+        session: &ObjectPath<'_>,
+        sender: Option<&str>,
+        item: &Item,
+    ) -> Result<SecretStruct> {
+        let guard = self.session(session, sender)?;
         let (params, value) = guard
             .get()
             .encrypt(item.secret.expose())
@@ -556,8 +575,8 @@ impl SecretService {
         ))
     }
 
-    fn decrypt(&self, secret: &SecretStruct) -> Result<SecretBytes> {
-        let guard = self.session(&secret.0.as_ref())?;
+    fn decrypt(&self, secret: &SecretStruct, sender: Option<&str>) -> Result<SecretBytes> {
+        let guard = self.session(&secret.0.as_ref(), sender)?;
         let plain = guard
             .get()
             .decrypt(&secret.1, &secret.2)
@@ -971,7 +990,9 @@ impl ServiceObj {
         &self,
         items: Vec<OwnedObjectPath>,
         session: OwnedObjectPath,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
     ) -> Result<HashMap<OwnedObjectPath, SecretStruct>> {
+        let sender = hdr.sender().map(|s| s.to_string());
         let found: Vec<(OwnedObjectPath, Item)> = self.svc.keyring.read(|b| {
             items
                 .iter()
@@ -984,7 +1005,11 @@ impl ServiceObj {
         })?;
         let mut out = HashMap::new();
         for (p, item) in found {
-            out.insert(p, self.svc.secret_for(&session.as_ref(), &item)?);
+            out.insert(
+                p,
+                self.svc
+                    .secret_for(&session.as_ref(), sender.as_deref(), &item)?,
+            );
         }
         Ok(out)
     }
@@ -1116,7 +1141,9 @@ impl CollectionObj {
         properties: HashMap<String, OwnedValue>,
         secret: SecretStruct,
         replace: bool,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
     ) -> Result<(OwnedObjectPath, OwnedObjectPath)> {
+        let sender = hdr.sender().map(|s| s.to_string());
         let id = self.id()?;
         let label = properties
             .get(ITEM_LABEL)
@@ -1128,7 +1155,7 @@ impl CollectionObj {
             .unwrap_or_default()
             .into_iter()
             .collect();
-        let value = self.svc.decrypt(&secret)?;
+        let value = self.svc.decrypt(&secret, sender.as_deref())?;
         let item = Item::new(label, attributes, value, secret.3.clone());
         let before: HashSet<Uuid> = self
             .svc
@@ -1272,13 +1299,25 @@ impl ItemObj {
     /// One struct out-argument, `((oayays))`: a bare tuple would be sent as
     /// four arguments, which libsecret rejects.
     #[zbus(out_args("secret"))]
-    async fn get_secret(&self, session: OwnedObjectPath) -> Result<(SecretStruct,)> {
+    async fn get_secret(
+        &self,
+        session: OwnedObjectPath,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+    ) -> Result<(SecretStruct,)> {
         let item = self.with(Item::clone)?;
-        Ok((self.svc.secret_for(&session.as_ref(), &item)?,))
+        let sender = hdr.sender().map(|s| s.to_string());
+        Ok((self
+            .svc
+            .secret_for(&session.as_ref(), sender.as_deref(), &item)?,))
     }
 
-    async fn set_secret(&self, secret: SecretStruct) -> Result<()> {
-        let value = self.svc.decrypt(&secret)?;
+    async fn set_secret(
+        &self,
+        secret: SecretStruct,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+    ) -> Result<()> {
+        let sender = hdr.sender().map(|s| s.to_string());
+        let value = self.svc.decrypt(&secret, sender.as_deref())?;
         let content_type = secret.3.clone();
         self.edit(move |i| {
             i.secret = value;

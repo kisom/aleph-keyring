@@ -790,3 +790,44 @@ async fn unstarted_prompts_are_capped_and_freed_with_their_client() {
         s.svc.prompt_count()
     );
 }
+
+/// A session is its opener's: another client naming its path (a stale
+/// one kept across an alephd restart, where numbering starts again) gets
+/// `NoSession`, never secrets under someone else's key.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_is_usable_only_by_the_client_that_opened_it() {
+    let s = served(vec![]).await;
+    secret_tool(&s, &["store", "--label=T", "service", "x"], Some("pw")).await;
+    let (a, b) = (client(&s).await, client(&s).await);
+    let (_, session): (OwnedValue, OwnedObjectPath) = service(&a)
+        .await
+        .call("OpenSession", &("plain", zbus::zvariant::Value::from("")))
+        .await
+        .unwrap();
+    let (items, _): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) = service(&a)
+        .await
+        .call(
+            "SearchItems",
+            &(std::collections::HashMap::from([("service", "x")]),),
+        )
+        .await
+        .unwrap();
+    let get = |c: &zbus::Connection| {
+        let (c, item, session) = (c.clone(), items[0].clone(), session.clone());
+        async move {
+            zbus::Proxy::new(
+                &c,
+                "org.freedesktop.secrets",
+                item,
+                "org.freedesktop.Secret.Item",
+            )
+            .await
+            .unwrap()
+            .call_method("GetSecret", &(session,))
+            .await
+        }
+    };
+    assert!(get(&a).await.is_ok());
+    let err = get(&b).await.unwrap_err().to_string();
+    assert!(err.contains("NoSession"), "{err}");
+}

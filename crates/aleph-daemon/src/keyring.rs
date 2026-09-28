@@ -1811,6 +1811,18 @@ impl Keyring {
         })
     }
 
+    /// Prove an enrolled method again, and nothing else: the manager's
+    /// guard before it shows or copies a secret (a guard against a glance,
+    /// not security: any program running as the user can read secrets).
+    pub fn confirm(&self, chan: &mut Channel) -> Result<()> {
+        let _op = self.begin(chan)?;
+        converse(chan, |chan| {
+            // (The manager says what the guard is worth, beside it.)
+            self.reauth(chan, "Confirm it is you")?;
+            Ok(None)
+        })
+    }
+
     /// Replace the recovery key: the old one stops working (§5).
     pub fn reissue_recovery(&self, chan: &mut Channel) -> Result<()> {
         let _op = self.begin(chan)?;
