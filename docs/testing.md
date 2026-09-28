@@ -57,6 +57,12 @@ These need real hardware and a person. Record the result (pass/fail,
 hardware model, firmware) in [hardware-log.md](hardware-log.md); release
 notes summarize it.
 
+`make gate-hw` runs the two below, and only those: the real TPM (with
+sudo for the test binary alone, unless you can open `/dev/tpmrm0`), then
+the FIDO2 key (it asks for the PIN without echo unless `ALEPH_FIDO2_PIN`
+is set; empty for built-in UV). `make hw-tpm` and `make hw-fido2` run
+one each.
+
 ### FIDO2 security key
 
 1. Plug in exactly one FIDO2 key that supports `hmac-secret` (YubiKey 5,
