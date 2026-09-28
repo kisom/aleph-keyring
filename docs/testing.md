@@ -116,32 +116,49 @@ does (DynamicUser, the seccomp filter, threads). As root:
 
 ### alephd with real clients
 
-Needs a vault on a test account (or a spare user), since it takes over
-the Secret Service for the session. As root, install the PAM service
-once: `install -Dm644 packaging/pam/aleph-check /etc/pam.d/aleph-check`.
-Then, with gnome-keyring stopped (`systemctl --user stop
-gnome-keyring-daemon.service gnome-keyring-daemon.socket`):
+aleph takes over the session's Secret Service, so use a test account
+(or a spare user) the first time; once it is set up on your own account,
+these run there too. `make && make install` installs everything (the
+binaries, `aleph-gui`, the PAM service `/etc/pam.d/aleph-check`, the
+units, and the Hyprland window rule) and restarts alephd, which locks the
+keyring. The client is `alephctl` (`aleph` on PATH is TeX's).
 
-1. Run `target/debug/alephd` in one terminal and `target/debug/alephctl setup`
-   in another; choose the TPM (or a key) and confirm the recovery key.
+1. `alephctl setup`: choose the TPM (or a key), confirm the recovery key,
+   and let it switch over from gnome-keyring (step 6 checks setup in
+   detail). Already set up (a keyring exists)? Run `alephctl setup` again
+   anyway after installing a new version: it changes nothing that is done,
+   skips the root step once it is applied, and offers what is new (Plan
+   5a: the prompt's Hyprland window rule; answer yes, and
+   `~/.config/hypr/hyprland.lua` gets two lines, the `pcall(dofile, …)`
+   include and a comment).
 2. `secret-tool store --label=t service aleph-check` (type a secret), then
    `secret-tool lookup service aleph-check` prints it.
-3. `alephctl lock`, then `secret-tool lookup service aleph-check`: the
-   prompt window opens, floating in the middle of the screen with the
-   keyboard on its password field. Type the login password: the lookup
-   prints the secret. Again with a wrong password (the error shows, the
-   field is empty and still has the keyboard), with Escape (the lookup
-   ends without a secret), and from a fullscreen window (the prompt still
-   gets the keyboard). With a security key enrolled: "Use security key",
-   then the PIN and touch screens. Switch the Omarchy theme while a prompt
-   is open: it re-themes. Leave a prompt unanswered past `prompt.timeout`
-   (`alephctl config set prompt.timeout 30` to wait less; set it back to
-   300 after): the window stays. With it open, `alephctl unlock` in a
-   terminal: the window closes, the terminal asks, and the lookup prints
-   the secret. Without a graphical session (a text
-   console, `WAYLAND_DISPLAY` unset), the lookup waits, and `alephctl
-   unlock` in another terminal ends it. After a reboot with SDDM autologin
-   (alephd starts before Hyprland), the first lookup opens the prompt.
+3. **The unlock prompt** (Plan 5a). Each check starts from `alephctl
+   lock`, then `secret-tool lookup service aleph-check`:
+   - The prompt opens floating in the middle of the screen, with the
+     keyboard on its password field. The login password: the lookup prints
+     the secret.
+   - A wrong password: the error shows, the field is empty and still has
+     the keyboard; then the right one.
+   - Escape: the window closes and the lookup ends without a secret.
+   - From a fullscreen window: the prompt still gets the keyboard.
+   - With a security key enrolled: "Use security key", then the PIN and
+     touch screens.
+   - Switch the Omarchy theme while the prompt is open: it re-themes.
+   - Leave it unanswered past `prompt.timeout` (`alephctl config set
+     prompt.timeout 30` to wait less; it asks you to confirm it is you; set
+     it back to 300 after): the window stays.
+   - With the window open, `alephctl unlock` in a terminal: the window
+     closes, the terminal asks, and the lookup prints the secret.
+   - With the window open, `passwd`: the window closes and `passwd`
+     completes; the lookup keeps waiting until an unlock (`alephctl
+     unlock`).
+   - Without a graphical session, the lookup waits and `alephctl unlock` in
+     another terminal ends it: log in on a text console with Hyprland not
+     running (alephd reads the display from the user manager, so unsetting
+     `WAYLAND_DISPLAY` in a terminal changes nothing).
+   - After a reboot with SDDM autologin (alephd starts before Hyprland),
+     the first lookup opens the prompt.
 4. **Chromium:** start it with `--password-store=gnome-libsecret`, save a
    site password, quit, `alephctl lock`, start Chromium again, and
    unlock in the prompt. Saved passwords must still be there
@@ -151,17 +168,18 @@ gnome-keyring-daemon.service gnome-keyring-daemon.socket`):
    reconnect, and unlock when asked: the connection must come up without
    asking for the Wi-Fi password again.
 6. **Setup and login unlock** (Plan 4c), on a test account with
-   gnome-keyring running and a few items in it (Seahorse). Install first:
-   `make && make install` (it asks for sudo, then reloads the user
-   units, restarts alephd, and starts `alephd.socket`).
-   The client is `alephctl`: `aleph` on PATH is TeX's (texlive-bin).
+   gnome-keyring running and a few items in it (Seahorse), after `make &&
+   make install` (it asks for sudo, then reloads the user units, restarts
+   alephd, and starts `alephd.socket`).
    - `alephctl setup`: it reports the TPM, creates the keyring, imports the
      items (`secret-tool lookup` finds them through aleph), switches over
      (`alephctl status` says alephd serves the Secret Service;
      `systemctl --user is-enabled gnome-keyring-daemon.socket` says
-     masked), and offers the root step: answer yes, and `sudo` runs
-     `alephctl system apply`, which asks the login password once and checks
-     the lock screen and the login with it.
+     masked), offers the prompt's Hyprland window rule (Lua configuration
+     only: `~/.config/hypr/hyprland.lua` gets the include), and offers the
+     root step: answer yes, and `sudo` runs `alephctl system apply`, which
+     asks the login password once and checks the lock screen and the login
+     with it.
    - Keep a root shell open until the lock screen has been tried: a TTY
      login is the way back in (`system-login`, `system-auth`, and `login`
      are never edited).
@@ -181,8 +199,9 @@ gnome-keyring-daemon.service gnome-keyring-daemon.socket`):
      itself (it runs as you) before walking away.
    - `alephctl setup --revert`: it asks the login password, copies
      everything back, and gnome-keyring serves the Secret Service again
-     (with the items stored in aleph meanwhile); `sudo alephctl system
-     revert` restores the PAM files byte for byte.
+     (with the items stored in aleph meanwhile), and the include is gone
+     from `hyprland.lua` (the rest of the file as it was); `sudo alephctl
+     system revert` restores the PAM files byte for byte.
 7. `alephctl status` shows the keyslots; `journalctl --user` (or the
    terminal) shows no secrets.
 8. **Backup and restore** (Plan 4b):
