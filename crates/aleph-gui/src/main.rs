@@ -41,10 +41,7 @@ fn manage() -> ExitCode {
         .with_app_id("aleph")
         .with_title("aleph")
         .with_inner_size(manager::SIZE);
-    let options = eframe::NativeOptions {
-        viewport,
-        ..Default::default()
-    };
+    let options = aleph_gui::native_options(viewport);
     let result = eframe::run_native(
         "aleph",
         options,
@@ -101,10 +98,7 @@ fn prompt() -> ExitCode {
         .with_max_inner_size(screens::SIZE)
         .with_resizable(false)
         .with_active(true);
-    let options = eframe::NativeOptions {
-        viewport,
-        ..Default::default()
-    };
+    let options = aleph_gui::native_options(viewport);
     let result = eframe::run_native(
         "aleph-prompt",
         options,
