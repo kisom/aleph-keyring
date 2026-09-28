@@ -35,6 +35,11 @@ Adopted, each with a test that failed without it:
   re-indented for reading, by a walk over the text into a zeroized string
   sized beforehand (parsing it into values would leave unzeroized copies);
   COPY and EDIT use the secret as stored.
+- **The list and the detail share the width by a proportion,** evenly at
+  first: the divider drags (the list at least 160 px, the detail 240 px),
+  and the share it leaves holds when the window is retiled. A fixed
+  280 px list left the detail too narrow at half a screen (Hyprland's
+  side-by-side tiling).
 - **Both windows run without vsync:** Mesa's Wayland swap waits for a
   frame callback, which Hyprland never sends a window on a hidden
   workspace, so the first repaint there (a store event, a timer) blocked

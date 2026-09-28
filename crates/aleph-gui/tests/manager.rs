@@ -101,6 +101,10 @@ fn vault() -> Vault {
 }
 
 fn window(theme: ThemeChoice, v: Vault) -> (Window, Fake, Clip) {
+    window_sized(theme, v, SIZE)
+}
+
+fn window_sized(theme: ThemeChoice, v: Vault, size: [f32; 2]) -> (Window, Fake, Clip) {
     let store = Fake::default();
     let clip = Clip::default();
     let home = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/home");
@@ -113,7 +117,7 @@ fn window(theme: ThemeChoice, v: Vault) -> (Window, Fake, Clip) {
     let palette = m.palette.clone();
     store.send(StoreEvent::Vault(v));
     let mut h = Harness::builder()
-        .with_size(egui::Vec2::from(SIZE))
+        .with_size(egui::Vec2::from(size))
         .build_ui_state(|ui, m: &mut Manager<Fake, Clip>| m.frame(ui), m);
     aleph_gui::theme::apply(&h.ctx, &palette);
     frames(&mut h);
@@ -727,6 +731,76 @@ fn enter_on_the_delete_question_says_no() {
 fn without_alephd_the_link_is_down() {
     let (h, _, _) = window(ThemeChoice::Neon, Vault::Unreachable("no such name".into()));
     h.get_by_label("LINK DOWN");
+}
+
+/// The list's right edge (its search field spans it).
+fn list_edge(h: &Window) -> f32 {
+    h.get_by_label("Search").rect().right()
+}
+
+/// Half a screen (Hyprland's side-by-side tiling): the list and the
+/// detail share what the navigation leaves, evenly.
+#[test]
+fn a_narrow_window_splits_list_and_detail_evenly() {
+    let (mut h, _, _) = window_sized(ThemeChoice::Neon, vault(), [640.0, 560.0]);
+    h.get_by_label("GitHub token").click();
+    frames(&mut h);
+    let edge = list_edge(&h);
+    let detail = 640.0 - edge;
+    assert!(detail > 230.0, "the detail pane is {detail} wide");
+    assert!(
+        (edge - (130.0 + 255.0)).abs() < 20.0,
+        "the list ends at {edge}"
+    );
+}
+
+/// The divider between the list and the detail drags.
+#[test]
+fn the_list_divider_drags() {
+    let (mut h, _, _) = window_sized(ThemeChoice::Neon, vault(), [640.0, 560.0]);
+    frames(&mut h);
+    let before = list_edge(&h);
+    let x = before + 8.0;
+    let y = 300.0;
+    let button = |pressed| egui::Event::PointerButton {
+        pos: egui::pos2(x - 60.0, y),
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    h.event(egui::Event::PointerMoved(egui::pos2(x, y)));
+    frames(&mut h);
+    h.event(egui::Event::PointerButton {
+        pos: egui::pos2(x, y),
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    });
+    frames(&mut h);
+    for step in 1..=6 {
+        h.event(egui::Event::PointerMoved(egui::pos2(
+            x - 10.0 * step as f32,
+            y,
+        )));
+        h.step();
+    }
+    h.event(button(false));
+    frames(&mut h);
+    let after = list_edge(&h);
+    assert!(
+        after < before - 40.0,
+        "the list ended at {before}, now {after}"
+    );
+    // Retiled to full width: the list keeps its share, not its width.
+    let share = (after - 130.0) / (640.0 - 130.0);
+    h.set_size(egui::vec2(1200.0, 560.0));
+    frames(&mut h);
+    let wide = list_edge(&h);
+    let expected = 130.0 + share * (1200.0 - 130.0);
+    assert!(
+        (wide - expected).abs() < 20.0,
+        "the list ends at {wide}, not {expected}"
+    );
 }
 
 /// Every view, in both themes.

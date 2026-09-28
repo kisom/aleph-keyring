@@ -55,6 +55,11 @@ pub enum Shown {
     Binary(usize),
 }
 
+/// The list panel, and the least width it and the detail get.
+const LIST: &str = "aleph-list";
+const LIST_MIN: f32 = 160.0;
+const DETAIL_MIN: f32 = 240.0;
+
 /// The most of a shown secret's height the pane gives it (it scrolls).
 const SECRET_HEIGHT: f32 = 220.0;
 
@@ -100,6 +105,10 @@ pub struct Manager<S: Store, B: Backend> {
     pub status: Option<String>,
     /// A secret asked for, and what for.
     awaiting: Option<(String, Want)>,
+    /// The list's share of the width the navigation leaves (the rest is
+    /// the detail's), and that width when last drawn.
+    list_share: f32,
+    list_room: f32,
     /// What runs once the reveal guard confirms.
     pending: Option<(String, Want)>,
     /// The reveal guard's conversation, drawn in the detail pane.
@@ -136,6 +145,8 @@ impl<S: Store, B: Backend> Manager<S, B> {
             mode: Mode::Browse,
             status: None,
             awaiting: None,
+            list_share: 0.5,
+            list_room: 0.0,
             pending: None,
             confirm: None,
             confirm_guard: crate::app::INPUT_GUARD,
@@ -467,8 +478,25 @@ impl<S: Store, B: Backend> Manager<S, B> {
         collections: &[Collection],
         now: Instant,
     ) {
-        egui::Panel::left("aleph-list")
-            .default_size(280.0)
+        // The list and the detail share the width, evenly at first; the
+        // divider drags, and the share it leaves holds when the window is
+        // retiled (half a screen, side by side, leaves little).
+        let room = ui.available_width();
+        let range = if room >= LIST_MIN + DETAIL_MIN {
+            LIST_MIN..=room - DETAIL_MIN
+        } else {
+            room / 2.0..=room / 2.0
+        };
+        if room != self.list_room {
+            // (The panel keeps its last width: forget it, so the share
+            // applies to the new room.)
+            ui.ctx()
+                .data_mut(|d| d.remove::<egui::containers::panel::PanelState>(egui::Id::new(LIST)));
+            self.list_room = room;
+        }
+        let list = egui::Panel::left(LIST)
+            .default_size((self.list_share * room).clamp(*range.start(), *range.end()))
+            .size_range(range)
             .resizable(true)
             .show(ui, |ui| {
                 ui.add_space(6.0);
@@ -549,6 +577,9 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     self.select(s);
                 }
             });
+        if room > 0.0 {
+            self.list_share = list.response.rect.width() / room;
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             self.status_line(ui, p);
             if self.confirm.is_some() {
