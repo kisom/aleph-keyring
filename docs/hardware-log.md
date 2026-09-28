@@ -3,6 +3,19 @@
 Results of the manual checks in [testing.md](testing.md), newest first.
 Each release's notes summarize the entries since the previous release.
 
+## 2026-09-28, commit f07550b (Plan 5b and follow-ups)
+
+Host: as below. Installed with `make && make install` at about 15:30.
+The manager's checks in testing.md were not run one by one; these are
+the owner's findings while using it.
+
+| Finding | Result |
+|---|---|
+| A long secret (JSON) ran off the detail pane | Fixed in 3f0cc5b: it scrolls both ways, and JSON is indented |
+| Switching to another workspace brought up Hyprland's "Application Not Responding" for the manager | Fixed in 2826d04 (no vsync: DECISIONS.md). Confirmed by the owner after installing f07550b: no dialog on switching away |
+| The prompt's title should look like the manager's "VAULT SEALED" | Done in f07550b (capitals, the warning color) |
+| `/tmp` full of `dbus-*` sockets | Not aleph on the live system: the test suite's private buses (10,735 sockets, removed). Fixed in 079c22e |
+
 ## 2026-09-28, commits 46686ef and f1daf20 (Plan 5a)
 
 Host: as below (Framework Laptop 12, Intel PTT), Omarchy 4.0.4, kernel
