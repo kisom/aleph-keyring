@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=aleph
+GenericName=Keyring
+Comment=Browse and edit the secrets in your aleph keyring
+Exec=aleph-gui
+Icon=aleph
+Terminal=false
+Categories=Utility;Security;
+Keywords=keyring;password;secret;vault;
+StartupWMClass=aleph

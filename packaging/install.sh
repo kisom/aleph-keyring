@@ -31,6 +31,13 @@ install)
     install -Dm755 "$R/libpam_aleph.so" /usr/lib/security/pam_aleph.so
     install -Dm644 packaging/pam/aleph-check /etc/pam.d/aleph-check
     install -Dm644 packaging/hyprland/aleph-prompt.lua /usr/share/aleph/hyprland/aleph-prompt.lua
+    install -Dm644 packaging/aleph-gui.desktop /usr/share/applications/aleph-gui.desktop
+    install -Dm644 assets/icons/aleph.svg /usr/share/icons/hicolor/scalable/apps/aleph.svg
+    install -Dm644 assets/icons/aleph-24.svg /usr/share/icons/hicolor/24x24/apps/aleph.svg
+    install -Dm644 assets/icons/aleph-16.svg /usr/share/icons/hicolor/16x16/apps/aleph.svg
+    install -Dm644 assets/icons/aleph-symbolic.svg /usr/share/icons/hicolor/symbolic/apps/aleph-symbolic.svg
+    gtk-update-icon-cache -q -t /usr/share/icons/hicolor 2>/dev/null || true
+    update-desktop-database -q /usr/share/applications 2>/dev/null || true
     install -Dm644 -t /usr/lib/systemd/system \
         packaging/systemd/aleph-tpmd.service packaging/systemd/aleph-tpmd.socket
     install -Dm644 -t /usr/lib/systemd/user \
@@ -60,6 +67,9 @@ uninstall)
     systemctl disable --now aleph-tpmd.socket aleph-tpmd.service || true
     rm -f /usr/bin/alephctl /usr/bin/aleph-gui /usr/lib/aleph/alephd /usr/lib/aleph/aleph-tpmd \
         /usr/share/aleph/hyprland/aleph-prompt.lua \
+        /usr/share/applications/aleph-gui.desktop \
+        /usr/share/icons/hicolor/scalable/apps/aleph.svg /usr/share/icons/hicolor/24x24/apps/aleph.svg \
+        /usr/share/icons/hicolor/16x16/apps/aleph.svg /usr/share/icons/hicolor/symbolic/apps/aleph-symbolic.svg \
         /usr/lib/security/pam_aleph.so /etc/pam.d/aleph-check \
         /usr/lib/systemd/system/aleph-tpmd.service /usr/lib/systemd/system/aleph-tpmd.socket \
         /usr/lib/systemd/user/alephd.service /usr/lib/systemd/user/alephd.socket \
