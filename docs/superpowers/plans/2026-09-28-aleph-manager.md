@@ -11,7 +11,7 @@
 
 **Tech Stack:** Rust 1.98; eframe/egui 0.36 (as in Plan 5a); zbus 5 on a tokio current-thread runtime (the store's thread); `wl-clipboard-rs` 0.9; egui_kittest 0.36 (screens and snapshots); the daemon's test harness (a real alephd on a private bus, swtpm) for the store's tests.
 
-**Spec:** `docs/superpowers/specs/2026-09-28-aleph-manager-design.md` (the manager's design; the owner reviewed it), extending `docs/superpowers/specs/2026-09-26-aleph-design.md` §6 (admin methods), §7 (Manager), §8 (installs). Decisions: `DECISIONS.md` H7 (the owner's: scope and approach) and H8 (calls made while prototyping); Task 7 adds both and updates the main spec.
+**Spec:** `docs/superpowers/specs/2026-09-28-aleph-manager-design.md` (the manager's design; the owner reviewed it), extending `docs/superpowers/specs/2026-09-26-aleph-design.md` §6 (admin methods), §7 (Manager), §8 (installs). Decisions: `DECISIONS.md` H7 (the owner's: scope and approach), H8 (calls made while prototyping), and H9 (the pre-execution review's fixes); Task 7 adds them and updates the main spec.
 
 **Plan series:** 1–5a (done) → **5b the manager's window and secrets (this plan)** → 5c settings → 5d admin → 6 packaging and CI.
 
@@ -23,10 +23,12 @@
 
 Every task was prototyped on a clone of `master` and the whole gate run (`make gate`) green; the code below is that prototype's, verbatim. The properties below were each checked by reverting them (the "teeth" step of the owning task). `DECISIONS.md` H8 lists these calls for the reviewers.
 
-- **The lock state is polled, the lists are not.** alephd sends no signal when the keyring locks (its objects just go), so the store reads one property (`Locked` on `/org/freedesktop/secrets/aliases/default`) every 2 s and lists everything only when that changes or an item or collection signal arrives (listing costs a few calls per item).
-- **Each request runs on its own** on the store's thread: an unlock prompt may wait for the person indefinitely (H5). Only the session is shared, under a lock held just to encrypt or decrypt; a failed `GetSecret` (alephd restarted: its sessions went with it) drops the session, and the next request opens a new one.
+- **The lock state is polled as well as signalled, the lists are not.** alephd signals a lock (`CollectionChanged` on the default alias); the store also reads one property (`Locked` on `/org/freedesktop/secrets/aliases/default`) every 2 s, for a missed signal or a restart, and lists everything only when that changes or a signal arrives (listing costs a few calls per item). With the default folder deleted (its alias goes too), the service answering means unlocked.
+- **Only the store's loop lists:** each request runs on its own (an unlock prompt may wait for the person indefinitely, H5) and asks the loop for a fresh listing when it ends, so what the loop last sent is what the window shows. Folders or items that vanish mid-listing are skipped; a burst of signals means one listing; signals are taken only from the service's owner.
+- **Sessions follow alephd (and are their openers'):** the store's session is tied to the unique name serving `org.freedesktop.secrets`, closed and replaced when a request using it fails, and that request is tried once more. alephd now serves a session only to the client that opened it (it numbers sessions from 1 on every start: after a restart another client could be handed the manager's cached path).
 - **The confirmation reuses the prompter:** `PromptApp` gains `embedded` (it then never closes or resizes the window, and ignores the window's close button); the manager draws it in the detail pane on a socketpair whose other end goes to `Reauth`.
-- **The copy is served by `wl-clipboard-rs`** from a thread until another program takes the clipboard; "still ours" is whether that thread is serving. The served copy is the crate's and is not zeroized (the manager spec: not guaranteed).
+- **The copy is served by `wl-clipboard-rs`** from a thread until another program takes the clipboard (or the manager exits); "still ours" is whether that thread is serving. The served copy is the crate's and is not zeroized (the manager spec: not guaranteed). **It is cleared by a timer thread** 30 s after the copy (if it is still that copy), never by the window's frames: a window on a hidden workspace draws none.
+- **An edit saves only what changed** (a loaded secret is rewritten only if it differs; a secret that is not text cannot be loaded into the editor), and **a form stays until its save succeeds** (a failed save keeps what was typed, with the error; a lock keeps a secret the person typed).
 - **New items get `xdg:schema = org.freedesktop.Secret.Generic`** unless one is typed; secrets are stored as `text/plain`.
 - **Dates are UTC calendar days;** a secret that is not UTF-8 shows as "binary secret, N bytes" (and can still be copied).
 - **No folder marker:** "▸" is not in the Omarchy theme's font (it drew a box); folders are bold, items indented.
@@ -48,11 +50,11 @@ Every task was prototyped on a clone of `master` and the whole gate run (`make g
 
 ## Review Focus
 
-1. **Walking away with a secret on screen or on the clipboard:** a lock hides what is shown and forgets the confirmation; a copy is cleared after 30 s unless something else was copied since. → Task 5 `a_lock_seals_the_window`; Task 4 `a_copy_is_cleared_after_thirty_seconds`, `a_copy_replaced_since_is_left_alone`, `a_confirmation_holds_five_minutes_and_not_past_a_lock`.
-2. **alephd stopped or restarted while the manager is open:** `LINK DOWN`, then recovery without restarting the manager; a secret asked for after a restart still comes (a new session). → Task 3 `without_alephd_the_store_is_unreachable`; Task 5 `without_alephd_the_link_is_down`; the restart itself is a manual check (testing.md, "The manager", step 8).
-3. **Odd data from other programs:** a label with line breaks or hundreds of characters, a secret that is not text, an item without attributes. → Task 5 `a_hostile_label_stays_on_one_line_in_the_list`, `a_binary_secret_is_not_shown`.
-4. **A keyring with hundreds of items:** the lists are fetched only on a change, never on every poll. → Task 3's poll loop (only `Locked` is read each tick); no test counts calls: the reviewer checks it.
-5. **Destructive actions by accident:** deleting asks with No as the default; a folder deletion is confirmed by alephd; an edit saves only what changed (a label edit never rewrites the secret). → Task 5 `delete_asks_first`, `an_edited_label_is_saved`; Task 3 `folders_are_created_and_deleted_after_alephds_confirmation`.
+1. **Walking away with a secret on screen or on the clipboard,** the manager hidden on another workspace: a lock hides what is shown and forgets the confirmation; the copy is cleared after 30 s by its own timer, unless something else was copied since. → Task 5 `a_lock_seals_the_window`; Task 4 `a_copy_is_cleared_after_its_time_without_the_window`, `a_copy_replaced_since_is_left_alone`, `a_newer_copy_keeps_its_own_time`, `a_confirmation_holds_five_minutes_and_not_past_a_lock`.
+2. **alephd restarted while the manager is open** (`make install`, an upgrade): shows and saves keep working on a new session, never on another client's. → Task 2 `a_session_is_usable_only_by_the_client_that_opened_it`; Task 3 `a_forgotten_session_is_replaced`, `without_alephd_the_store_is_unreachable`; Task 5 `without_alephd_the_link_is_down`.
+3. **An edit that loses or mangles data:** a label edit after LOAD SECRET, a binary secret, a save that fails, a lock mid-edit. → Task 5 `a_loaded_secret_is_saved_only_if_changed`, `a_binary_secret_is_not_editable`, `a_failed_save_keeps_the_form`, `a_typed_secret_survives_a_lock`, `an_edited_label_is_saved`.
+4. **Odd data and odd folders:** a hostile label, a secret that is not text, the default folder deleted. → Task 5 `a_hostile_label_stays_on_one_line_in_the_list`, `a_binary_secret_is_not_shown`; Task 3 `deleting_the_default_folder_keeps_the_keyring_reachable`.
+5. **Destructive actions by accident:** deleting asks with No the default (Enter says No); a folder deletion is confirmed by alephd. → Task 5 `delete_asks_first`, `enter_on_the_delete_question_says_no`; Task 3 `folders_are_created_and_deleted_after_alephds_confirmation`. (A keyring with hundreds of items: the lists are fetched only on a change, never on each poll; no test counts calls: the reviewer checks Task 3's loop.)
 
 ## File Structure
 
@@ -397,15 +399,15 @@ git add Cargo.toml Cargo.lock crates/aleph-secret-session crates/aleph-daemon
 git commit -m "refactor: the Secret Service sessions in a crate of their own" -m "aleph-secret-session: the plain and DH sessions, server and client halves, moved from alephd unchanged but for randomness from getrandom directly; the manager window will use the client half." -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
 
-### Task 2: alephd: `Reauth`
+### Task 2: alephd: `Reauth`, and sessions that are their openers'
 
 **Files:**
-- Modify: `crates/aleph-daemon/src/keyring.rs` (`Keyring::confirm`), `crates/aleph-daemon/src/admin.rs` (`Reauth`), `crates/aleph-daemon/tests/admin.rs`
+- Modify: `crates/aleph-daemon/src/keyring.rs` (`Keyring::confirm`), `crates/aleph-daemon/src/admin.rs` (`Reauth`), `crates/aleph-daemon/src/secret/service.rs` (sessions checked against their opener; `forget_sessions` for tests), `crates/aleph-daemon/tests/admin.rs`, `crates/aleph-daemon/tests/secret_service.rs`
 
 **Interfaces:**
-- Produces: `Keyring::confirm(&self, &mut Channel) -> Result<()>`; admin method `io.aleph.Admin1.Reauth(prompter: h)` (a conversation: `Begin { purpose: Reauth, operation: "Confirm it is you (…)" }`, the method choice, `Done`; changes nothing).
+- Produces: `Keyring::confirm(&self, &mut Channel) -> Result<()>`; admin method `io.aleph.Admin1.Reauth(prompter: h)` (a conversation: `Begin { purpose: Reauth, operation: "Confirm it is you" }`, the method choice, `Done`; changes nothing). A session serves only the client that opened it (`NoSession` otherwise). `SecretService::forget_sessions(&self)` (feature `testing`: as a restart does).
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
 Add at the end of `crates/aleph-daemon/tests/admin.rs`:
 
@@ -442,10 +444,57 @@ async fn reauth_confirms_and_changes_nothing() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+Add at the end of `crates/aleph-daemon/tests/secret_service.rs`:
+
+```rust
+/// A session is its opener's: another client naming its path (a stale
+/// one kept across an alephd restart, where numbering starts again) gets
+/// `NoSession`, never secrets under someone else's key.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_is_usable_only_by_the_client_that_opened_it() {
+    let s = served(vec![]).await;
+    secret_tool(&s, &["store", "--label=T", "service", "x"], Some("pw")).await;
+    let (a, b) = (client(&s).await, client(&s).await);
+    let (_, session): (OwnedValue, OwnedObjectPath) = service(&a)
+        .await
+        .call("OpenSession", &("plain", zbus::zvariant::Value::from("")))
+        .await
+        .unwrap();
+    let (items, _): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) = service(&a)
+        .await
+        .call(
+            "SearchItems",
+            &(std::collections::HashMap::from([("service", "x")]),),
+        )
+        .await
+        .unwrap();
+    let get = |c: &zbus::Connection| {
+        let (c, item, session) = (c.clone(), items[0].clone(), session.clone());
+        async move {
+            zbus::Proxy::new(
+                &c,
+                "org.freedesktop.secrets",
+                item,
+                "org.freedesktop.Secret.Item",
+            )
+            .await
+            .unwrap()
+            .call_method("GetSecret", &(session,))
+            .await
+        }
+    };
+    assert!(get(&a).await.is_ok());
+    let err = get(&b).await.unwrap_err().to_string();
+    assert!(err.contains("NoSession"), "{err}");
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -q -p aleph-daemon --test admin reauth_confirms`
 Expected: FAIL: `org.freedesktop.DBus.Error.UnknownMethod`, "Unknown method 'Reauth'".
+Run: `cargo test -q -p aleph-daemon --test secret_service a_session_is_usable`
+Expected: FAIL at `unwrap_err()`: the second client's `GetSecret` with the first client's session succeeds.
 
 - [ ] **Step 3: Implement**
 
@@ -458,10 +507,8 @@ In `crates/aleph-daemon/src/keyring.rs`, add before `/// Replace the recovery ke
     pub fn confirm(&self, chan: &mut Channel) -> Result<()> {
         let _op = self.begin(chan)?;
         converse(chan, |chan| {
-            self.reauth(
-                chan,
-                "Confirm it is you (any program running as you can read secrets; this only guards against a glance)",
-            )?;
+            // (The manager says what the guard is worth, beside it.)
+            self.reauth(chan, "Confirm it is you")?;
             Ok(None)
         })
     }
@@ -477,20 +524,220 @@ In `crates/aleph-daemon/src/admin.rs`, add before `    async fn rotate_master(&s
     }
 ```
 
+In `crates/aleph-daemon/src/secret/service.rs` (sessions are their openers': every use passes the caller's name), replace
+
+```rust
+    fn session(&self, p: &ObjectPath<'_>) -> Result<SessionGuard<'_>> {
+        let sessions = self.sessions.lock().unwrap();
+        if !sessions.contains_key(&OwnedObjectPath::from(p.to_owned())) {
+            return Err(SecretError::NoSession(format!("no session {p}")));
+        }
+        Ok(SessionGuard {
+            sessions,
+            path: OwnedObjectPath::from(p.to_owned()),
+        })
+    }
+```
+
+with
+
+```rust
+    /// The session at `p`, if `sender` opened it: a session is its
+    /// opener's (another client naming the path, such as a stale one kept
+    /// across an alephd restart, where numbering starts again, gets
+    /// `NoSession`).
+    fn session(&self, p: &ObjectPath<'_>, sender: Option<&str>) -> Result<SessionGuard<'_>> {
+        let sessions = self.sessions.lock().unwrap();
+        let owner = sessions
+            .get(&OwnedObjectPath::from(p.to_owned()))
+            .map(|(_, owner)| owner.as_deref());
+        match owner {
+            Some(owner) if owner.is_none() || sender.is_none() || owner == sender => {}
+            _ => return Err(SecretError::NoSession(format!("no session {p}"))),
+        }
+        Ok(SessionGuard {
+            sessions,
+            path: OwnedObjectPath::from(p.to_owned()),
+        })
+    }
+```
+
+replace
+
+```rust
+    fn secret_for(&self, session: &ObjectPath<'_>, item: &Item) -> Result<SecretStruct> {
+        let guard = self.session(session)?;
+```
+
+with
+
+```rust
+    fn secret_for(
+        &self,
+        session: &ObjectPath<'_>,
+        sender: Option<&str>,
+        item: &Item,
+    ) -> Result<SecretStruct> {
+        let guard = self.session(session, sender)?;
+```
+
+replace
+
+```rust
+    fn decrypt(&self, secret: &SecretStruct) -> Result<SecretBytes> {
+        let guard = self.session(&secret.0.as_ref())?;
+```
+
+with
+
+```rust
+    fn decrypt(&self, secret: &SecretStruct, sender: Option<&str>) -> Result<SecretBytes> {
+        let guard = self.session(&secret.0.as_ref(), sender)?;
+```
+
+replace
+
+```rust
+    async fn get_secrets(
+        &self,
+        items: Vec<OwnedObjectPath>,
+        session: OwnedObjectPath,
+    ) -> Result<HashMap<OwnedObjectPath, SecretStruct>> {
+        let found: Vec<(OwnedObjectPath, Item)> = self.svc.keyring.read(|b| {
+            items
+                .iter()
+                .filter_map(|p| {
+                    let (c, i) = parse_item(&p.as_ref())?;
+                    let item = b.collection(c)?.items.iter().find(|x| x.id == i)?;
+                    Some((p.clone(), item.clone()))
+                })
+                .collect()
+        })?;
+        let mut out = HashMap::new();
+        for (p, item) in found {
+            out.insert(p, self.svc.secret_for(&session.as_ref(), &item)?);
+        }
+        Ok(out)
+    }
+```
+
+with
+
+```rust
+    async fn get_secrets(
+        &self,
+        items: Vec<OwnedObjectPath>,
+        session: OwnedObjectPath,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+    ) -> Result<HashMap<OwnedObjectPath, SecretStruct>> {
+        let sender = hdr.sender().map(|s| s.to_string());
+        let found: Vec<(OwnedObjectPath, Item)> = self.svc.keyring.read(|b| {
+            items
+                .iter()
+                .filter_map(|p| {
+                    let (c, i) = parse_item(&p.as_ref())?;
+                    let item = b.collection(c)?.items.iter().find(|x| x.id == i)?;
+                    Some((p.clone(), item.clone()))
+                })
+                .collect()
+        })?;
+        let mut out = HashMap::new();
+        for (p, item) in found {
+            out.insert(
+                p,
+                self.svc
+                    .secret_for(&session.as_ref(), sender.as_deref(), &item)?,
+            );
+        }
+        Ok(out)
+    }
+```
+
+replace
+
+```rust
+    async fn get_secret(&self, session: OwnedObjectPath) -> Result<(SecretStruct,)> {
+        let item = self.with(Item::clone)?;
+        Ok((self.svc.secret_for(&session.as_ref(), &item)?,))
+    }
+
+    async fn set_secret(&self, secret: SecretStruct) -> Result<()> {
+        let value = self.svc.decrypt(&secret)?;
+```
+
+with
+
+```rust
+    async fn get_secret(
+        &self,
+        session: OwnedObjectPath,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+    ) -> Result<(SecretStruct,)> {
+        let item = self.with(Item::clone)?;
+        let sender = hdr.sender().map(|s| s.to_string());
+        Ok((self
+            .svc
+            .secret_for(&session.as_ref(), sender.as_deref(), &item)?,))
+    }
+
+    async fn set_secret(
+        &self,
+        secret: SecretStruct,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+    ) -> Result<()> {
+        let sender = hdr.sender().map(|s| s.to_string());
+        let value = self.svc.decrypt(&secret, sender.as_deref())?;
+```
+
+replace
+
+```rust
+    async fn create_item(
+        &self,
+        properties: HashMap<String, OwnedValue>,
+        secret: SecretStruct,
+        replace: bool,
+    ) -> Result<(OwnedObjectPath, OwnedObjectPath)> {
+```
+
+with
+
+```rust
+    async fn create_item(
+        &self,
+        properties: HashMap<String, OwnedValue>,
+        secret: SecretStruct,
+        replace: bool,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+    ) -> Result<(OwnedObjectPath, OwnedObjectPath)> {
+        let sender = hdr.sender().map(|s| s.to_string());
+```
+
+replace `        let value = self.svc.decrypt(&secret)?;` (in `create_item`) with `        let value = self.svc.decrypt(&secret, sender.as_deref())?;`, and add after `pub fn session_count`:
+
+```rust
+    /// Forget every session, as a restart does (the manager's tests).
+    #[cfg(feature = "testing")]
+    pub fn forget_sessions(&self) {
+        self.sessions.lock().unwrap().clear();
+    }
+```
+
 - [ ] **Step 4: Run the tests, clippy, and fmt**
 
-Run: `cargo test -q -p aleph-daemon --test admin && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
-Expected: `ok. 4 passed`.
+Run: `cargo test -q -p aleph-daemon --test admin --test secret_service && cargo test -q -p aleph-daemon && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
+Expected: `ok. 4 passed` (admin), `ok. 18 passed` (secret_service), then every aleph-daemon test binary ok.
 
 - [ ] **Step 5: Confirm the test has teeth**
 
-In `admin.rs`, replace `self.converse(prompter, |k, chan| k.confirm(chan))` with `self.converse(prompter, |k, chan| { let _ = k; chan.done(true, None); Ok(()) })`; `cargo test -q -p aleph-daemon --test admin reauth_confirms` FAILS (no `Begin`, and the wrong password is accepted); undo it.
+- In `admin.rs`, replace `self.converse(prompter, |k, chan| k.confirm(chan))` with `self.converse(prompter, |k, chan| { let _ = k; chan.done(true, None); Ok(()) })`; `cargo test -q -p aleph-daemon --test admin reauth_confirms` FAILS (no `Begin`, and the wrong password is accepted); undo it.
+- In `service.rs`, replace `Some(owner) if owner.is_none() || sender.is_none() || owner == sender => {}` with `Some(_) => {}`; `cargo test -q -p aleph-daemon --test secret_service a_session_is_usable` FAILS; undo it.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add crates/aleph-daemon
-git commit -m "feat: Reauth, the admin method that proves an enrolled method and nothing else" -m "The manager's guard before it shows or copies a secret (a guard against a glance, not security)." -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git commit -m "feat: Reauth; a Secret Service session serves only its opener" -m "Reauth proves an enrolled method and nothing else: the manager's guard before it shows or copies a secret. Sessions were numbered from 1 on every start and checked only for existence, so after a restart another client could be handed a stale path; now NoSession." -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
 
 ### Task 3: the manager's store
@@ -507,6 +754,7 @@ git commit -m "feat: Reauth, the admin method that proves an enrolled method and
   - `Request`: `Unlock`, `Secret(String)`, `SetLabel { path, label }`, `SetSecret { path, secret: Zeroizing<Vec<u8>> }`, `CreateItem { collection, label, attributes: BTreeMap<String, String>, secret: Zeroizing<Vec<u8>> }`, `DeleteItem(String)`, `CreateCollection(String)`, `DeleteCollection(String)`, `Reauth(OwnedFd)`; `Request::name(&self) -> &'static str`
   - `StoreEvent`: `Vault(Vault)`, `Secret { path, secret: Zeroizing<Vec<u8>>, content_type: String }`, `Done { request: &'static str, error: Option<String>, dismissed: bool }`
   - `trait Store { fn request(&self, Request); fn events(&self) -> Vec<StoreEvent>; }`; `DbusStore::start(Option<String>, impl Fn() + Send + Sync + 'static) -> DbusStore` (implements `Store`); `POLL: Duration` (2 s)
+  - `Request::name`: `unlock`, `fetch the secret`, `rename`, `change the secret`, `create the item`, `delete the item`, `create the folder`, `delete the folder`, `confirm`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -756,6 +1004,68 @@ async fn reauth_converses_on_the_windows_socket() {
     );
 }
 
+/// After alephd forgets every session (as a restart does), a secret is
+/// still shown and an item still created: the store opens a new session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forgotten_session_is_replaced() {
+    let d = daemon(true, vec![]).await;
+    let mut store = Probe::new(&d.bus.address);
+    let cols = store.unlocked(|c| !c.is_empty()).await;
+    let default = cols[0].path.clone();
+    let create = |label: &str| Request::CreateItem {
+        collection: default.clone(),
+        label: label.into(),
+        attributes: BTreeMap::new(),
+        secret: Zeroizing::new(b"one".to_vec()),
+    };
+    store.request(create("A"));
+    assert_eq!(store.done("create the item").await, (None, false));
+    let cols = store.unlocked(|c| item(c, "A").is_some()).await;
+    let a = item(&cols, "A").unwrap().path.clone();
+    store.request(Request::Secret(a.clone()));
+    assert_eq!(store.done("fetch the secret").await.0, None);
+    d.secrets.forget_sessions();
+    store.request(Request::Secret(a));
+    assert_eq!(store.done("fetch the secret").await.0, None);
+    d.secrets.forget_sessions();
+    store.request(create("B"));
+    assert_eq!(store.done("create the item").await, (None, false));
+    store.unlocked(|c| item(c, "B").is_some()).await;
+}
+
+/// Deleting the default folder (its alias goes with it) leaves the
+/// keyring unlocked, not unreachable.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_the_default_folder_keeps_the_keyring_reachable() {
+    let yes = || vec![FromPrompter::Confirm { yes: true }];
+    let d = daemon(true, vec![yes(), yes()]).await;
+    let mut store = Probe::new(&d.bus.address);
+    store.unlocked(|c| !c.is_empty()).await;
+    store.request(Request::CreateCollection("work".into()));
+    assert_eq!(store.done("create the folder").await, (None, false));
+    let cols = store
+        .unlocked(|c| c.iter().any(|c| c.label == "work"))
+        .await;
+    let default = cols.iter().find(|c| c.is_default).unwrap().path.clone();
+    store.request(Request::DeleteCollection(default));
+    assert_eq!(store.done("delete the folder").await, (None, false));
+    let cols = store
+        .unlocked(|c| c.iter().all(|c| !c.is_default) && c.iter().any(|c| c.label == "work"))
+        .await;
+    assert_eq!(cols.len(), 1);
+    // And it stays so across polls.
+    tokio::time::sleep(aleph_gui::store::POLL * 2).await;
+    store.pending.extend(store.store.events());
+    assert!(
+        !store
+            .pending
+            .iter()
+            .any(|e| matches!(e, StoreEvent::Vault(Vault::Unreachable(_)))),
+        "{:?}",
+        store.pending
+    );
+}
+
 /// With no alephd, the store says so (and keeps trying).
 #[tokio::test(flavor = "multi_thread")]
 async fn without_alephd_the_store_is_unreachable() {
@@ -792,7 +1102,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use aleph_secret_session::{ClientDh, DH, Session};
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use zbus::Connection;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 use zeroize::Zeroizing;
@@ -803,15 +1113,19 @@ const DEFAULT_ALIAS: &str = "/org/freedesktop/secrets/aliases/default";
 const SERVICE: &str = "org.freedesktop.Secret.Service";
 const COLLECTION: &str = "org.freedesktop.Secret.Collection";
 const ITEM: &str = "org.freedesktop.Secret.Item";
+const SESSION: &str = "org.freedesktop.Secret.Session";
 const PROMPT: &str = "org.freedesktop.Secret.Prompt";
 const SESSION_COLLECTION: &str = "/org/freedesktop/secrets/collection/session";
 const ADMIN_NAME: &str = "io.aleph.Keyring";
 const ADMIN_PATH: &str = "/io/aleph/Admin";
 const ADMIN: &str = "io.aleph.Admin1";
 
-/// How often the lock state is checked: alephd sends no signal when the
-/// keyring locks (its objects just go).
+/// How often the lock state is checked, besides the signals alephd sends
+/// (one missed, or alephd restarting, is caught within this).
 pub const POLL: Duration = Duration::from_secs(2);
+
+/// How long a burst of signals may run before the lists are fetched once.
+const SETTLE: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item {
@@ -876,7 +1190,7 @@ impl Request {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Unlock => "unlock",
-            Self::Secret(_) => "secret",
+            Self::Secret(_) => "fetch the secret",
             Self::SetLabel { .. } => "rename",
             Self::SetSecret { .. } => "change the secret",
             Self::CreateItem { .. } => "create the item",
@@ -1001,22 +1315,39 @@ async fn connect(address: &Option<String>) -> Result<Connection, String> {
     }
 }
 
+/// The session: its keys, its path, and the unique name of the alephd
+/// that opened it.
+type Opened = (Session, OwnedObjectPath, String);
+
 /// The client on its thread (cheap to clone: each request runs on its
 /// own, and an unlock prompt may wait for the person indefinitely).
 #[derive(Clone)]
 struct Client {
     conn: Connection,
-    /// The encrypted session and its path, opened on first use.
-    session: std::sync::Arc<tokio::sync::Mutex<Option<(Session, OwnedObjectPath)>>>,
+    /// Opened on first use, and again for another alephd (sessions do not
+    /// survive a restart).
+    session: std::sync::Arc<tokio::sync::Mutex<Option<Opened>>>,
 }
 
 impl Client {
-    /// Run `f` with the session (opened if need be).
+    /// Who serves the Secret Service now (its unique name).
+    async fn owner(&self) -> Result<String, String> {
+        let dbus = zbus::fdo::DBusProxy::new(&self.conn).await.map_err(err)?;
+        let name = zbus::names::BusName::try_from(SECRETS).map_err(err)?;
+        Ok(dbus.get_name_owner(name).await.map_err(err)?.to_string())
+    }
+
+    /// Run `f` with the session, opened if need be, and again if another
+    /// alephd serves now.
     async fn with_session<T>(
         &self,
         f: impl FnOnce(&Session, &OwnedObjectPath) -> Result<T, String>,
     ) -> Result<T, String> {
+        let owner = self.owner().await?;
         let mut guard = self.session.lock().await;
+        if guard.as_ref().is_some_and(|(_, _, o)| *o != owner) {
+            *guard = None;
+        }
         if guard.is_none() {
             let service = proxy(&self.conn, SERVICE_PATH, SERVICE).await?;
             let dh = ClientDh::new().map_err(err)?;
@@ -1025,23 +1356,43 @@ impl Client {
                 .await
                 .map_err(err)?;
             let server: Vec<u8> = output.try_into().map_err(err)?;
-            *guard = Some((dh.finish(&server).map_err(err)?, path));
+            *guard = Some((dh.finish(&server).map_err(err)?, path, owner));
         }
-        let (session, path) = guard.as_ref().expect("just opened");
+        let (session, path, _) = guard.as_ref().expect("just opened");
         f(session, path)
     }
 
-    /// Forget the session (alephd restarted: its sessions went with it).
-    async fn drop_session(&self) {
-        *self.session.lock().await = None;
+    /// Drop the session (it failed: alephd forgot it, or it is not ours),
+    /// closing it if the same alephd still serves.
+    async fn reset_session(&self) {
+        let old = self.session.lock().await.take();
+        if let Some((_, path, owner)) = old
+            && self.owner().await.is_ok_and(|o| o == owner)
+            && let Ok(p) = proxy(&self.conn, path.as_str(), SESSION).await
+        {
+            let _ = p.call_method("Close", &()).await;
+        }
     }
 
+    /// Whether the keyring is locked. While locked alephd serves only the
+    /// default alias (locked); while unlocked the alias may be gone (its
+    /// folder deleted), and then the service answering is enough.
     async fn locked(&self) -> Result<bool, String> {
-        proxy(&self.conn, DEFAULT_ALIAS, COLLECTION)
+        let alias = proxy(&self.conn, DEFAULT_ALIAS, COLLECTION)
             .await?
-            .get_property("Locked")
-            .await
-            .map_err(err)
+            .get_property::<bool>("Locked")
+            .await;
+        match alias {
+            Ok(locked) => Ok(locked),
+            Err(_) => {
+                let _: Vec<OwnedObjectPath> = proxy(&self.conn, SERVICE_PATH, SERVICE)
+                    .await?
+                    .get_property("Collections")
+                    .await
+                    .map_err(err)?;
+                Ok(false)
+            }
+        }
     }
 
     async fn vault(&self) -> Vault {
@@ -1057,45 +1408,61 @@ impl Client {
         }
         let service = proxy(&self.conn, SERVICE_PATH, SERVICE).await?;
         let paths: Vec<OwnedObjectPath> = service.get_property("Collections").await.map_err(err)?;
-        let default: OwnedObjectPath = service
-            .call("ReadAlias", &("default",))
-            .await
-            .map_err(err)?;
+        let default: Option<OwnedObjectPath> = service.call("ReadAlias", &("default",)).await.ok();
         let mut out = Vec::new();
         for path in paths {
             if path.as_str() == SESSION_COLLECTION || path.as_str().contains("/aliases/") {
                 continue;
             }
-            let c = proxy(&self.conn, path.as_str(), COLLECTION).await?;
-            let item_paths: Vec<OwnedObjectPath> = c.get_property("Items").await.map_err(err)?;
-            let mut items = Vec::new();
-            for ip in item_paths {
-                let i = proxy(&self.conn, ip.as_str(), ITEM).await?;
-                let attributes: HashMap<String, String> =
-                    i.get_property("Attributes").await.map_err(err)?;
-                items.push(Item {
-                    path: ip.to_string(),
-                    label: i.get_property("Label").await.map_err(err)?,
-                    attributes: attributes.into_iter().collect(),
-                    created: i.get_property("Created").await.unwrap_or(0),
-                    modified: i.get_property("Modified").await.unwrap_or(0),
-                });
+            // (A folder or item deleted while it is listed is skipped, not
+            // an error.)
+            if let Some(c) = self.collection(&path, default.as_ref()).await {
+                out.push(c);
             }
-            items.sort_by_key(|i| i.label.to_lowercase());
-            out.push(Collection {
-                is_default: path == default,
-                label: c.get_property("Label").await.map_err(err)?,
-                path: path.to_string(),
-                items,
-            });
         }
-        // The default collection first, then by label.
+        // The default folder first, then by label.
         out.sort_by(|a, b| {
             b.is_default
                 .cmp(&a.is_default)
                 .then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase()))
         });
         Ok(Vault::Unlocked(out))
+    }
+
+    async fn collection(
+        &self,
+        path: &OwnedObjectPath,
+        default: Option<&OwnedObjectPath>,
+    ) -> Option<Collection> {
+        let c = proxy(&self.conn, path.as_str(), COLLECTION).await.ok()?;
+        let item_paths: Vec<OwnedObjectPath> = c.get_property("Items").await.ok()?;
+        let label: String = c.get_property("Label").await.ok()?;
+        let mut items = Vec::new();
+        for ip in item_paths {
+            if let Some(i) = self.item(ip).await {
+                items.push(i);
+            }
+        }
+        items.sort_by_key(|i| i.label.to_lowercase());
+        Some(Collection {
+            is_default: default == Some(path),
+            label,
+            path: path.to_string(),
+            items,
+        })
+    }
+
+    /// One item's label, attributes, and times (`None` if it went).
+    async fn item(&self, path: OwnedObjectPath) -> Option<Item> {
+        let i = proxy(&self.conn, path.as_str(), ITEM).await.ok()?;
+        let attributes: HashMap<String, String> = i.get_property("Attributes").await.ok()?;
+        Some(Item {
+            label: i.get_property("Label").await.ok()?,
+            attributes: attributes.into_iter().collect(),
+            created: i.get_property("Created").await.unwrap_or(0),
+            modified: i.get_property("Modified").await.unwrap_or(0),
+            path: path.to_string(),
+        })
     }
 
     /// The secret as the session wraps it for alephd.
@@ -1108,6 +1475,53 @@ impl Client {
             Ok((path.clone(), params, value, "text/plain".into()))
         })
         .await
+    }
+
+    async fn fetch(&self, path: &str) -> Result<StoreEvent, String> {
+        let session_path = self.with_session(|_, p| Ok(p.clone())).await?;
+        type Wrapped = ((OwnedObjectPath, Vec<u8>, Vec<u8>, String),);
+        let ((_, params, value, content_type),): Wrapped = proxy(&self.conn, path, ITEM)
+            .await?
+            .call("GetSecret", &(session_path,))
+            .await
+            .map_err(err)?;
+        let secret = self
+            .with_session(|session, _| {
+                Ok(Zeroizing::new(
+                    session.decrypt(&params, &value).map_err(err)?.to_vec(),
+                ))
+            })
+            .await?;
+        Ok(StoreEvent::Secret {
+            path: path.to_string(),
+            secret,
+            content_type,
+        })
+    }
+
+    async fn set_secret(&self, path: &str, secret: &[u8]) -> Result<(), String> {
+        let wrapped = self.wrap(secret).await?;
+        proxy(&self.conn, path, ITEM)
+            .await?
+            .call::<_, _, ()>("SetSecret", &(wrapped,))
+            .await
+            .map_err(err)
+    }
+
+    async fn create(
+        &self,
+        collection: &str,
+        props: &HashMap<&str, Value<'_>>,
+        secret: &[u8],
+    ) -> Result<OwnedObjectPath, String> {
+        let wrapped = self.wrap(secret).await?;
+        let (_, prompt): (OwnedObjectPath, OwnedObjectPath) =
+            proxy(&self.conn, collection, COLLECTION)
+                .await?
+                .call("CreateItem", &(props, wrapped, false))
+                .await
+                .map_err(err)?;
+        Ok(prompt)
     }
 
     /// Run a prompt alephd returned ("/" for none); `true` if dismissed.
@@ -1128,7 +1542,9 @@ impl Client {
         }
     }
 
-    /// Carry out one request: `(dismissed, secret event)`.
+    /// Carry out one request: `(dismissed, secret event)`. A request that
+    /// uses the session is tried once more on a new one if it fails
+    /// (alephd may have restarted and forgotten ours).
     async fn handle(&self, request: Request) -> Result<(bool, Option<StoreEvent>), String> {
         match request {
             Request::Unlock => {
@@ -1143,32 +1559,14 @@ impl Client {
                 Ok((self.prompt(&prompt).await?, None))
             }
             Request::Secret(path) => {
-                let session_path = self.with_session(|_, p| Ok(p.clone())).await?;
-                let i = proxy(&self.conn, &path, ITEM).await?;
-                type Wrapped = ((OwnedObjectPath, Vec<u8>, Vec<u8>, String),);
-                let ((_, params, value, content_type),): Wrapped =
-                    match i.call("GetSecret", &(session_path,)).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            self.drop_session().await;
-                            return Err(err(e));
-                        }
-                    };
-                let secret = self
-                    .with_session(|session, _| {
-                        Ok(Zeroizing::new(
-                            session.decrypt(&params, &value).map_err(err)?.to_vec(),
-                        ))
-                    })
-                    .await?;
-                Ok((
-                    false,
-                    Some(StoreEvent::Secret {
-                        path,
-                        secret,
-                        content_type,
-                    }),
-                ))
+                let secret = match self.fetch(&path).await {
+                    Ok(s) => s,
+                    Err(_) => {
+                        self.reset_session().await;
+                        self.fetch(&path).await?
+                    }
+                };
+                Ok((false, Some(secret)))
             }
             Request::SetLabel { path, label } => {
                 proxy(&self.conn, &path, ITEM)
@@ -1179,12 +1577,10 @@ impl Client {
                 Ok((false, None))
             }
             Request::SetSecret { path, secret } => {
-                let wrapped = self.wrap(&secret).await?;
-                proxy(&self.conn, &path, ITEM)
-                    .await?
-                    .call::<_, _, ()>("SetSecret", &(wrapped,))
-                    .await
-                    .map_err(err)?;
+                if self.set_secret(&path, &secret).await.is_err() {
+                    self.reset_session().await;
+                    self.set_secret(&path, &secret).await?;
+                }
                 Ok((false, None))
             }
             Request::CreateItem {
@@ -1203,13 +1599,13 @@ impl Client {
                     "org.freedesktop.Secret.Item.Attributes",
                     Value::from(attributes),
                 );
-                let wrapped = self.wrap(&secret).await?;
-                let (_, prompt): (OwnedObjectPath, OwnedObjectPath) =
-                    proxy(&self.conn, &collection, COLLECTION)
-                        .await?
-                        .call("CreateItem", &(props, wrapped, false))
-                        .await
-                        .map_err(err)?;
+                let prompt = match self.create(&collection, &props, &secret).await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        self.reset_session().await;
+                        self.create(&collection, &props, &secret).await?
+                    }
+                };
                 Ok((self.prompt(&prompt).await?, None))
             }
             Request::DeleteItem(path) => {
@@ -1278,10 +1674,12 @@ async fn run(
             }
         }
     };
-    // Item and collection signals from whoever serves the Secret Service
-    // (alephd): any of them means the lists changed.
+    // Signals from whoever serves the Secret Service (alephd): any of them
+    // means the lists may have changed.
     let rule = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
+        .sender(SECRETS)
+        .expect("a valid name")
         .path_namespace(SERVICE_PATH)
         .expect("a valid path")
         .build();
@@ -1292,6 +1690,9 @@ async fn run(
         conn: conn.clone(),
         session: Default::default(),
     };
+    // Requests ask for a fresh listing when they end; only this loop lists,
+    // so what it last sent is always what the window shows.
+    let (refresh_tx, mut refresh) = tokio::sync::mpsc::unbounded_channel::<()>();
     let mut last = client.vault().await;
     emit.send(StoreEvent::Vault(last.clone()));
     let mut poll = tokio::time::interval(POLL);
@@ -1299,33 +1700,43 @@ async fn run(
         let changed = tokio::select! {
             r = requests.recv() => {
                 let Some(r) = r else { return };
-                // (Each request runs on its own: an unlock prompt may wait
-                // for the person indefinitely.)
-                let (client, emit) = (client.clone(), emit.clone());
+                let (client, emit, refresh_tx) = (client.clone(), emit.clone(), refresh_tx.clone());
                 tokio::spawn(async move {
                     let name = r.name();
-                    let result = client.handle(r).await;
-                    match result {
+                    match client.handle(r).await {
                         Ok((dismissed, secret)) => {
                             if let Some(s) = secret {
                                 emit.send(s);
                             }
                             emit.send(StoreEvent::Done { request: name, error: None, dismissed });
                         }
-                        Err(e) => emit.send(StoreEvent::Done { request: name, error: Some(e), dismissed: false }),
+                        Err(e) => {
+                            // (Operations and reasons only: never a secret
+                            // or a label.)
+                            eprintln!("aleph-gui: cannot {name}: {e}");
+                            emit.send(StoreEvent::Done { request: name, error: Some(e), dismissed: false });
+                        }
                     }
-                    emit.send(StoreEvent::Vault(client.vault().await));
+                    let _ = refresh_tx.send(());
                 });
                 false
             }
+            Some(()) = refresh.recv() => true,
             m = async {
                 match &mut signals {
                     Some(s) => s.next().await,
                     None => std::future::pending().await,
                 }
-            } => m.is_some(),
-            // (Only the lock state is polled: listing every item each
-            // time would cost a few calls per item.)
+            } => {
+                // (A burst of signals means one listing.)
+                tokio::time::sleep(SETTLE).await;
+                if let Some(s) = &mut signals {
+                    while let Some(Some(_)) = s.next().now_or_never() {}
+                }
+                m.is_some()
+            }
+            // (Only the lock state is polled: listing every item each time
+            // would cost a few calls per item.)
             _ = poll.tick() => {
                 let locked = client.locked().await.ok();
                 let known = match &last {
@@ -1350,11 +1761,15 @@ async fn run(
 - [ ] **Step 4: Run the tests, clippy, and fmt**
 
 Run: `cargo test -q -p aleph-gui --test store && cargo test -q -p aleph-gui && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
-Expected: `ok. 5 passed` (store), then every aleph-gui test binary ok (the library's 20 unit tests unchanged).
+Expected: `ok. 7 passed` (store), then every aleph-gui test binary ok (the library's 20 unit tests unchanged).
 
 - [ ] **Step 5: Confirm the tests have teeth**
 
-In `store.rs`, replace `.or_insert_with(|| "org.freedesktop.Secret.Generic".into());` with `.or_insert_with(String::new);`; `cargo test -q -p aleph-gui --test store items_are_listed` FAILS; undo it.
+Make each change in `store.rs`, run the named test and see it FAIL, then undo it:
+
+- **the generic schema** (`items_are_listed`): replace `.or_insert_with(|| "org.freedesktop.Secret.Generic".into());` with `.or_insert_with(String::new);`.
+- **a new session after a failure** (`a_forgotten_session_is_replaced`): in `Request::Secret`'s arm, replace the `Err(_) => { self.reset_session().await; self.fetch(&path).await? }` arm with `Err(e) => return Err(e),`.
+- **the default alias gone** (`deleting_the_default_folder_keeps_the_keyring_reachable`): in `locked`, make an `Err` from the alias's `Locked` an error (`Err(e) => Err(err(e)),`) instead of asking the service.
 
 - [ ] **Step 6: Commit**
 
@@ -1370,7 +1785,7 @@ git commit -m "feat(gui): the manager's store, a Secret Service client" -m "Co-A
 - Modify: `crates/aleph-gui/Cargo.toml` (`wl-clipboard-rs`), `crates/aleph-gui/src/lib.rs`
 
 **Interfaces:**
-- Produces: `reauth::{HOLD, Reauth}` with `Reauth::{needed(&self, Instant) -> bool, confirmed(&mut self, Instant), forget(&mut self)}` (`Default`); `clipboard::{KEEP, HINT_TYPE, HINT, Backend, Clipboard, Wayland}` with `trait Backend { fn offer(&mut self, Zeroizing<Vec<u8>>) -> Result<(), String>; fn still_ours(&self) -> bool; fn clear(&mut self); }`, `Clipboard::{new(B) -> Self, copy(&mut self, Zeroizing<Vec<u8>>, Instant) -> Result<(), String>, tick(&mut self, Instant) -> Option<Duration>, backend(&self) -> &B}`, `Wayland: Default + Backend`.
+- Produces: `reauth::{HOLD, Reauth}` with `Reauth::{needed(&self, Instant) -> bool, confirmed(&mut self, Instant), forget(&mut self)}` (`Default`); `clipboard::{KEEP, HINT_TYPE, HINT, Backend, Clipboard, Wayland}` with `trait Backend: Send + 'static { fn offer(&mut self, Zeroizing<Vec<u8>>) -> Result<(), String>; fn still_ours(&self) -> bool; fn clear(&mut self); }`, `Clipboard::{new(B) -> Self, with_keep(B, Duration) -> Self, copy(&self, Zeroizing<Vec<u8>>) -> Result<(), String>}` (the clearing runs on its own timer thread), `Wayland: Default + Backend`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1428,53 +1843,72 @@ mod tests {
     use super::*;
 
     #[derive(Default)]
-    struct Fake {
+    struct State {
         held: Option<Vec<u8>>,
         replaced: bool,
         cleared: usize,
     }
 
+    #[derive(Clone, Default)]
+    struct Fake(Arc<Mutex<State>>);
+
     impl Backend for Fake {
         fn offer(&mut self, secret: Zeroizing<Vec<u8>>) -> Result<(), String> {
-            self.held = Some(secret.to_vec());
-            self.replaced = false;
+            let mut s = self.0.lock().unwrap();
+            s.held = Some(secret.to_vec());
+            s.replaced = false;
             Ok(())
         }
         fn still_ours(&self) -> bool {
-            self.held.is_some() && !self.replaced
+            let s = self.0.lock().unwrap();
+            s.held.is_some() && !s.replaced
         }
         fn clear(&mut self) {
-            self.held = None;
-            self.cleared += 1;
+            let mut s = self.0.lock().unwrap();
+            s.held = None;
+            s.cleared += 1;
         }
     }
 
+    const KEEP: Duration = Duration::from_millis(60);
+
+    /// Cleared by its own timer: no frame, no call, needed.
     #[test]
-    fn a_copy_is_cleared_after_thirty_seconds() {
-        let t = Instant::now();
-        let mut c = Clipboard::new(Fake::default());
-        c.copy(Zeroizing::new(b"pw".to_vec()), t).unwrap();
-        assert_eq!(
-            c.tick(t + Duration::from_secs(10)),
-            Some(Duration::from_secs(20))
-        );
-        assert!(c.backend().held.is_some());
-        assert_eq!(c.tick(t + KEEP), None);
-        assert!(c.backend().held.is_none());
-        assert_eq!(c.backend().cleared, 1);
-        // Nothing pending any more.
-        assert_eq!(c.tick(t + KEEP * 2), None);
+    fn a_copy_is_cleared_after_its_time_without_the_window() {
+        let fake = Fake::default();
+        let c = Clipboard::with_keep(fake.clone(), KEEP);
+        c.copy(Zeroizing::new(b"pw".to_vec())).unwrap();
+        assert!(fake.0.lock().unwrap().held.is_some());
+        std::thread::sleep(KEEP * 3);
+        let s = fake.0.lock().unwrap();
+        assert!(s.held.is_none());
+        assert_eq!(s.cleared, 1);
     }
 
-    /// Something copied since is not cleared.
+    /// Something another program copied since is not cleared.
     #[test]
     fn a_copy_replaced_since_is_left_alone() {
-        let t = Instant::now();
-        let mut c = Clipboard::new(Fake::default());
-        c.copy(Zeroizing::new(b"pw".to_vec()), t).unwrap();
-        c.backend.replaced = true;
-        c.tick(t + KEEP);
-        assert_eq!(c.backend().cleared, 0);
+        let fake = Fake::default();
+        let c = Clipboard::with_keep(fake.clone(), KEEP);
+        c.copy(Zeroizing::new(b"pw".to_vec())).unwrap();
+        fake.0.lock().unwrap().replaced = true;
+        std::thread::sleep(KEEP * 3);
+        assert_eq!(fake.0.lock().unwrap().cleared, 0);
+    }
+
+    /// A newer copy is not cleared by an older copy's timer.
+    #[test]
+    fn a_newer_copy_keeps_its_own_time() {
+        let fake = Fake::default();
+        let c = Clipboard::with_keep(fake.clone(), KEEP);
+        c.copy(Zeroizing::new(b"one".to_vec())).unwrap();
+        std::thread::sleep(KEEP / 2);
+        c.copy(Zeroizing::new(b"two".to_vec())).unwrap();
+        std::thread::sleep(KEEP * 3 / 4);
+        // (The first timer fired: the second copy stays.)
+        assert_eq!(fake.0.lock().unwrap().held.as_deref(), Some(&b"two"[..]));
+        std::thread::sleep(KEEP * 2);
+        assert!(fake.0.lock().unwrap().held.is_none());
     }
 }
 ```
@@ -1527,9 +1961,13 @@ Put this above the tests in `crates/aleph-gui/src/clipboard.rs`:
 ```rust
 //! Copying a secret (the manager spec): offered with the hint
 //! clipboard-history tools honor (`x-kde-passwordManagerHint: secret`),
-//! and cleared after 30 s if the clipboard still holds it.
+//! and cleared after 30 s if the clipboard still holds it. The clearing
+//! runs on a timer thread of its own, not with the window's frames: a
+//! window on a hidden workspace draws none.
 
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use zeroize::Zeroizing;
 
@@ -1542,7 +1980,7 @@ pub const HINT_TYPE: &str = "x-kde-passwordManagerHint";
 pub const HINT: &[u8] = b"secret";
 
 /// The clipboard itself.
-pub trait Backend {
+pub trait Backend: Send + 'static {
     /// Offer `secret` as text (with the hint).
     fn offer(&mut self, secret: Zeroizing<Vec<u8>>) -> Result<(), String>;
     /// Whether the clipboard still holds our offer.
@@ -1552,50 +1990,60 @@ pub trait Backend {
 
 /// Copies with an expiry.
 pub struct Clipboard<B: Backend> {
-    backend: B,
-    expires: Option<Instant>,
+    backend: Arc<Mutex<B>>,
+    /// Which copy is the latest (a timer clears only its own).
+    copies: Arc<AtomicU64>,
+    keep: Duration,
 }
 
 impl<B: Backend> Clipboard<B> {
     pub fn new(backend: B) -> Self {
+        Self::with_keep(backend, KEEP)
+    }
+
+    /// With another expiry (the tests').
+    pub fn with_keep(backend: B, keep: Duration) -> Self {
         Self {
-            backend,
-            expires: None,
+            backend: Arc::new(Mutex::new(backend)),
+            copies: Arc::default(),
+            keep,
         }
     }
 
-    pub fn copy(&mut self, secret: Zeroizing<Vec<u8>>, now: Instant) -> Result<(), String> {
-        self.backend.offer(secret)?;
-        self.expires = Some(now + KEEP);
+    /// Offer `secret`, and clear it after the expiry if it is still ours
+    /// and nothing was copied through here since.
+    pub fn copy(&self, secret: Zeroizing<Vec<u8>>) -> Result<(), String> {
+        self.backend
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .offer(secret)?;
+        let this = self.copies.fetch_add(1, Ordering::SeqCst) + 1;
+        let (backend, copies, keep) = (self.backend.clone(), self.copies.clone(), self.keep);
+        std::thread::Builder::new()
+            .name("aleph-clipboard".into())
+            .spawn(move || {
+                std::thread::sleep(keep);
+                if copies.load(Ordering::SeqCst) != this {
+                    return;
+                }
+                let mut b = backend.lock().unwrap_or_else(|e| e.into_inner());
+                if b.still_ours() {
+                    b.clear();
+                }
+            })
+            .map_err(|e| e.to_string())?;
         Ok(())
-    }
-
-    /// Clear an expired copy that is still ours. Returns when to look
-    /// again, if a copy is pending.
-    pub fn tick(&mut self, now: Instant) -> Option<Duration> {
-        let at = self.expires?;
-        if now < at {
-            return Some(at - now);
-        }
-        self.expires = None;
-        if self.backend.still_ours() {
-            self.backend.clear();
-        }
-        None
-    }
-
-    pub fn backend(&self) -> &B {
-        &self.backend
     }
 }
 
 /// The Wayland clipboard (the wlr data-control protocol, which Hyprland
 /// has). The offer is served from a thread until another program takes
-/// the clipboard or it is cleared; the served copy is the crate's, and is
-/// not zeroized (the manager spec: not guaranteed).
+/// the clipboard or it is cleared (or the manager exits: the copy goes
+/// with it); the served copy is the crate's, and is not zeroized (the
+/// manager spec: not guaranteed).
 #[derive(Default)]
 pub struct Wayland {
-    serving: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    serving: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Backend for Wayland {
@@ -1616,18 +2064,18 @@ impl Backend for Wayland {
         let prepared = options
             .prepare_copy_multi(sources)
             .map_err(|e| e.to_string())?;
-        let serving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let serving = Arc::new(std::sync::atomic::AtomicBool::new(true));
         self.serving = serving.clone();
         std::thread::spawn(move || {
             // Returns once the offer is replaced or cleared.
             let _ = prepared.serve();
-            serving.store(false, std::sync::atomic::Ordering::SeqCst);
+            serving.store(false, Ordering::SeqCst);
         });
         Ok(())
     }
 
     fn still_ours(&self) -> bool {
-        self.serving.load(std::sync::atomic::Ordering::SeqCst)
+        self.serving.load(Ordering::SeqCst)
     }
 
     fn clear(&mut self) {
@@ -1640,18 +2088,19 @@ impl Backend for Wayland {
 - [ ] **Step 4: Run the tests, clippy, and fmt**
 
 Run: `cargo test -q -p aleph-gui --lib && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
-Expected: `ok. 23 passed`.
+Expected: `ok. 24 passed`.
 
 - [ ] **Step 5: Confirm the tests have teeth**
 
-- `clipboard.rs`: replace `        if self.backend.still_ours() {` with `        if true {`; `cargo test -q -p aleph-gui --lib a_copy_replaced` FAILS; undo it.
+- `clipboard.rs`: replace `                if b.still_ours() {` with `                if true {`; `cargo test -q -p aleph-gui --lib a_copy_replaced` FAILS; undo it.
+- `clipboard.rs`: replace `                if copies.load(Ordering::SeqCst) != this {` with `                if true {`; `cargo test -q -p aleph-gui --lib a_copy_is_cleared` FAILS (nothing clears); undo it.
 - `reauth.rs`: replace `.is_none_or(|at| now.duration_since(at) >= HOLD)` with `.is_none_or(|_| false)`; `cargo test -q -p aleph-gui --lib a_confirmation_holds` FAILS; undo it.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add Cargo.lock crates/aleph-gui
-git commit -m "feat(gui): the confirmation clock and the clipboard (30 s, hinted)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git commit -m "feat(gui): the confirmation clock and the clipboard (hinted, cleared after 30 s on its own timer)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
 
 ### Task 5: the manager window
@@ -1662,7 +2111,7 @@ git commit -m "feat(gui): the confirmation clock and the clipboard (30 s, hinted
 
 **Interfaces:**
 - Consumes: Task 3's store types; Task 4's `Reauth`, `Clipboard`, `Backend`, `Wayland`; Plan 5a's `PromptApp`, `conversation::{Screen, shown}`, `link::spawn_reader`, `theme`, `settings`.
-- Produces: `manager::{SIZE, Manager, Selection, Want, Shown, Mode, date}`; `Manager::new(S, B, Settings, Option<PathBuf>, bool) -> Self`, `Manager::frame(&mut self, &mut egui::Ui)`, `Manager::watch_theme(&mut self, &egui::Context)`, public fields `store`, `clipboard`, `reauth`, `vault`, `search`, `selected`, `shown`, `mode`, `status`, `confirm_guard`, `palette`; `impl eframe::App`. `PromptApp.embedded: bool`. `theme::Watch::{start(&Path, &egui::Context) -> Option<Watch>, changed(&self) -> bool}`.
+- Produces: `manager::{SIZE, Manager, Selection, Want, Shown, Mode, date}` (`Mode::Edit { path, label, secret: Option<Zeroizing<String>>, original: Option<Zeroizing<String>> }`); `Manager::new(S, B, Settings, Option<PathBuf>, bool) -> Self`, `Manager::frame(&mut self, &mut egui::Ui)`, `Manager::watch_theme(&mut self, &egui::Context)`, public fields `store`, `clipboard`, `reauth`, `vault`, `search`, `selected`, `shown`, `mode`, `status`, `confirm_guard`, `saving`, `palette`; `impl eframe::App`. `PromptApp.embedded: bool` (it also paints no scanlines of its own then). `theme::Watch::{start(&Path, &egui::Context) -> Option<Watch>, changed(&self) -> bool}`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1732,18 +2181,18 @@ impl Fake {
 }
 
 #[derive(Clone, Default)]
-struct Clip(Rc<RefCell<Option<Vec<u8>>>>);
+struct Clip(std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>);
 
 impl Backend for Clip {
     fn offer(&mut self, secret: Zeroizing<Vec<u8>>) -> Result<(), String> {
-        *self.0.borrow_mut() = Some(secret.to_vec());
+        *self.0.lock().unwrap() = Some(secret.to_vec());
         Ok(())
     }
     fn still_ours(&self) -> bool {
-        self.0.borrow().is_some()
+        self.0.lock().unwrap().is_some()
     }
     fn clear(&mut self) {
-        *self.0.borrow_mut() = None;
+        *self.0.lock().unwrap() = None;
     }
 }
 
@@ -1945,7 +2394,7 @@ fn a_copy_goes_to_the_clipboard() {
         content_type: "text/plain".into(),
     });
     frames(&mut h);
-    assert_eq!(clip.0.borrow().as_deref(), Some(&b"ghp_s3cret"[..]));
+    assert_eq!(clip.0.lock().unwrap().as_deref(), Some(&b"ghp_s3cret"[..]));
     assert!(h.query_by_label("ghp_s3cret").is_none());
     h.get_by_label_contains("COPIED");
 }
@@ -2097,6 +2546,132 @@ fn a_hostile_label_stays_on_one_line_in_the_list() {
     assert!(text.chars().count() <= 61, "{}", text.chars().count());
 }
 
+fn secret(store: &Fake, path: &str, bytes: &[u8]) {
+    store.send(StoreEvent::Secret {
+        path: path.into(),
+        secret: Zeroizing::new(bytes.to_vec()),
+        content_type: "text/plain".into(),
+    });
+}
+
+fn done(store: &Fake, request: &'static str, error: Option<&str>) {
+    store.send(StoreEvent::Done {
+        request,
+        error: error.map(Into::into),
+        dismissed: false,
+    });
+}
+
+/// After LOAD SECRET, a save sends only what changed: an unchanged secret
+/// is not rewritten.
+#[test]
+fn a_loaded_secret_is_saved_only_if_changed() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.state_mut().reauth.confirmed(Instant::now());
+    h.get_by_label("GitHub token").click();
+    frames(&mut h);
+    h.get_by_label("EDIT").click();
+    frames(&mut h);
+    h.get_by_label("LOAD SECRET").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Secret(_)));
+    secret(&store, "/c/login/1", b"ghp_s3cret");
+    frames(&mut h);
+    type_into(&mut h, "Label", "!");
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::SetLabel { .. }));
+}
+
+/// A secret that is not text is not loaded into the editor.
+#[test]
+fn a_binary_secret_is_not_editable() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.state_mut().reauth.confirmed(Instant::now());
+    h.get_by_label("GitHub token").click();
+    frames(&mut h);
+    h.get_by_label("EDIT").click();
+    frames(&mut h);
+    h.get_by_label("LOAD SECRET").click();
+    frames(&mut h);
+    store.take();
+    secret(&store, "/c/login/1", &[0xff, 0xfe]);
+    frames(&mut h);
+    assert!(h.query_by_label("Secret").is_none());
+    h.get_by_label_contains("not editable");
+}
+
+/// A save that fails keeps the form, with what was typed; one that
+/// succeeds closes it.
+#[test]
+fn a_failed_save_keeps_the_form() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("+ ITEM").click();
+    frames(&mut h);
+    type_into(&mut h, "Label", "Router");
+    type_into(&mut h, "Secret", "admin123");
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::CreateItem { .. }));
+    h.get_by_label("SAVING…");
+    done(
+        &store,
+        "create the item",
+        Some("org.freedesktop.Secret.Error.IsLocked"),
+    );
+    frames(&mut h);
+    assert_eq!(h.get_by_label("Label").value().as_deref(), Some("Router"));
+    h.get_by_label_contains("cannot create the item");
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::CreateItem { .. }));
+    done(&store, "create the item", None);
+    frames(&mut h);
+    assert!(h.query_by_label("Label").is_none());
+}
+
+/// A secret typed into the editor survives a lock, and is saved after the
+/// unlock.
+#[test]
+fn a_typed_secret_survives_a_lock() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.state_mut().reauth.confirmed(Instant::now());
+    h.get_by_label("GitHub token").click();
+    frames(&mut h);
+    h.get_by_label("EDIT").click();
+    frames(&mut h);
+    h.get_by_label("LOAD SECRET").click();
+    frames(&mut h);
+    store.take();
+    secret(&store, "/c/login/1", b"old");
+    frames(&mut h);
+    type_into(&mut h, "Secret", "new");
+    store.send(StoreEvent::Vault(Vault::Locked));
+    frames(&mut h);
+    store.send(StoreEvent::Vault(vault()));
+    frames(&mut h);
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    match only(store.take()) {
+        Request::SetSecret { secret, .. } => assert_eq!(&secret[..], b"oldnew"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Enter on the delete question answers its default: No.
+#[test]
+fn enter_on_the_delete_question_says_no() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("VPN").click();
+    frames(&mut h);
+    h.get_by_label("DELETE").click();
+    frames(&mut h);
+    h.key_press(egui::Key::Enter);
+    frames(&mut h);
+    assert!(store.take().is_empty());
+    assert!(h.query_by_label("Delete 'VPN'?").is_none());
+}
+
 #[test]
 fn without_alephd_the_link_is_down() {
     let (h, _, _) = window(ThemeChoice::Neon, Vault::Unreachable("no such name".into()));
@@ -2137,6 +2712,35 @@ fn snapshots() {
         h.get_by_label("+ ITEM").click();
         frames(&mut h);
         shot(&mut h, "new");
+        // The confirmation, drawn inside the window (alephd has asked).
+        let (mut h, store, _) = window(theme, vault());
+        h.get_by_label("GitHub token").click();
+        frames(&mut h);
+        h.get_by_label("SHOW").click();
+        frames(&mut h);
+        let Request::Reauth(fd) = only(store.take()) else {
+            panic!("no confirmation");
+        };
+        let alephd = std::thread::spawn(move || {
+            let mut chan = Channel::from_fd(fd, Duration::from_secs(10)).unwrap();
+            chan.send(&ToPrompter::Begin {
+                purpose: Purpose::Reauth,
+                operation: "Confirm it is you".into(),
+                caller: None,
+            })
+            .unwrap();
+            chan.send(&ToPrompter::Ask {
+                methods: vec![Method::Password],
+                error: None,
+                retry_after: None,
+            })
+            .unwrap();
+            chan
+        });
+        let chan = alephd.join().unwrap();
+        settle(&mut h);
+        shot(&mut h, "confirm");
+        drop(chan);
         let (mut h, _, _) = window(theme, Vault::Locked);
         shot(&mut h, "locked");
         let (mut h, _, _) = window(
@@ -2557,7 +3161,8 @@ impl PromptApp {
             ctx.request_repaint_after(self.shown_at + self.input_guard - now);
         }
         let action = self.ui.show(ui, now);
-        if self.scanlines {
+        // (Embedded, the window around it paints them.)
+        if self.scanlines && !self.embedded {
             theme::paint_scanlines(&ctx, &self.ui.palette);
         }
         match action {
@@ -2609,6 +3214,14 @@ pub const SIZE: [f32; 2] = [900.0, 560.0];
 /// detail pane, wrapped).
 const NAME: usize = 60;
 
+/// The requests a form's SAVE sends ([`Request::name`]).
+const SAVES: &[&str] = &[
+    "rename",
+    "change the secret",
+    "create the item",
+    "create the folder",
+];
+
 /// What is selected in the list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Selection {
@@ -2637,8 +3250,13 @@ pub enum Mode {
     Edit {
         path: String,
         label: String,
-        /// The secret being edited (fetched after the reveal guard).
+        /// The secret being edited: fetched (after the reveal guard), or
+        /// typed.
         secret: Option<Zeroizing<String>>,
+        /// The secret as fetched: a save sends the secret only if it
+        /// differs (`None` once a lock forgot it: then what was typed is
+        /// sent).
+        original: Option<Zeroizing<String>>,
     },
     New {
         collection: String,
@@ -2674,6 +3292,9 @@ pub struct Manager<S: Store, B: Backend> {
     confirm: Option<PromptApp>,
     /// Keys ignored as the confirmation appears (the tests set it to 0).
     pub confirm_guard: Duration,
+    /// Save requests not answered yet: the form stays until they succeed
+    /// (and stays, with the error, if one fails).
+    pub saving: usize,
     settings: Settings,
     home: Option<PathBuf>,
     still: bool,
@@ -2704,6 +3325,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
             pending: None,
             confirm: None,
             confirm_guard: crate::app::INPUT_GUARD,
+            saving: 0,
             settings,
             home,
             still,
@@ -2783,9 +3405,16 @@ impl<S: Store, B: Backend> Manager<S, B> {
         self.awaiting = None;
         self.pending = None;
         self.confirm = None;
-        if let Mode::Edit { secret, .. } = &mut self.mode {
-            // (The form stays; its secret must be fetched again.)
-            *secret = None;
+        if let Mode::Edit {
+            secret, original, ..
+        } = &mut self.mode
+        {
+            // (The form stays. A fetched secret must be fetched again; one
+            // typed stays, and is saved as typed.)
+            if *secret == *original {
+                *secret = None;
+            }
+            *original = None;
         }
     }
 
@@ -2812,12 +3441,17 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     }
                 }
                 StoreEvent::Secret { path, secret, .. } => {
-                    let Some((want_path, want)) = self.awaiting.take() else {
+                    // (Only the secret asked for last: an earlier one is
+                    // dropped, and wiped.)
+                    let Some(want) = self
+                        .awaiting
+                        .as_ref()
+                        .filter(|(p, _)| *p == path)
+                        .map(|(_, w)| *w)
+                    else {
                         continue;
                     };
-                    if want_path != path {
-                        continue;
-                    }
+                    self.awaiting = None;
                     match want {
                         Want::Show => {
                             let shown = match std::str::from_utf8(&secret) {
@@ -2827,35 +3461,54 @@ impl<S: Store, B: Backend> Manager<S, B> {
                             self.shown = Some((path, shown));
                         }
                         Want::Copy => {
-                            self.status = Some(match self.clipboard.copy(secret, Instant::now()) {
+                            self.status = Some(match self.clipboard.copy(secret) {
                                 Ok(()) => "COPIED :: the clipboard clears in 30 s".into(),
                                 Err(e) => format!("cannot copy: {e}"),
                             });
                         }
                         Want::Edit => {
+                            let Ok(text) = std::str::from_utf8(&secret) else {
+                                self.status = Some(
+                                    "binary secret: not editable here (it can be copied)".into(),
+                                );
+                                continue;
+                            };
                             if let Mode::Edit {
-                                path: p, secret: s, ..
+                                path: p,
+                                secret: s,
+                                original,
+                                ..
                             } = &mut self.mode
                                 && *p == path
                             {
-                                *s = Some(Zeroizing::new(
-                                    String::from_utf8_lossy(&secret).into_owned(),
-                                ));
+                                *s = Some(Zeroizing::new(text.to_string()));
+                                *original = Some(Zeroizing::new(text.to_string()));
                             }
                         }
                     }
                 }
-                StoreEvent::Done {
-                    request,
-                    error: Some(e),
-                    ..
-                } => {
-                    self.status = Some(format!("cannot {request}: {e}"));
-                    if request == "secret" {
-                        self.awaiting = None;
+                StoreEvent::Done { request, error, .. } => {
+                    let save = SAVES.contains(&request) && self.saving > 0;
+                    match error {
+                        Some(e) => {
+                            self.status = Some(format!("cannot {request}: {e}"));
+                            if request == "fetch the secret" {
+                                self.awaiting = None;
+                            }
+                            // (The form stays, with what was typed.)
+                            if save {
+                                self.saving = 0;
+                            }
+                        }
+                        None if save => {
+                            self.saving -= 1;
+                            if self.saving == 0 {
+                                self.mode = Mode::Browse;
+                            }
+                        }
+                        None => {}
                     }
                 }
-                StoreEvent::Done { .. } => {}
             }
         }
     }
@@ -2868,9 +3521,6 @@ impl<S: Store, B: Backend> Manager<S, B> {
             theme::apply(ui.ctx(), &self.palette);
         }
         self.take_events();
-        if let Some(wait) = self.clipboard.tick(now) {
-            ui.ctx().request_repaint_after(wait);
-        }
         let p = self.palette.clone();
         egui::Panel::left("aleph-nav")
             .exact_size(130.0)
@@ -3053,6 +3703,14 @@ impl<S: Store, B: Backend> Manager<S, B> {
         let Some(app) = self.confirm.as_mut() else {
             return;
         };
+        // (What the guard is worth: spec §6.)
+        ui.label(
+            RichText::new(
+                "Any program running as you can read secrets; this only guards against a glance.",
+            )
+            .small()
+            .color(self.palette.foreground.gamma_multiply(0.7)),
+        );
         app.frame(ui);
         if app.closed {
             let ok = matches!(
@@ -3079,6 +3737,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 path,
                 mut label,
                 secret,
+                original,
             } => {
                 ui.label(RichText::new("EDIT").strong().color(p.accent));
                 ui.add_space(6.0);
@@ -3096,32 +3755,40 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     }
                 }
                 ui.add_space(8.0);
-                let (mut save, mut cancel) = (false, false);
-                ui.horizontal(|ui| {
-                    save = ui
-                        .add_enabled(!label.trim().is_empty(), Button::new("SAVE"))
-                        .clicked();
-                    cancel = ui.button("CANCEL").clicked();
-                });
+                let (save, cancel) = self.save_buttons(ui, !label.trim().is_empty());
+                if cancel {
+                    // (An answer still to come no longer closes a form.)
+                    self.saving = 0;
+                }
                 if save {
+                    let mut sent = 0;
                     if self.item(&path).is_some_and(|i| i.label != label) {
                         self.store.request(Request::SetLabel {
                             path: path.clone(),
                             label: label.clone(),
                         });
+                        sent += 1;
                     }
-                    if let Some(s) = &secret {
+                    // (Only a secret that changed: an unchanged one is not
+                    // rewritten.)
+                    if let Some(s) = &secret
+                        && secret != original
+                    {
                         self.store.request(Request::SetSecret {
                             path: path.clone(),
                             secret: Zeroizing::new(s.as_bytes().to_vec()),
                         });
+                        sent += 1;
                     }
                     self.shown = None;
-                } else if !cancel {
+                    self.saving = sent;
+                }
+                if !cancel && !(save && self.saving == 0) {
                     self.mode = Mode::Edit {
                         path,
                         label,
                         secret,
+                        original,
                     };
                 }
             }
@@ -3179,24 +3846,26 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 ui.add_space(8.0);
                 let ready =
                     !label.trim().is_empty() && !secret.is_empty() && !collection.is_empty();
-                let (mut save, mut cancel) = (false, false);
-                ui.horizontal(|ui| {
-                    save = ui.add_enabled(ready, Button::new("SAVE")).clicked();
-                    cancel = ui.button("CANCEL").clicked();
-                });
+                let (save, cancel) = self.save_buttons(ui, ready);
+                if cancel {
+                    // (An answer still to come no longer closes a form.)
+                    self.saving = 0;
+                }
                 if save {
-                    let attributes: BTreeMap<String, String> = attributes
-                        .into_iter()
+                    let wanted: BTreeMap<String, String> = attributes
+                        .iter()
                         .filter(|(k, _)| !k.trim().is_empty())
-                        .map(|(k, v)| (k.trim().to_string(), v))
+                        .map(|(k, v)| (k.trim().to_string(), v.clone()))
                         .collect();
                     self.store.request(Request::CreateItem {
-                        collection,
-                        label,
-                        attributes,
-                        secret: Zeroizing::new(std::mem::take(&mut *secret).into_bytes()),
+                        collection: collection.clone(),
+                        label: label.clone(),
+                        attributes: wanted,
+                        secret: Zeroizing::new(secret.as_bytes().to_vec()),
                     });
-                } else if !cancel {
+                    self.saving = 1;
+                }
+                if !cancel {
                     self.mode = Mode::New {
                         collection,
                         label,
@@ -3228,22 +3897,38 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 ui.label(RichText::new("NEW FOLDER").strong().color(p.accent));
                 ui.add_space(6.0);
                 field(ui, &mut label, "Folder name", "name_", false);
-                let (mut create, mut cancel) = (false, false);
-                ui.horizontal(|ui| {
-                    create = ui
-                        .add_enabled(!label.trim().is_empty(), Button::new("CREATE"))
-                        .clicked();
-                    cancel = ui.button("CANCEL").clicked();
-                });
+                let (create, cancel) = self.save_buttons(ui, !label.trim().is_empty());
+                if cancel {
+                    // (An answer still to come no longer closes a form.)
+                    self.saving = 0;
+                }
                 if create {
                     // (alephd confirms it in its own prompt window.)
                     self.store
                         .request(Request::CreateCollection(label.trim().to_string()));
-                } else if !cancel {
+                    self.saving = 1;
+                }
+                if !cancel {
                     self.mode = Mode::NewFolder { label };
                 }
             }
         }
+    }
+
+    /// SAVE (enabled when `ready` and nothing is being saved) and CANCEL;
+    /// "SAVING…" while a save is answered.
+    fn save_buttons(&self, ui: &mut egui::Ui, ready: bool) -> (bool, bool) {
+        let (mut save, mut cancel) = (false, false);
+        ui.horizontal(|ui| {
+            save = ui
+                .add_enabled(ready && self.saving == 0, Button::new("SAVE"))
+                .clicked();
+            cancel = ui.button("CANCEL").clicked();
+            if self.saving > 0 {
+                ui.label("SAVING…");
+            }
+        });
+        (save, cancel)
     }
 
     fn browse(&mut self, ui: &mut egui::Ui, p: &Palette, collections: &[Collection], now: Instant) {
@@ -3339,6 +4024,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
                         path: path.clone(),
                         label: it.label.clone(),
                         secret: None,
+                        original: None,
                     };
                 }
                 if delete {
@@ -3546,12 +4232,12 @@ fn prompt() -> ExitCode {
 - [ ] **Step 4: Generate the snapshots and look at every one**
 
 Run: `UPDATE_SNAPSHOTS=1 cargo test -q -p aleph-gui --test manager snapshots`
-Expected: `ok. 1 passed`, and 14 new files: `manager_{empty,item,shown,edit,new,locked,unreachable}_{neon,omarchy}.png`. Open every one: the sidebar reads `ALEPH` / `// VAULT` / `SECRETS`; folders are bold with their items indented under them, no boxes where a glyph is missing; the detail pane's attribute names are legible in both themes; the secret is dots until shown (`manager_shown_*`: `ghp_s3cret` in monospace); `manager_locked_*` shows `VAULT SEALED` and UNLOCK; `manager_unreachable_*` shows `LINK DOWN` and the reason.
+Expected: `ok. 1 passed`, and 16 new files: `manager_{empty,item,shown,edit,new,confirm,locked,unreachable}_{neon,omarchy}.png`. Open every one: the sidebar reads `ALEPH` / `// VAULT` / `SECRETS`; folders are bold with their items indented under them, no boxes where a glyph is missing; the detail pane's attribute names are legible in both themes; the secret is dots until shown (`manager_shown_*`: `ghp_s3cret` in monospace); `manager_confirm_*`: the caveat line ("Any program running as you can read secrets; this only guards against a glance.") above the embedded confirmation (`ALEPH // IDENTITY CHECK`, "Confirm it is you", the passphrase field, ABORT and PROCEED), one set of scanlines; `manager_locked_*` shows `VAULT SEALED` and UNLOCK; `manager_unreachable_*` shows `LINK DOWN` and the reason.
 
 - [ ] **Step 5: Run the tests, clippy, and fmt**
 
 Run: `cargo test -q -p aleph-gui && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
-Expected: `ok. 25 passed` (lib), `ok. 4 passed` (binary), `ok. 12 passed` (manager), `ok. 24 passed` (screens), `ok. 5 passed` (store).
+Expected: `ok. 26 passed` (lib), `ok. 4 passed` (binary), `ok. 17 passed` (manager), `ok. 24 passed` (screens), `ok. 7 passed` (store).
 
 - [ ] **Step 6: Confirm the tests have teeth**
 
@@ -3563,6 +4249,11 @@ Make each change below in `crates/aleph-gui/src/manager.rs`, run the named test 
 - **one line for hostile labels** (`a_hostile_label_stays_on_one_line_in_the_list`): replace `.selectable_label(picked, shown(&it.label, NAME))` with `.selectable_label(picked, it.label.clone())`.
 - **binary secrets** (`a_binary_secret_is_not_shown`): replace `Err(_) => Shown::Binary(secret.len()),` with `Err(_) => Shown::Text(Zeroizing::new(String::from_utf8_lossy(&secret).into_owned())),`.
 - **delete asks** (`delete_asks_first`): make the DELETE button request `Request::DeleteItem(path)` at once instead of setting `Mode::DeleteItem`.
+- **only a changed secret is saved** (`a_loaded_secret_is_saved_only_if_changed`): replace `                        && secret != original` with `                        && true`.
+- **binary secrets are not edited** (`a_binary_secret_is_not_editable`): replace `let Ok(text) = std::str::from_utf8(&secret) else {` with `let Ok(text) = Ok::<&str, ()>("\u{fffd}") else {`.
+- **a typed secret survives a lock** (`a_typed_secret_survives_a_lock`): in `sealed`, replace `            if *secret == *original {` with `            if true {`.
+- **a failed save keeps the form** (`a_failed_save_keeps_the_form`): where an error ends a save (`self.saving = 0;` in `take_events`), also set `self.mode = Mode::Browse;`.
+- **Enter says No** (`enter_on_the_delete_question_says_no`): delete `                    n.request_focus();`.
 
 - [ ] **Step 7: Commit**
 
@@ -3895,8 +4586,9 @@ installed with it), on the account aleph serves:
    the window shows `VAULT SEALED` and hides the secret; UNLOCK opens the
    usual prompt, and a SHOW then asks for the confirmation again.
 4. COPY: `COPIED`; paste it somewhere: it is the secret. Clipboard history
-   (`cliphist list`, if installed) does not list it. After 30 s the
-   clipboard is empty.
+   (`cliphist list`, if installed) does not list it. Switch to another
+   workspace (the manager hidden) and wait 30 s: the clipboard is empty.
+   (Closing the manager also clears a copy it served.)
 5. `+ ITEM` in a test folder (`+ FOLDER` first: alephd's prompt asks to
    confirm): a label, a secret, an attribute; SAVE: it appears, and
    `secret-tool lookup <key> <value>` prints the secret. EDIT its label
@@ -3906,8 +4598,11 @@ installed with it), on the account aleph serves:
 6. An application storing a secret meanwhile (`secret-tool store
    --label=live service live-check`): it appears without a refresh.
 7. Switch the Omarchy theme: the manager re-themes.
-8. Stop alephd (`systemctl --user stop alephd.service`): `LINK DOWN`;
-   start it again (any `secret-tool` call does): the manager recovers.
+8. Restart alephd (`systemctl --user restart alephd.service`; the
+   keyring locks): the manager shows `VAULT SEALED`; unlock; SHOW and
+   `+ ITEM` still work (the manager opens a new session with the new
+   alephd). (Stopping alephd shows `LINK DOWN` only briefly: the manager's
+   own calls start it again, through D-Bus activation.)
 
 ## Emergency manual revert
 ```
@@ -3917,17 +4612,61 @@ In `DECISIONS.md`, insert before `## 2026-09-28: Plan 5a (the prompter), design`
 ```markdown
 ## 2026-09-28: Plan 5b (the manager), design
 
+### H9. The pre-execution review of the Plan 5b document: fixes adopted
+
+An independent review of the plan and its prototype; no critical finding.
+Adopted, each with a test that failed without it:
+
+- **Sessions are their openers' (alephd).** alephd numbered sessions from
+  1 on every start and only checked that a session path existed, so after
+  a restart another client (Chromium, say) could be handed the manager's
+  cached path: the manager's shows then failed, and a save could store
+  garbage without an error. A session now serves only the client that
+  opened it (`NoSession` otherwise).
+- **The store follows alephd's restarts:** its session is tied to the
+  unique name that serves `org.freedesktop.secrets`, is closed and
+  replaced when a request that uses it fails, and that request is tried
+  once more.
+- **Deleting the default folder** (its alias goes with it) no longer shows
+  `LINK DOWN`: with the alias gone, the service answering means unlocked.
+- **The clipboard clears itself** on a timer thread 30 s after the copy
+  (if it is still that copy), not with the window's frames: a window on a
+  hidden workspace draws none.
+- **An edit saves only what changed:** a loaded secret is rewritten only
+  if it differs, and a secret that is not text cannot be loaded into the
+  editor (it would be mangled).
+- **A form stays until its save succeeds:** a failed save keeps what was
+  typed, with the error; a lock keeps a secret the person typed (a fetched
+  one must be fetched again).
+- **Only the store's loop lists,** so what it last sent is what the window
+  shows; a folder or item that vanishes mid-listing is skipped; a burst of
+  signals means one listing; signals are taken only from the service's
+  owner.
+- **Minor, adopted:** a secret asked for earlier no longer swallows the one
+  asked for last; Enter on the delete question answers No (a test);
+  "cannot fetch the secret" (not "cannot secret"); failures reach stderr
+  (operations and reasons, never secrets or labels); the embedded
+  confirmation paints no second set of scanlines, has a snapshot, and its
+  caveat is the manager's own line (it did not fit alephd's title).
+- **Left as they are:** a hostile item can carry attributes named
+  `created` or `modified`, shown above the real dates; a collection named
+  "X (default)" looks like the default (creating one needs alephd's
+  confirmation); the clipboard's "still ours" check and its clear are not
+  atomic (another program's copy in between is cleared); closing the
+  manager clears a copy it served (documented).
+
 ### H8. Calls made while prototyping Plan 5b
 
 For the reviewers; each is argued in the plan
 (`docs/superpowers/plans/2026-09-28-aleph-manager.md`, "Decisions made
 while prototyping") and pinned by a test that was seen to fail without it.
 
-- **The lock state is polled, the lists are not.** alephd sends no signal
-  when the keyring locks (its objects just go), so the store reads one
-  property (`Locked` on the default alias) every 2 s, and lists every
-  folder and item only when that changes or an item or collection signal
-  arrives: listing costs a few calls per item.
+- **The lock state is polled as well as signalled, the lists are not.**
+  alephd signals a lock (`CollectionChanged` on the default alias), and the
+  store also reads one property (`Locked` on the default alias) every 2 s,
+  for a missed signal or an alephd restart; it lists every folder and item
+  only when that changes or a signal arrives: listing costs a few calls
+  per item.
 - **Each request runs on its own** on the store's thread: an unlock prompt
   may wait for the person indefinitely (H5), and nothing else waits for
   it. Only the session is shared, under a lock held just to encrypt or
@@ -3938,8 +4677,9 @@ while prototyping") and pinned by a test that was seen to fail without it.
   `Reauth`.
 - **The copy is served by `wl-clipboard-rs`** (the wlr data-control
   protocol, which Hyprland has) from a thread until another program takes
-  the clipboard; "still ours" is whether that thread is still serving.
-  The served copy is the crate's and is not zeroized.
+  the clipboard (or the manager exits: the copy goes with it); "still
+  ours" is whether that thread is still serving. The served copy is the
+  crate's and is not zeroized.
 - **New items get `xdg:schema = org.freedesktop.Secret.Generic`** unless
   one is typed; items are stored as `text/plain`.
 - **Dates are UTC calendar days;** a secret that is not UTF-8 shows as
