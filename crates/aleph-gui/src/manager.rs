@@ -512,13 +512,13 @@ impl<S: Store, B: Backend> Manager<S, B> {
     /// were closed (`job_finished`: alephd said how it went); any other job
     /// is handed back, with whether an answer had gone to alephd, for the
     /// interruption's wording. A reveal's confirmation just ends.
-    fn cut_short(&mut self) -> Option<(Job, bool)> {
+    fn cut_short(&mut self, now: Instant) -> Option<(Job, bool)> {
         let finished = self.confirm_finished();
         let answered = self.confirm_answered();
         self.end_confirm();
         match (self.running.take(), finished) {
             (Some(Running::Job(job)), Some(finished)) => {
-                self.job_finished(job, Some(finished), answered, Instant::now());
+                self.job_finished(job, Some(finished), answered, now);
                 None
             }
             (Some(Running::Job(job)), None) => Some((job, answered)),
@@ -555,7 +555,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
         if self.confirm.is_some() {
             // (The window closes: nothing to say, but a backup that had its
             // answer keeps its file. One alephd had ended ends as it said.)
-            if let Some((mut job, answered)) = self.cut_short() {
+            if let Some((mut job, answered)) = self.cut_short(Instant::now()) {
                 job.interrupted(answered);
             }
         }
@@ -581,13 +581,14 @@ impl<S: Store, B: Backend> Manager<S, B> {
     }
 
     /// Hide and forget what the keyring's lock makes unreadable. `now` is
-    /// the vault's new state (locked, or alephd out of reach).
-    fn sealed(&mut self, now: &Vault) {
+    /// the vault's new state (locked, or alephd out of reach), `at` the
+    /// frame's time.
+    fn sealed(&mut self, now: &Vault, at: Instant) {
         self.shown = None;
         self.awaiting = None;
         // (A reveal's confirmation just ends; a job's says it may have gone
         // through, unless alephd had already said how it ended.)
-        if let Some((mut job, answered)) = self.cut_short() {
+        if let Some((mut job, answered)) = self.cut_short(at) {
             let why = match now {
                 Vault::Locked => "the vault locked",
                 _ => "alephd went away",
@@ -611,13 +612,13 @@ impl<S: Store, B: Backend> Manager<S, B> {
         }
     }
 
-    fn take_events(&mut self) {
+    fn take_events(&mut self, now: Instant) {
         for e in self.store.events() {
             match e {
                 StoreEvent::Vault(v) => {
                     if !matches!(v, Vault::Unlocked(_)) && matches!(self.vault, Vault::Unlocked(_))
                     {
-                        self.sealed(&v);
+                        self.sealed(&v, now);
                     }
                     let was_up = matches!(self.vault, Vault::Locked | Vault::Unlocked(_));
                     let was_unlocked = matches!(self.vault, Vault::Unlocked(_));
@@ -871,7 +872,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 .any(|e| matches!(e, egui::Event::WindowFocused(false)))
         }) {
             self.shown = None;
-            if let Some((mut job, answered)) = self.cut_short() {
+            if let Some((mut job, answered)) = self.cut_short(now) {
                 let kept = job.interrupted(answered);
                 self.status = Some(format!(
                     "the window lost focus: {}{kept}",
@@ -884,7 +885,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 self.awaiting = None;
             }
         }
-        self.take_events();
+        self.take_events(now);
         if !self.form().is_some_and(|f| f.edited()) {
             // (A cancel or a save takes the warning away.)
             self.disarm_exit();
@@ -1509,11 +1510,8 @@ impl<S: Store, B: Backend> Manager<S, B> {
         if app.closed {
             // (`None`: closed with no `Done` from alephd, which may have
             // saved already.)
-            let finished = match &app.ui.conversation.screen {
-                Screen::Finished { ok, message } => Some((*ok, message.clone())),
-                _ => None,
-            };
-            let answered = app.answered();
+            let finished = self.confirm_finished();
+            let answered = self.confirm_answered();
             self.end_confirm();
             match self.running.take() {
                 Some(Running::Job(job)) => self.job_finished(job, finished, answered, now),
