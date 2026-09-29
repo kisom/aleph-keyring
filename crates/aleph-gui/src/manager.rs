@@ -158,6 +158,9 @@ pub struct Manager<S: Store, B: Backend> {
     exit_requested: bool,
 }
 
+/// What the status line says after the first EXIT with unsaved edits.
+const EXIT_WARNING: &str = "Unsaved settings will be lost: press EXIT again to quit";
+
 /// Where the re-read after an interrupted save stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Rebase {
@@ -437,17 +440,27 @@ impl<S: Store, B: Backend> Manager<S, B> {
         }
     }
 
+    /// Take the EXIT warning away (and its message, if still up).
+    fn disarm_exit(&mut self) {
+        self.exit_armed = false;
+        if self.status.as_deref() == Some(EXIT_WARNING) {
+            self.status = None;
+        }
+    }
+
     /// EXIT: close the window as its own close does. With unsaved VAULT
-    /// edits the first press only says so; the second closes. A running
-    /// confirmation is ended (and its save given up) and the window closes.
+    /// edits (even while their save's confirmation runs) the first press
+    /// only says so and changes nothing else; the second closes. A running
+    /// confirmation is then ended (and its save given up).
     fn exit(&mut self, ctx: &egui::Context) {
+        if self.form().is_some_and(|f| f.edited()) && !self.exit_armed {
+            self.exit_armed = true;
+            self.status = Some(EXIT_WARNING.into());
+            return;
+        }
         if self.confirm.is_some() {
             self.end_confirm();
             self.saving_settings = false;
-        } else if self.form().is_some_and(|f| f.edited()) && !self.exit_armed {
-            self.exit_armed = true;
-            self.status = Some("Unsaved settings will be lost: press EXIT again to quit".into());
-            return;
         }
         self.exit_armed = false;
         self.exit_requested = true;
@@ -714,7 +727,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
         self.take_events();
         if !self.form().is_some_and(|f| f.edited()) {
             // (A cancel or a save takes the warning away.)
-            self.exit_armed = false;
+            self.disarm_exit();
         }
         self.resume_save(&ui.ctx().clone());
         self.ask_config();
@@ -762,7 +775,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
         }
         if let Some(page) = go {
             if page != self.page {
-                self.exit_armed = false;
+                self.disarm_exit();
             }
             if page == Page::Settings && self.page != Page::Settings {
                 // (Opening the screen reads the values again, unless there

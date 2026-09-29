@@ -1949,15 +1949,76 @@ fn the_exit_warning_is_disarmed_by_cancel_and_by_changing_screens() {
     assert!(h.state().exit_requested());
 }
 
-/// EXIT during a confirmation ends it and closes (it does not hang alephd's
-/// conversation).
+/// EXIT during a settings confirmation, with the edits unsaved, warns first
+/// and leaves the confirmation running; the second press ends it and closes.
 #[test]
-fn exit_during_a_confirmation_ends_it_and_closes() {
+fn exit_during_a_settings_confirmation_warns_then_ends_it_and_closes() {
     let (mut h, store, _) = window(ThemeChoice::Neon, vault());
-    let _fd = save_an_edit(&mut h, &store);
+    let fd = save_an_edit(&mut h, &store);
+    // (alephd's end; it fails when the window ends the conversation.)
+    let _alephd = alephd_confirms(fd, "hunter2");
     settle(&mut h);
+    h.get_by_label("Login password");
+    assert!(h.state().form().unwrap().edited());
     assert!(!h.get_by_label("EXIT").accesskit_node().is_disabled());
     h.get_by_label("EXIT").click();
-    frames(&mut h);
+    settle(&mut h);
+    assert!(!h.state().exit_requested());
+    h.get_by_label_contains("Unsaved settings will be lost: press EXIT again to quit");
+    h.get_by_label("Login password");
+    h.get_by_label("EXIT").click();
+    settle(&mut h);
     assert!(h.state().exit_requested());
+    assert!(h.query_by_label("Login password").is_none());
+}
+
+/// A reveal confirmation with nothing edited: one EXIT closes.
+#[test]
+fn exit_during_a_reveal_confirmation_closes_at_once() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("GitHub token").click();
+    frames(&mut h);
+    h.get_by_label("SHOW").click();
+    frames(&mut h);
+    let Request::Reauth(fd) = only(store.take()) else {
+        panic!("no confirmation");
+    };
+    let _alephd = alephd_confirms(fd, "hunter2");
+    settle(&mut h);
+    h.get_by_label("Login password");
+    h.get_by_label("EXIT").click();
+    settle(&mut h);
+    assert!(h.state().exit_requested());
+    assert!(h.query_by_label("Login password").is_none());
+}
+
+/// The warning goes away with the reason for it: a cancel or a change of
+/// screen takes it off the status line (other messages stay).
+#[test]
+fn the_exit_warning_leaves_the_status_line_when_disarmed() {
+    let warning = "Unsaved settings will be lost: press EXIT again to quit";
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_settings(&mut h, &store, "0", "300", "true");
+    pick(&mut h, "Idle lock", "15 min");
+    h.get_by_label("EXIT").click();
+    frames(&mut h);
+    h.get_by_label_contains(warning);
+    h.get_by_label("CANCEL").click();
+    frames(&mut h);
+    assert!(h.query_by_label_contains(warning).is_none());
+    // A page change does the same.
+    pick(&mut h, "Idle lock", "15 min");
+    h.get_by_label("EXIT").click();
+    frames(&mut h);
+    h.get_by_label_contains(warning);
+    h.get_by_label("SECRETS").click();
+    frames(&mut h);
+    assert!(h.query_by_label_contains(warning).is_none());
+    // Another message is not taken down.
+    done(&store, "lock", Some("boom"));
+    frames(&mut h);
+    h.get_by_label_contains("cannot lock: boom");
+    h.get_by_label("SETTINGS").click();
+    frames(&mut h);
+    h.get_by_label_contains("cannot lock: boom");
 }
