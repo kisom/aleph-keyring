@@ -209,7 +209,11 @@ what happened, in capitals like the rest: `KEYSLOT ADDED`,
     `; check <path> (an empty file means it did not)`.
   - alephd reports failure (a `Done` error for the request, or the
     confirmation's `done` with `ok: false`): the file is removed whatever
-    its size, so a half-made backup never sits at the path.
+    its size, so a half-made backup never sits at the path. The person's
+    own ABORT, and the confirmation refusing a message, end the same way
+    (the manager cannot tell them from alephd's own `done(false, ..)`):
+    they asked for no backup, and alephd, past re-authentication, would
+    write to a file no longer at the path.
   - Success keeps it.
 - Interruptions use the settings spec's wording ("may not have gone
   through") and read STATUS again, so the slot list shows what is really
