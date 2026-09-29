@@ -1245,9 +1245,10 @@ fn a_refused_save_keeps_the_edits_and_says_why() {
     h.get_by_label_contains("cannot save the settings");
     h.get_by_label("Idle lock: 15 min");
     assert!(h.state().form().unwrap().edited());
+    assert!(store.take().is_empty(), "no re-read: nothing changed");
 }
 
-/// (Review Focus 5.) A confirmation that is cancelled saves nothing and
+/// (Review Focus 5.) A confirmation the person cancels saves nothing and
 /// leaves the edits.
 #[test]
 fn a_cancelled_confirmation_saves_nothing() {
@@ -1257,28 +1258,163 @@ fn a_cancelled_confirmation_saves_nothing() {
     h.get_by_label("SAVE").click();
     frames(&mut h);
     let (fd, _) = saved_map(only(store.take()));
-    drop(fd);
+    // (alephd asks; the answer is the person's Cancel.)
+    let alephd = std::thread::spawn(move || {
+        let mut chan = Channel::from_fd(fd, Duration::from_secs(10)).unwrap();
+        chan.send(&ToPrompter::Begin {
+            purpose: Purpose::Reauth,
+            operation: "Set lock.idle_timeout = 900".into(),
+            caller: None,
+        })
+        .unwrap();
+        chan.ask(&ToPrompter::Ask {
+            methods: vec![Method::Password],
+            error: None,
+            retry_after: None,
+        })
+        .is_err()
+    });
     settle(&mut h);
-    h.get_by_label_contains("nothing was saved");
+    h.get_by_label("Login password");
+    h.key_press(egui::Key::Escape);
+    frames(&mut h);
+    assert!(alephd.join().unwrap(), "not cancelled");
+    settle(&mut h);
+    h.get_by_label_contains("cancelled: nothing was saved");
     assert!(store.take().is_empty(), "no re-read: nothing changed");
     h.get_by_label("Idle lock: 15 min");
 }
 
-/// (Review Focus 5.) The vault locking under a confirmation ends it and
-/// says nothing was saved.
+/// Answer the re-read an interrupted save asked for: the idle lock as
+/// read, the prompt timeout changed meanwhile (15 min).
+fn reread_after_interruption(h: &mut Window, store: &Fake) {
+    assert!(matches!(only(store.take()), Request::Config), "no re-read");
+    store.send(config("0", "900", "true"));
+    frames(h);
+    // The unedited control follows what is in force; the edit stays.
+    h.get_by_label("Prompt timeout: 15 min");
+    h.get_by_label("Idle lock: 15 min");
+    let form = h.state().form().unwrap();
+    assert_eq!(
+        form.changes(),
+        BTreeMap::from([("lock.idle_timeout".to_string(), "900".to_string())])
+    );
+}
+
+/// Open SETTINGS, edit the idle lock, and SAVE: the confirmation's fd.
+fn save_an_edit(h: &mut Window, store: &Fake) -> std::os::fd::OwnedFd {
+    open_settings(h, store, "0", "300", "true");
+    pick(h, "Idle lock", "15 min");
+    h.get_by_label("SAVE").click();
+    frames(h);
+    saved_map(only(store.take())).0
+}
+
+/// A confirmation that ends with no answer from alephd may have saved or
+/// not: the window says so, and reads the values again, keeping the edits.
 #[test]
-fn a_lock_during_the_confirmation_saves_nothing() {
+fn a_confirmation_closed_without_an_answer_may_not_have_saved() {
     let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    let fd = save_an_edit(&mut h, &store);
+    drop(fd);
+    settle(&mut h);
+    h.get_by_label_contains("may not have been saved");
+    reread_after_interruption(&mut h, &store);
+}
+
+/// (Review Focus 5.) The vault locking under a confirmation ends it; the
+/// save may have gone through, so the values are read again (the edits
+/// stay).
+#[test]
+fn a_lock_during_the_confirmation_may_not_have_saved_and_reads_again() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    let _fd = save_an_edit(&mut h, &store);
+    store.send(StoreEvent::Vault(Vault::Locked));
+    settle(&mut h);
+    h.get_by_label_contains("the vault locked: the save may not have gone through");
+    reread_after_interruption(&mut h, &store);
+    assert!(h.state().form().unwrap().edited());
+}
+
+/// alephd going away under a confirmation says so (not "the vault
+/// locked"), and the values are read again once it is back.
+#[test]
+fn alephd_going_away_during_the_confirmation_reads_again_when_back() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    let _fd = save_an_edit(&mut h, &store);
+    store.send(StoreEvent::Vault(Vault::Unreachable("gone".into())));
+    settle(&mut h);
+    h.get_by_label_contains("alephd went away: the save may not have gone through");
+    assert!(store.take().is_empty(), "nothing to ask while it is away");
+    store.send(StoreEvent::Vault(Vault::Locked));
+    frames(&mut h);
+    reread_after_interruption(&mut h, &store);
+}
+
+/// Leaving the window under a settings confirmation ends it; the save
+/// may have gone through, so the values are read again (the edits stay).
+#[test]
+fn leaving_the_window_during_a_settings_confirmation_reads_again() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    let fd = save_an_edit(&mut h, &store);
+    h.event(egui::Event::WindowFocused(false));
+    frames(&mut h);
+    h.get_by_label_contains("may not have been saved");
+    reread_after_interruption(&mut h, &store);
+    drop(fd);
+}
+
+/// An unlock that fails while a save waits for it saves nothing, says
+/// why, and a vault unlocked later does not resume the save.
+#[test]
+fn a_failed_unlock_drops_the_waiting_save() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, Vault::Locked);
     open_settings(&mut h, &store, "0", "300", "true");
     pick(&mut h, "Idle lock", "15 min");
     h.get_by_label("SAVE").click();
     frames(&mut h);
-    let (_fd, _) = saved_map(only(store.take()));
-    store.send(StoreEvent::Vault(Vault::Locked));
-    settle(&mut h);
+    assert!(matches!(only(store.take()), Request::Unlock));
+    store.send(StoreEvent::Done {
+        request: "unlock",
+        error: Some("the TPM is busy".into()),
+        dismissed: false,
+    });
+    frames(&mut h);
+    h.get_by_label_contains("the TPM is busy");
     h.get_by_label_contains("nothing was saved");
+    assert!(h.query_by_label("waiting for the unlock…").is_none());
+    store.send(StoreEvent::Vault(vault()));
+    frames(&mut h);
+    assert!(store.take().is_empty(), "saved after all");
     h.get_by_label("Idle lock: 15 min");
-    assert!(h.state().form().unwrap().edited());
+}
+
+/// A save resumed after the unlock waits for the window to have the
+/// keyboard: its confirmation would otherwise hold alephd's conversation
+/// lock, unseen.
+#[test]
+fn a_resumed_save_waits_for_the_window_to_be_focused() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, Vault::Locked);
+    open_settings(&mut h, &store, "0", "300", "true");
+    pick(&mut h, "Idle lock", "15 min");
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Unlock));
+    // (alephd's unlock prompt has the keyboard.)
+    h.input_mut().focused = false;
+    h.event(egui::Event::WindowFocused(false));
+    store.send(StoreEvent::Vault(vault()));
+    frames(&mut h);
+    assert!(store.take().is_empty(), "confirmation opened unseen");
+    h.get_by_label("waiting for the unlock…");
+    h.input_mut().focused = true;
+    h.event(egui::Event::WindowFocused(true));
+    frames(&mut h);
+    let (_fd, map) = saved_map(only(store.take()));
+    assert_eq!(
+        map,
+        BTreeMap::from([("lock.idle_timeout".to_string(), "900".to_string())])
+    );
 }
 
 /// A window whose gui.toml is `dir/aleph/gui.toml`.

@@ -146,6 +146,19 @@ pub struct Manager<S: Store, B: Backend> {
     /// SAVE was pressed while the vault was locked: it asked alephd to
     /// unlock, and saves (with the edits as they are then) once it is open.
     save_after_unlock: bool,
+    /// After an interrupted save: the values to read again, under the
+    /// edits ([`Form::rebase`]).
+    rebase_on_config: Rebase,
+}
+
+/// Where the re-read after an interrupted save stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rebase {
+    No,
+    /// To ask for, once alephd can be reached.
+    Due,
+    /// Asked for: the next `Config` rebases the form.
+    Asked,
 }
 
 impl<S: Store, B: Backend> Manager<S, B> {
@@ -186,6 +199,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
             values: Values::Unknown,
             saving_settings: false,
             save_after_unlock: false,
+            rebase_on_config: Rebase::No,
         }
     }
 
@@ -367,15 +381,30 @@ impl<S: Store, B: Backend> Manager<S, B> {
         }
     }
 
-    /// Hide and forget what the keyring's lock makes unreadable.
-    fn sealed(&mut self) {
+    /// A settings save was cut short (a lock, alephd gone, the window left,
+    /// the confirmation closed with no answer): alephd may have saved
+    /// already, so its values are read again, under the edits.
+    fn save_interrupted(&mut self) {
+        if matches!(self.values, Values::Ready(_)) {
+            self.rebase_on_config = Rebase::Due;
+        }
+    }
+
+    /// Hide and forget what the keyring's lock makes unreadable. `now` is
+    /// the vault's new state (locked, or alephd out of reach).
+    fn sealed(&mut self, now: &Vault) {
         self.reauth.forget();
         self.shown = None;
         self.awaiting = None;
         self.pending = None;
         self.end_confirm();
         if std::mem::take(&mut self.saving_settings) {
-            self.status = Some("the vault locked: nothing was saved".into());
+            let why = match now {
+                Vault::Locked => "the vault locked",
+                _ => "alephd went away",
+            };
+            self.status = Some(format!("{why}: the save may not have gone through"));
+            self.save_interrupted();
         }
         if let Mode::Edit {
             secret, original, ..
@@ -396,13 +425,17 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 StoreEvent::Vault(v) => {
                     if !matches!(v, Vault::Unlocked(_)) && matches!(self.vault, Vault::Unlocked(_))
                     {
-                        self.sealed();
+                        self.sealed(&v);
                     }
                     let was_up = matches!(self.vault, Vault::Locked | Vault::Unlocked(_));
                     self.vault = v;
                     let up = matches!(self.vault, Vault::Locked | Vault::Unlocked(_));
                     if !up && matches!(self.values, Values::Loading) {
                         self.values = Values::Unknown;
+                    }
+                    if !up && self.rebase_on_config == Rebase::Asked {
+                        // (Its answer may never come: asked again when back.)
+                        self.rebase_on_config = Rebase::Due;
                     }
                     if !up && self.save_after_unlock {
                         // (No `Done` comes for an unlock that alephd went away
@@ -454,6 +487,17 @@ impl<S: Store, B: Backend> Manager<S, B> {
                             Ok(form) => Values::Ready(form),
                             Err(e) => Values::Failed(e),
                         };
+                    } else if self.rebase_on_config == Rebase::Asked {
+                        // (After an interrupted save: what is in force now
+                        // is the baseline; the edits stay.)
+                        self.rebase_on_config = Rebase::No;
+                        if let Values::Ready(form) = &mut self.values
+                            && let Err(e) = result.and_then(|v| form.rebase(&v))
+                        {
+                            self.status = Some(format!(
+                                "cannot read the settings again: {e}; the save may not have gone through"
+                            ));
+                        }
                     }
                 }
                 StoreEvent::SecretFailed { path, .. } => {
@@ -586,7 +630,9 @@ impl<S: Store, B: Backend> Manager<S, B> {
             self.end_confirm();
             self.pending = None;
             if std::mem::take(&mut self.saving_settings) {
-                self.status = Some("the window lost focus: nothing was saved".into());
+                self.status =
+                    Some("the window lost focus: the settings may not have been saved".into());
+                self.save_interrupted();
             }
             if matches!(self.awaiting, Some((_, Want::Show))) {
                 self.awaiting = None;
@@ -679,8 +725,16 @@ impl<S: Store, B: Backend> Manager<S, B> {
     /// A save that waited for the unlock (SAVE pressed while sealed): now
     /// that the vault is open, confirm and save what is in the form. Not
     /// if the form went (another screen, nothing left to save).
+    /// Not while the window lacks the keyboard (alephd's unlock prompt may
+    /// still have it): the confirmation would hold alephd's conversation
+    /// lock, unseen. It waits (SAVE still says so) and tries again.
     fn resume_save(&mut self, ctx: &egui::Context) {
         if !self.save_after_unlock || !matches!(self.vault, Vault::Unlocked(_)) {
+            return;
+        }
+        if !ctx.input(|i| i.focused) {
+            // (Focus coming back draws a frame; this is a fallback.)
+            ctx.request_repaint_after(Duration::from_millis(250));
             return;
         }
         self.save_after_unlock = false;
@@ -702,6 +756,14 @@ impl<S: Store, B: Backend> Manager<S, B> {
         let up = matches!(self.vault, Vault::Locked | Vault::Unlocked(_));
         if self.page == Page::Settings && up && matches!(self.values, Values::Unknown) {
             self.values = Values::Loading;
+            // (A fresh read: nothing left to rebase.)
+            self.rebase_on_config = Rebase::No;
+            self.store.request(Request::Config);
+        } else if up
+            && self.rebase_on_config == Rebase::Due
+            && matches!(self.values, Values::Ready(_))
+        {
+            self.rebase_on_config = Rebase::Asked;
             self.store.request(Request::Config);
         }
     }
@@ -963,25 +1025,37 @@ impl<S: Store, B: Backend> Manager<S, B> {
         }
         app.frame(ui);
         if app.closed {
-            let (ok, message) = match &app.ui.conversation.screen {
-                Screen::Finished { ok, message } => (*ok, message.clone()),
-                _ => (false, None),
+            // (`None`: closed with no `Done` from alephd, which may have
+            // saved already.)
+            let finished = match &app.ui.conversation.screen {
+                Screen::Finished { ok, message } => Some((*ok, message.clone())),
+                _ => None,
             };
             self.end_confirm();
             if std::mem::take(&mut self.saving_settings) {
-                if ok {
-                    // (The same proof as a reveal's; and read again.)
-                    self.reauth.confirmed(now);
-                    self.status = Some("SETTINGS SAVED".into());
-                    self.values = Values::Unknown;
-                } else {
-                    self.status = Some(match message {
-                        Some(m) => format!("not saved: {m}"),
-                        None => "cancelled: nothing was saved".into(),
-                    });
+                match finished {
+                    None => {
+                        self.status = Some(
+                            "the confirmation ended early: the settings may not have been saved"
+                                .into(),
+                        );
+                        self.save_interrupted();
+                    }
+                    Some((true, _)) => {
+                        // (The same proof as a reveal's; and read again.)
+                        self.reauth.confirmed(now);
+                        self.status = Some("SETTINGS SAVED".into());
+                        self.values = Values::Unknown;
+                    }
+                    Some((false, message)) => {
+                        self.status = Some(match message {
+                            Some(m) => format!("not saved: {m}"),
+                            None => "cancelled: nothing was saved".into(),
+                        });
+                    }
                 }
             } else if let Some((path, want)) = self.pending.take()
-                && ok
+                && finished.is_some_and(|(ok, _)| ok)
             {
                 self.reauth.confirmed(now);
                 self.fetch(path, want);
