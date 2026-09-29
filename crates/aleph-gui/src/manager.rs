@@ -184,7 +184,10 @@ impl<S: Store, B: Backend> Manager<S, B> {
     /// Show, copy, or edit `path`'s secret: after the reveal guard, then
     /// fetched.
     fn want(&mut self, ctx: &egui::Context, path: String, want: Want, now: Instant) {
-        if self.reauth.needed(now) {
+        if self
+            .reauth
+            .needed(now, Duration::from_secs(self.settings.reveal_hold))
+        {
             self.start_confirm(ctx, path, want);
         } else {
             self.fetch(path, want);

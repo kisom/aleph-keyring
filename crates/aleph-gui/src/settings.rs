@@ -1,13 +1,14 @@
-//! The GUI's own settings, `~/.config/aleph/gui.toml` (spec §7 "Theme").
+//! The GUI's own settings, `~/.config/aleph/gui.toml` (spec §7 "Theme";
+//! the settings spec for the reveal hold and for writing the file).
 //!
 //! A file of their own: alephd's `config.toml` refuses unknown keys, and
 //! alephd has no use for these.
 
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemeChoice {
     /// The current Omarchy theme where there is one, else Aleph neon.
@@ -17,12 +18,26 @@ pub enum ThemeChoice {
     Neon,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+/// The longest a confirmation may hold, in seconds (an hour).
+pub const MAX_REVEAL_HOLD: u64 = 3600;
+/// How long one holds unless the file says otherwise (5 minutes).
+pub const DEFAULT_REVEAL_HOLD: u64 = 300;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Settings {
     pub theme: ThemeChoice,
     /// The scanline overlay (off anyway when reduced motion is asked for).
     pub scanlines: bool,
+    /// Seconds a confirmation lets secrets be shown without another; 0 is
+    /// every time. A larger value in the file is read as
+    /// [`MAX_REVEAL_HOLD`].
+    #[serde(deserialize_with = "capped_hold")]
+    pub reveal_hold: u64,
+}
+
+fn capped_hold<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    Ok(u64::deserialize(d)?.min(MAX_REVEAL_HOLD))
 }
 
 impl Default for Settings {
@@ -30,6 +45,7 @@ impl Default for Settings {
         Self {
             theme: ThemeChoice::Auto,
             scanlines: true,
+            reveal_hold: DEFAULT_REVEAL_HOLD,
         }
     }
 }
@@ -38,20 +54,44 @@ impl Settings {
     /// The file's settings; the defaults if it is missing, and (with a
     /// warning) if it is unreadable: a prompt must still open.
     pub fn load(path: &Path) -> (Self, Option<String>) {
-        match std::fs::read_to_string(path) {
-            Ok(text) => match toml::from_str(&text) {
-                Ok(s) => (s, None),
-                Err(e) => (
-                    Self::default(),
-                    Some(format!("{}: {e} (using the defaults)", path.display())),
-                ),
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Self::default(), None),
-            Err(e) => (
-                Self::default(),
-                Some(format!("{}: {e} (using the defaults)", path.display())),
-            ),
+        match Self::read(path) {
+            Ok(s) => (s, None),
+            Err(e) => (Self::default(), Some(format!("{e} (using the defaults)"))),
         }
+    }
+
+    /// The file's settings, the defaults if it does not exist, and an
+    /// error naming the file if it cannot be read as settings.
+    fn read(path: &Path) -> Result<Self, String> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        }
+    }
+
+    /// Write the settings. A file that does not read as settings is never
+    /// overwritten (the owner fixes it, or resets it). Comments in the
+    /// file are lost: the whole file is rewritten.
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        Self::read(path)?;
+        self.write(path)
+    }
+
+    /// The defaults, over whatever is there (the broken-file button).
+    pub fn reset(path: &Path) -> Result<(), String> {
+        Self::default().write(path)
+    }
+
+    /// Atomically: a temp file, then a rename; the directory is created.
+    fn write(&self, path: &Path) -> Result<(), String> {
+        let at = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+        let dir = path.parent().ok_or_else(|| at(&"no directory"))?;
+        std::fs::create_dir_all(dir).map_err(|e| at(&e))?;
+        let text = toml::to_string(self).map_err(|e| at(&e))?;
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, text).map_err(|e| at(&e))?;
+        std::fs::rename(&tmp, path).map_err(|e| at(&e))
     }
 }
 
@@ -138,13 +178,73 @@ mod tests {
             Settings::load(&file).0,
             Settings {
                 theme: ThemeChoice::Neon,
-                scanlines: false
+                scanlines: false,
+                ..Settings::default()
             }
         );
         std::fs::write(&file, "scanline = false\n").unwrap();
         let (s, warning) = Settings::load(&file);
         assert_eq!(s, Settings::default());
         assert!(warning.unwrap().contains("scanline"));
+    }
+
+    #[test]
+    fn the_reveal_hold_defaults_to_five_minutes_and_is_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("gui.toml");
+        assert_eq!(Settings::load(&file).0.reveal_hold, 300);
+        for (text, want) in [
+            ("reveal_hold = 900\n", 900),
+            ("reveal_hold = 0\n", 0),
+            ("reveal_hold = 3600\n", 3600),
+            // (A larger value, hand-edited, is read as the largest.)
+            ("reveal_hold = 99999\n", 3600),
+            ("scanlines = false\n", 300),
+        ] {
+            std::fs::write(&file, text).unwrap();
+            assert_eq!(Settings::load(&file).0.reveal_hold, want, "{text}");
+        }
+        std::fs::write(&file, "reveal_hold = -1\n").unwrap();
+        assert!(Settings::load(&file).1.is_some());
+    }
+
+    #[test]
+    fn saved_settings_read_back_and_the_directory_is_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("aleph/gui.toml");
+        let s = Settings {
+            theme: ThemeChoice::Neon,
+            scanlines: false,
+            reveal_hold: 900,
+        };
+        s.save(&file).unwrap();
+        assert_eq!(Settings::load(&file), (s.clone(), None));
+        // Saving again over a good file is fine.
+        Settings {
+            reveal_hold: 0,
+            ..s
+        }
+        .save(&file)
+        .unwrap();
+        assert_eq!(Settings::load(&file).0.reveal_hold, 0);
+    }
+
+    /// (Review Focus 4.) A file that does not read as settings is the
+    /// owner's to fix: saving never overwrites it.
+    #[test]
+    fn a_broken_file_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("gui.toml");
+        std::fs::write(&file, "scanline = false\n# my note\n").unwrap();
+        let e = Settings::default().save(&file).unwrap_err();
+        assert!(e.contains("gui.toml") && e.contains("scanline"), "{e}");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "scanline = false\n# my note\n"
+        );
+        // Reset is the way out: it writes the defaults.
+        Settings::reset(&file).unwrap();
+        assert_eq!(Settings::load(&file), (Settings::default(), None));
     }
 
     #[test]

@@ -54,6 +54,7 @@ fn window(theme: ThemeChoice) -> (Harness<'static, PromptApp>, Daemon) {
     let settings = Settings {
         theme,
         scanlines: true,
+        ..Settings::default()
     };
     // A fixed home: auto reads the Omarchy fixture from it.
     let home = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/home");

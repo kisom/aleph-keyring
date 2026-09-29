@@ -111,6 +111,7 @@ fn window_sized(theme: ThemeChoice, v: Vault, size: [f32; 2]) -> (Window, Fake, 
     let settings = Settings {
         theme,
         scanlines: true,
+        ..Settings::default()
     };
     let mut m = Manager::new(store.clone(), clip.clone(), settings, Some(home), true);
     m.confirm_guard = Duration::ZERO;
@@ -394,7 +395,11 @@ fn a_lock_seals_the_window() {
     store.send(StoreEvent::Vault(Vault::Locked));
     frames(&mut h);
     assert!(h.query_by_label("ghp_s3cret").is_none());
-    assert!(h.state().reauth.needed(Instant::now()));
+    assert!(
+        h.state()
+            .reauth
+            .needed(Instant::now(), Duration::from_secs(300))
+    );
     h.get_by_label("VAULT SEALED");
     h.get_by_label("UNLOCK").click();
     frames(&mut h);
