@@ -9,6 +9,11 @@
 #   make install      install the release build (sudo), then restart alephd
 #   make uninstall    remove it again (after alephctl setup --revert and
 #                     sudo alephctl system revert)
+#   make pkg          an Arch package of the working tree, in target/pkg
+#                     (install it with sudo pacman -U; nothing is installed)
+#   make pkg-test     build and test the packages in an Arch container
+#                     (docker; ALEPH_PKG_CACHE=1 keeps cargo's downloads in
+#                     the docker volume aleph-pkg-cargo between runs)
 
 CARGO ?= cargo
 # (The TPM library's logging would flood the test output.)
@@ -16,7 +21,7 @@ export TSS2_LOG ?= all+NONE
 
 SUDO := $(if $(filter 0,$(shell id -u)),,sudo)
 
-.PHONY: all build test lint pkg-shell-test gate gate-hw hw-tpm hw-fido2 install uninstall restart clean
+.PHONY: all build test lint pkg-shell-test pkg pkg-test gate gate-hw hw-tpm hw-fido2 install uninstall restart clean
 
 all: build
 
@@ -34,12 +39,33 @@ lint:
 	sh -n packaging/arch/remove-guard
 	sh -n packaging/arch/tests/guard-test.sh
 	sh -n packaging/arch/tests/hook-test.sh
+	sh -n packaging/arch/make-pkg.sh
+	sh -n packaging/arch/test-packages.sh
+	bash -n packaging/arch/common.sh
+	bash -n packaging/arch/local/PKGBUILD
 
 # Shell tests for the package's hook and removal guard: they run on any
 # host, with a stub systemctl and temporary directories.
 pkg-shell-test:
 	sh packaging/arch/tests/guard-test.sh
 	sh packaging/arch/tests/hook-test.sh
+
+# A package of the working tree, built as the user in target/pkg (install it
+# with `sudo pacman -U`; nothing is installed here).
+pkg:
+	packaging/arch/make-pkg.sh local
+
+# Build and test the packages in a clean Arch container (needs docker; the
+# repository is mounted read-only, nothing on the host is touched). In a git
+# worktree the shared git directory is outside the tree, so it is mounted
+# read-only at its own path too. ALEPH_PKG_CACHE=1 keeps cargo's registry
+# in the docker volume aleph-pkg-cargo (off by default: a clean run).
+pkg-test:
+	@set -- -v "$$PWD:/src:ro"; \
+	common=$$(git rev-parse --path-format=absolute --git-common-dir); \
+	case "$$common" in "$$PWD"/*) ;; *) set -- "$$@" -v "$$common:$$common:ro" ;; esac; \
+	if [ -n "$${ALEPH_PKG_CACHE:-}" ]; then set -- "$$@" -v aleph-pkg-cargo:/work/cargo; fi; \
+	set -x; docker run --rm "$$@" archlinux:base-devel sh /src/packaging/arch/test-packages.sh
 
 gate: lint test pkg-shell-test
 

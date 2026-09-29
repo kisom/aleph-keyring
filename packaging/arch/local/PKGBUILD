@@ -1,0 +1,32 @@
+# Maintainer: K. Isom <kyle@imap.cc>
+# A package of the working tree, for `make pkg` (packaging/arch/make-pkg.sh
+# writes pkgver, and the tarball, into the build directory).
+pkgname=aleph-keyring-local
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='A Rust Secret Service keyring backed by a TPM and FIDO2 keys'
+arch=('x86_64')
+url='https://github.com/kisom/aleph-keyring'
+license=('Apache-2.0')
+depends=(tpm2-tss libfido2 pam dbus)
+makedepends=(rust clang pkgconf)
+provides=('org.freedesktop.secrets' 'aleph-keyring')
+conflicts=('aleph-keyring' 'aleph-keyring-git')
+backup=('etc/pam.d/aleph-check')
+install=aleph-keyring.install
+source=("aleph-src.tar.gz")
+sha256sums=('SKIP')   # the tarball is made by make-pkg.sh from the working tree
+
+# (common.sh builds in "$srcdir/$_srcname": $srcdir is not set yet when
+# makepkg reads this top level, only inside build() and package().)
+_srcname=aleph-src
+
+build() {
+  . "$startdir/common.sh"
+  aleph_build
+}
+
+package() {
+  . "$startdir/common.sh"
+  aleph_package
+}
