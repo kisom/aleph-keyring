@@ -3392,3 +3392,186 @@ fn a_backup_unlocked_after_leaving_the_page_is_not_run_and_its_file_goes() {
     h.get_by_label_contains("the vault unlocked: the operation was not run");
     assert!(!path.exists());
 }
+
+// ---- An interruption once alephd has said how it ended ----
+
+/// Play alephd: ask for the password, do `meanwhile` (write a backup's
+/// file, say), and end with `ok` and a closing `message`, which stays on
+/// the confirmation's closing screen until it is read.
+fn alephd_ends_with(
+    fd: std::os::fd::OwnedFd,
+    ok: bool,
+    message: &'static str,
+    meanwhile: impl FnOnce() + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut chan = Channel::from_fd(fd, Duration::from_secs(10)).unwrap();
+        chan.send(&ToPrompter::Begin {
+            purpose: Purpose::Reauth,
+            operation: "Confirm it is you".into(),
+            caller: None,
+        })
+        .unwrap();
+        chan.ask(&ToPrompter::Ask {
+            methods: vec![Method::Password],
+            error: None,
+            retry_after: None,
+        })
+        .unwrap();
+        meanwhile();
+        chan.done(ok, Some(message.into()));
+    })
+}
+
+/// Answer alephd's ask, and wait until its closing message is on screen
+/// (not closed yet).
+fn to_the_closing_message(h: &mut Window, alephd: std::thread::JoinHandle<()>, message: &str) {
+    settle(h);
+    type_into(h, "Login password", "hunter2");
+    h.key_press(egui::Key::Enter);
+    frames(h);
+    alephd.join().unwrap();
+    settle(h);
+    h.get_by_label("Close");
+    h.get_by_label_contains(message);
+}
+
+/// Write `bytes` into a backup's file (as alephd does).
+fn write_into(file: std::os::fd::OwnedFd, bytes: &'static [u8]) -> impl FnOnce() + Send + 'static {
+    move || {
+        use std::io::Write;
+        (&std::fs::File::from(file)).write_all(bytes).unwrap();
+    }
+}
+
+/// alephd said the save went through: leaving the window on its closing
+/// message says so, and reads the settings again (not "may not have been
+/// saved").
+#[test]
+fn leaving_the_window_on_a_finished_save_says_it_was_saved() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    let fd = save_an_edit(&mut h, &store);
+    let alephd = alephd_ends_with(fd, true, "The settings were saved.", || {});
+    to_the_closing_message(&mut h, alephd, "The settings were saved.");
+    h.event(egui::Event::WindowFocused(false));
+    frames(&mut h);
+    h.get_by_label_contains("SETTINGS SAVED");
+    assert!(
+        h.query_by_label_contains("may not have been saved")
+            .is_none()
+    );
+    // Read again, from scratch: what was saved is what is in force.
+    assert!(matches!(only(store.take()), Request::Config));
+    store.send(config("900", "300", "true"));
+    frames(&mut h);
+    assert!(!h.state().form().unwrap().edited());
+}
+
+/// alephd said the operation went through: a lock on its closing message
+/// says it was done, reads STATUS again, and still forgets the proof.
+#[test]
+fn a_lock_on_a_finished_operation_says_it_was_done() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_admin(&mut h, &store, admin_status());
+    h.get_by_label("ROTATE MASTER KEY").click();
+    frames(&mut h);
+    let Request::RotateMaster(fd) = only(store.take()) else {
+        panic!("no rotation");
+    };
+    let alephd = alephd_ends_with(fd, true, "The master key was rotated.", || {});
+    to_the_closing_message(&mut h, alephd, "The master key was rotated.");
+    store.send(StoreEvent::Vault(Vault::Locked));
+    settle(&mut h);
+    h.get_by_label("MASTER KEY ROTATED");
+    assert!(
+        h.query_by_label_contains("may not have gone through")
+            .is_none()
+    );
+    let requests = store.take();
+    assert!(
+        requests.iter().any(|r| matches!(r, Request::Status)),
+        "{requests:?}"
+    );
+    assert!(
+        h.state()
+            .reauth
+            .needed(Instant::now(), Duration::from_secs(300)),
+        "a lock forgets the proof"
+    );
+}
+
+/// alephd said the backup failed, after writing part: a lock on its closing
+/// message removes the file and says why (as closing it would).
+#[test]
+fn a_lock_on_a_failed_backup_removes_the_file_and_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, store, fd, file) = start_backup(&path);
+    let alephd = alephd_ends_with(
+        fd,
+        false,
+        "no space left on device",
+        write_into(file, b"half"),
+    );
+    to_the_closing_message(&mut h, alephd, "no space left on device");
+    assert!(path.exists());
+    store.send(StoreEvent::Vault(Vault::Locked));
+    settle(&mut h);
+    h.get_by_label("not done: no space left on device");
+    assert!(!path.exists(), "a half-made backup stays behind");
+}
+
+/// alephd said the backup was made: a lock on its closing message keeps
+/// the file and says where it went.
+#[test]
+fn a_lock_on_a_finished_backup_keeps_it_and_says_backed_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, store, fd, file) = start_backup(&path);
+    let alephd = alephd_ends_with(
+        fd,
+        true,
+        "The backup was written.",
+        write_into(file, b"backup"),
+    );
+    to_the_closing_message(&mut h, alephd, "The backup was written.");
+    store.send(StoreEvent::Vault(Vault::Locked));
+    settle(&mut h);
+    h.get_by_label(&format!(
+        "BACKED UP :: {} (it opens only with your recovery key)",
+        path.display()
+    ));
+    drop(h);
+    assert_eq!(std::fs::read(&path).unwrap(), b"backup");
+}
+
+/// The same with EXIT: the file stays, and what the status says is that it
+/// was backed up.
+#[test]
+fn exit_on_a_finished_backup_keeps_it_and_says_backed_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, _store, fd, file) = start_backup(&path);
+    let alephd = alephd_ends_with(
+        fd,
+        true,
+        "The backup was written.",
+        write_into(file, b"backup"),
+    );
+    to_the_closing_message(&mut h, alephd, "The backup was written.");
+    h.get_by_label("EXIT").click();
+    settle(&mut h);
+    assert!(h.state().exit_requested());
+    assert_eq!(
+        h.state().status.as_deref(),
+        Some(
+            format!(
+                "BACKED UP :: {} (it opens only with your recovery key)",
+                path.display()
+            )
+            .as_str()
+        )
+    );
+    drop(h);
+    assert_eq!(std::fs::read(&path).unwrap(), b"backup");
+}

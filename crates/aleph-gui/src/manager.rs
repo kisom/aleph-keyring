@@ -496,6 +496,34 @@ impl<S: Store, B: Backend> Manager<S, B> {
         self.confirm.as_ref().is_some_and(PromptApp::answered)
     }
 
+    /// How alephd ended the confirmation on screen, if it has (its closing
+    /// message is up, not read yet). Read before `end_confirm`.
+    fn confirm_finished(&self) -> Option<(bool, Option<String>)> {
+        match &self.confirm.as_ref()?.ui.conversation.screen {
+            Screen::Finished { ok, message } => Some((*ok, message.clone())),
+            _ => None,
+        }
+    }
+
+    /// End the confirmation, cut short (a lock, alephd gone, focus loss,
+    /// EXIT). A job alephd had already ended ends as if its confirmation
+    /// were closed (`job_finished`: alephd said how it went); any other job
+    /// is handed back, with whether an answer had gone to alephd, for the
+    /// interruption's wording. A reveal's confirmation just ends.
+    fn cut_short(&mut self) -> Option<(Job, bool)> {
+        let finished = self.confirm_finished();
+        let answered = self.confirm_answered();
+        self.end_confirm();
+        match (self.running.take(), finished) {
+            (Some(Running::Job(job)), Some(finished)) => {
+                self.job_finished(job, Some(finished), answered, Instant::now());
+                None
+            }
+            (Some(Running::Job(job)), None) => Some((job, answered)),
+            _ => None,
+        }
+    }
+
     /// End the confirmation, if one runs (alephd holds its conversation
     /// lock until it ends).
     fn end_confirm(&mut self) {
@@ -523,11 +551,9 @@ impl<S: Store, B: Backend> Manager<S, B> {
             return;
         }
         if self.confirm.is_some() {
-            let answered = self.confirm_answered();
-            self.end_confirm();
             // (The window closes: nothing to say, but a backup that had its
-            // answer keeps its file.)
-            if let Some(Running::Job(mut job)) = self.running.take() {
+            // answer keeps its file. One alephd had ended ends as it said.)
+            if let Some((mut job, answered)) = self.cut_short() {
                 job.interrupted(answered);
             }
         }
@@ -555,14 +581,11 @@ impl<S: Store, B: Backend> Manager<S, B> {
     /// Hide and forget what the keyring's lock makes unreadable. `now` is
     /// the vault's new state (locked, or alephd out of reach).
     fn sealed(&mut self, now: &Vault) {
-        self.reauth.forget();
         self.shown = None;
         self.awaiting = None;
-        let answered = self.confirm_answered();
-        self.end_confirm();
         // (A reveal's confirmation just ends; a job's says it may have gone
-        // through.)
-        if let Some(Running::Job(mut job)) = self.running.take() {
+        // through, unless alephd had already said how it ended.)
+        if let Some((mut job, answered)) = self.cut_short() {
             let why = match now {
                 Vault::Locked => "the vault locked",
                 _ => "alephd went away",
@@ -571,6 +594,8 @@ impl<S: Store, B: Backend> Manager<S, B> {
             self.status = Some(format!("{why}: {}{kept}", job.may_not_have_gone_through()));
             self.save_interrupted(&job);
         }
+        // (After the job's end, which may have confirmed the proof.)
+        self.reauth.forget();
         if let Mode::Edit {
             secret, original, ..
         } = &mut self.mode
@@ -837,9 +862,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 .any(|e| matches!(e, egui::Event::WindowFocused(false)))
         }) {
             self.shown = None;
-            let answered = self.confirm_answered();
-            self.end_confirm();
-            if let Some(Running::Job(mut job)) = self.running.take() {
+            if let Some((mut job, answered)) = self.cut_short() {
                 let kept = job.interrupted(answered);
                 self.status = Some(format!(
                     "the window lost focus: {}{kept}",
