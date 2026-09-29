@@ -180,7 +180,6 @@ mod tests {
 
     #[test]
     fn set_many_applies_all_or_none() {
-        use std::collections::BTreeMap;
         let pairs = |p: &[(&str, &str)]| -> BTreeMap<String, String> {
             p.iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))

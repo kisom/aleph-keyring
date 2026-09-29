@@ -299,21 +299,25 @@ async fn a_declined_confirmation_changes_no_setting() {
 async fn a_bad_pair_or_an_empty_map_is_refused_before_any_question() {
     let d = daemon().await;
     converse(&d, "Create", &["password"], vec![password(PW)]).await;
-    for values in [
-        &[("lock.idle_timeout", "900"), ("prompt.timeout", "0")][..],
-        &[("lock.idel", "1")][..],
-        &[][..],
+    // (Refused for the reason given, not as a method alephd lacks.)
+    for (values, why) in [
+        (
+            &[("lock.idle_timeout", "900"), ("prompt.timeout", "0")][..],
+            "prompt.timeout",
+        ),
+        (&[("lock.idel", "1")][..], "lock.idel"),
+        (&[][..], "no settings to change"),
     ] {
         let (_ours, theirs) = UnixStream::pair().unwrap();
         let fd = zbus::zvariant::OwnedFd::from(OwnedFd::from(theirs));
-        assert!(
-            admin(&d)
-                .await
-                .call_method("SetConfigs", &(fd, map(values)))
-                .await
-                .is_err(),
-            "{values:?}"
-        );
+        let e = admin(&d)
+            .await
+            .call_method("SetConfigs", &(fd, map(values)))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(why), "{values:?}: {e}");
+        assert!(!e.contains("UnknownMethod"), "{values:?}: {e}");
     }
     // (Not even the good pair of the first call was applied.)
     assert_eq!(get_config(&d, "lock.idle_timeout").await, "0");

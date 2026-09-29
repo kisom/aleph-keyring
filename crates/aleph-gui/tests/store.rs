@@ -201,10 +201,7 @@ async fn settings_are_read_and_saved_through_alephd() {
     let d = daemon(true, vec![]).await;
     let mut store = Probe::new(&d.bus.address);
     store.unlocked(|c| !c.is_empty()).await;
-    let read = |store: &mut Probe| {
-        store.request(Request::Config);
-    };
-    read(&mut store);
+    store.request(Request::Config);
     let values = store
         .until(|e| match e {
             StoreEvent::Config(Ok(v)) => Some(v.clone()),
@@ -241,7 +238,7 @@ async fn settings_are_read_and_saved_through_alephd() {
         ),
         "{sent:?}"
     );
-    read(&mut store);
+    store.request(Request::Config);
     let values = store
         .until(|e| match e {
             StoreEvent::Config(Ok(v)) => Some(v.clone()),
