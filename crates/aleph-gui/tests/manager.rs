@@ -1383,6 +1383,68 @@ fn a_lock_during_the_confirmation_may_not_have_saved_and_reads_again() {
     assert!(h.state().form().unwrap().edited());
 }
 
+/// The link lost while the re-read after an interrupted save is on its
+/// way, and back: the late answer of the read from before is not taken for
+/// the next one's (no "cannot read the settings again"); the values are
+/// read again, and that answer rebases the form.
+#[test]
+fn a_reread_answer_from_before_the_link_went_is_read_again() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    let _fd = save_an_edit(&mut h, &store);
+    store.send(StoreEvent::Vault(Vault::Locked));
+    settle(&mut h);
+    assert!(matches!(only(store.take()), Request::Config), "no re-read");
+    store.send(StoreEvent::Vault(Vault::Unreachable("gone".into())));
+    frames(&mut h);
+    store.send(StoreEvent::Vault(Vault::Locked));
+    frames(&mut h);
+    // (Asked again once the old read's answer is in.)
+    store.take();
+    // The old request's answer.
+    store.send(StoreEvent::Config(Err("no reply from alephd".into())));
+    frames(&mut h);
+    assert!(
+        h.query_by_label_contains("cannot read the settings again")
+            .is_none()
+    );
+    reread_after_interruption(&mut h, &store);
+    assert!(h.state().form().unwrap().edited());
+    assert!(store.take().is_empty(), "asked again after it came");
+}
+
+/// As above, but the edit undone before the link went: the values are
+/// read afresh when it is back, and the late answer of the re-read from
+/// before is not taken for that read's either.
+#[test]
+fn a_reread_answer_from_before_the_link_went_is_not_taken_for_a_fresh_read() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    let _fd = save_an_edit(&mut h, &store);
+    store.send(StoreEvent::Vault(Vault::Locked));
+    settle(&mut h);
+    assert!(matches!(only(store.take()), Request::Config), "no re-read");
+    pick(&mut h, "Idle lock", "Off");
+    assert!(!h.state().form().unwrap().edited());
+    store.send(StoreEvent::Vault(Vault::Unreachable("gone".into())));
+    frames(&mut h);
+    store.send(StoreEvent::Vault(Vault::Locked));
+    frames(&mut h);
+    // (Read afresh now or once the old read's answer is in.)
+    store.take();
+    // The old request's answer.
+    store.send(StoreEvent::Config(Err("no reply from alephd".into())));
+    frames(&mut h);
+    assert!(h.query_by_label_contains("no reply from alephd").is_none());
+    assert!(h.query_by_label("RETRY").is_none());
+    assert!(
+        matches!(only(store.take()), Request::Config),
+        "not read again"
+    );
+    store.send(config("900", "300", "true"));
+    frames(&mut h);
+    h.get_by_label("Idle lock: 15 min");
+    assert!(store.take().is_empty(), "asked again after it came");
+}
+
 /// alephd going away under a confirmation says so (not "the vault
 /// locked"), and the values are read again once it is back.
 #[test]

@@ -181,6 +181,9 @@ enum Rebase {
     Due,
     /// Asked for: the next `Config` rebases the form.
     Asked,
+    /// Asked for, then the link went: the next `Config` is that read's
+    /// (an error most likely), not taken; it is asked again (`Due`).
+    AskedStale,
 }
 
 /// One of gui.toml's fields, as a DISPLAY change sets it.
@@ -631,8 +634,10 @@ impl<S: Store, B: Backend> Manager<S, B> {
                         *stale = true;
                     }
                     if !up && self.rebase_on_config == Rebase::Asked {
-                        // (Its answer may never come: asked again when back.)
-                        self.rebase_on_config = Rebase::Due;
+                        // (Its answer still comes, an error most likely:
+                        // not taken, it asks again. Forgotten, it would be
+                        // taken for the next read's.)
+                        self.rebase_on_config = Rebase::AskedStale;
                     }
                     if !up && let Some(job) = self.waiting.take() {
                         // (No `Done` comes for an unlock that alephd went away
@@ -722,6 +727,9 @@ impl<S: Store, B: Backend> Manager<S, B> {
                                 "cannot read the settings again: {e}; the save may not have gone through"
                             ));
                         }
+                    } else if self.rebase_on_config == Rebase::AskedStale {
+                        // (The answer from before the link went: read again.)
+                        self.rebase_on_config = Rebase::Due;
                     }
                 }
                 StoreEvent::SecretFailed { path, .. } => {
@@ -1051,10 +1059,16 @@ impl<S: Store, B: Backend> Manager<S, B> {
     fn ask_config(&mut self) {
         let up = matches!(self.vault, Vault::Locked | Vault::Unlocked(_));
         if self.page == Page::Settings && up && matches!(self.values, Values::Unknown) {
-            self.values = Values::Loading { stale: false };
+            if self.rebase_on_config == Rebase::AskedStale {
+                // (A re-read from before the link went is still to be
+                // answered: that answer is not taken, and asks again.)
+                self.values = Values::Loading { stale: true };
+            } else {
+                self.values = Values::Loading { stale: false };
+                self.store.request(Request::Config);
+            }
             // (A fresh read: nothing left to rebase.)
             self.rebase_on_config = Rebase::No;
-            self.store.request(Request::Config);
         } else if up
             && self.rebase_on_config == Rebase::Due
             && matches!(self.values, Values::Ready(_))
