@@ -696,11 +696,6 @@ impl<S: Store, B: Backend> Manager<S, B> {
                         }
                         continue;
                     }
-                    if request == Job::Settings.request_name() {
-                        // (Late: its confirmation already ended, and said
-                        // why.)
-                        continue;
-                    }
                     let save = SAVES.contains(&request) && self.saving > 0;
                     match error {
                         Some(e) => {

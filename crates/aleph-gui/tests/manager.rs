@@ -1248,6 +1248,21 @@ fn a_refused_save_keeps_the_edits_and_says_why() {
     assert!(store.take().is_empty(), "no re-read: nothing changed");
 }
 
+/// A save's refusal that comes after its confirmation ended (no save
+/// running) is still said, not dropped.
+#[test]
+fn a_late_refused_save_still_says_why() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_settings(&mut h, &store, "0", "300", "true");
+    store.send(StoreEvent::Done {
+        request: "save the settings",
+        error: Some("boom".into()),
+        dismissed: false,
+    });
+    frames(&mut h);
+    h.get_by_label_contains("cannot save the settings: boom");
+}
+
 /// (Review Focus 5.) A confirmation the person cancels saves nothing and
 /// leaves the edits.
 #[test]
