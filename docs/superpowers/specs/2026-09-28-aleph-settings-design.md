@@ -215,3 +215,7 @@ settable with `alephctl config set`.
 - Idle lock and prompt timeout are presets plus custom minutes, checked
   as typed.
 - A successful settings save also starts the reveal window.
+- Save on a locked vault unlocks it first (alephd's prompt), then
+  confirms and saves: two proofs. The buttons carry the note
+  `VAULT SEALED :: SAVE WILL UNLOCK FIRST` while it is locked. A dismissed
+  unlock saves nothing.
