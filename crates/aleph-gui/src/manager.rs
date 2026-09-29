@@ -573,7 +573,11 @@ impl<S: Store, B: Backend> Manager<S, B> {
     fn save_interrupted(&mut self, job: &Job) {
         match job {
             Job::Settings => {
-                if matches!(self.values, Values::Ready(_)) {
+                // (A re-read from before the link went stays marked: its
+                // answer, not taken, asks again.)
+                if matches!(self.values, Values::Ready(_))
+                    && self.rebase_on_config != Rebase::AskedStale
+                {
                     self.rebase_on_config = Rebase::Due;
                 }
             }
@@ -1067,7 +1071,9 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 self.values = Values::Loading { stale: false };
                 self.store.request(Request::Config);
             }
-            // (A fresh read: nothing left to rebase.)
+            // (A fresh read: nothing left to rebase. After `AskedStale`,
+            // the old answer is taken by the `Loading { stale: true }` arm,
+            // which then has the read sent.)
             self.rebase_on_config = Rebase::No;
         } else if up
             && self.rebase_on_config == Rebase::Due

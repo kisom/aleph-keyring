@@ -1398,8 +1398,10 @@ fn a_reread_answer_from_before_the_link_went_is_read_again() {
     frames(&mut h);
     store.send(StoreEvent::Vault(Vault::Locked));
     frames(&mut h);
-    // (Asked again once the old read's answer is in.)
-    store.take();
+    assert!(
+        store.take().is_empty(),
+        "asked again before the old read's answer is in"
+    );
     // The old request's answer.
     store.send(StoreEvent::Config(Err("no reply from alephd".into())));
     frames(&mut h);
@@ -1409,6 +1411,41 @@ fn a_reread_answer_from_before_the_link_went_is_read_again() {
     );
     reread_after_interruption(&mut h, &store);
     assert!(h.state().form().unwrap().edited());
+    assert!(store.take().is_empty(), "asked again after it came");
+}
+
+/// As above, but a second save is interrupted while the re-read from
+/// before the link went is still out: nothing more is asked until its
+/// answer is in (not taken), then exactly one read, which rebases.
+#[test]
+fn a_second_interrupted_save_waits_for_the_stale_reread_answer() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    let _fd = save_an_edit(&mut h, &store);
+    store.send(StoreEvent::Vault(Vault::Locked));
+    settle(&mut h);
+    assert!(matches!(only(store.take()), Request::Config), "no re-read");
+    store.send(StoreEvent::Vault(Vault::Unreachable("gone".into())));
+    frames(&mut h);
+    store.send(StoreEvent::Vault(vault()));
+    frames(&mut h);
+    assert!(store.take().is_empty(), "asked before the old answer is in");
+    assert!(h.state().form().unwrap().edited());
+    // A second save, interrupted by a lock under its confirmation.
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    let (_fd2, _) = saved_map(only(store.take()));
+    store.send(StoreEvent::Vault(Vault::Locked));
+    settle(&mut h);
+    h.get_by_label_contains("the vault locked: the save may not have gone through");
+    assert!(store.take().is_empty(), "asked before the old answer is in");
+    // The old request's answer.
+    store.send(StoreEvent::Config(Err("no reply from alephd".into())));
+    frames(&mut h);
+    assert!(
+        h.query_by_label_contains("cannot read the settings again")
+            .is_none()
+    );
+    reread_after_interruption(&mut h, &store);
     assert!(store.take().is_empty(), "asked again after it came");
 }
 
@@ -1428,8 +1465,10 @@ fn a_reread_answer_from_before_the_link_went_is_not_taken_for_a_fresh_read() {
     frames(&mut h);
     store.send(StoreEvent::Vault(Vault::Locked));
     frames(&mut h);
-    // (Read afresh now or once the old read's answer is in.)
-    store.take();
+    assert!(
+        store.take().is_empty(),
+        "read afresh before the old read's answer is in"
+    );
     // The old request's answer.
     store.send(StoreEvent::Config(Err("no reply from alephd".into())));
     frames(&mut h);
