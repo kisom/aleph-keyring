@@ -11,6 +11,7 @@ pub mod pretty;
 pub mod reauth;
 pub mod screens;
 pub mod settings;
+pub mod settings_page;
 pub mod store;
 pub mod theme;
 
