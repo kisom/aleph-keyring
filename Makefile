@@ -39,16 +39,20 @@ lint:
 	sh -n packaging/arch/remove-guard
 	sh -n packaging/arch/tests/guard-test.sh
 	sh -n packaging/arch/tests/hook-test.sh
+	sh -n packaging/arch/tests/pkgver-test.sh
 	sh -n packaging/arch/make-pkg.sh
+	sh -n packaging/arch/pkgver.sh
 	sh -n packaging/arch/test-packages.sh
 	bash -n packaging/arch/common.sh
 	bash -n packaging/arch/local/PKGBUILD
 
-# Shell tests for the package's hook and removal guard: they run on any
-# host, with a stub systemctl and temporary directories.
+# Shell tests for the package's hook, removal guard and version: they run
+# on any host, with a stub systemctl and temporary directories and git
+# repositories.
 pkg-shell-test:
 	sh packaging/arch/tests/guard-test.sh
 	sh packaging/arch/tests/hook-test.sh
+	sh packaging/arch/tests/pkgver-test.sh
 
 # A package of the working tree, built as the user in target/pkg (install it
 # with `sudo pacman -U`; nothing is installed here).
@@ -62,7 +66,8 @@ pkg:
 # in the docker volume aleph-pkg-cargo (off by default: a clean run).
 pkg-test:
 	@set -- -v "$$PWD:/src:ro"; \
-	common=$$(git rev-parse --path-format=absolute --git-common-dir); \
+	common=$$(git rev-parse --path-format=absolute --git-common-dir) && [ -n "$$common" ] || \
+		{ echo "make pkg-test: run it in a git checkout of aleph (make-pkg.sh needs git)" >&2; exit 1; }; \
 	case "$$common" in "$$PWD"/*) ;; *) set -- "$$@" -v "$$common:$$common:ro" ;; esac; \
 	if [ -n "$${ALEPH_PKG_CACHE:-}" ]; then set -- "$$@" -v aleph-pkg-cargo:/work/cargo; fi; \
 	set -x; docker run --rm "$$@" archlinux:base-devel sh /src/packaging/arch/test-packages.sh

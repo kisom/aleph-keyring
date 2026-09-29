@@ -22,7 +22,8 @@
   - maintainer line: `# Maintainer: K. Isom <kyle@imap.cc>`
   - package description: `A Rust Secret Service keyring backed by a TPM and FIDO2 keys`
   - url `https://github.com/kisom/aleph-keyring`; `license=('Apache-2.0')`; `arch=('x86_64')`
-  - `depends=(tpm2-tss libfido2 pam dbus)`; `makedepends=(rust clang pkgconf)` (plus `git` for `-git`)
+  - `depends=(tpm2-tss libfido2 pam dbus openssl hicolor-icon-theme wayland libxkbcommon libglvnd)`; `makedepends=(rust clang pkgconf)` (plus `git` for `-git`); `options=('!debug')`
+  - the source directory is `_srcname=<directory under $srcdir>` at the PKGBUILD's top level (common.sh does `cd "$srcdir/$_srcname"`: `$srcdir` is empty at the top level)
   - `provides=('org.freedesktop.secrets' 'aleph-keyring')`; the three variants `conflicts` with each other; no `conflicts` with `gnome-keyring`
   - `backup=('etc/pam.d/aleph-check')`
   - the guard's refusal names `alephctl system revert` (as root) and `alephctl setup --revert` (as the user)
@@ -39,7 +40,7 @@ Each line has a test in the task named after it.
 2. **The hook outside a booted systemd** (a chroot, a container): no `systemctl`, or one that fails, must not fail the transaction, and the message must say which step was skipped; a second run must be idempotent. (Task 1)
 3. **File-list drift**: `install.sh`, the PKGBUILD's `package()` and the expected list must agree; nothing else is installed; modes are right (755 for binaries, the guard and the PAM module; 644 for the rest). (Task 2)
 4. **A placeholder checksum reaching the AUR**: `make pkgbuild-aur` must refuse the release package while its checksum is `SKIP`; `make pkgbuild-release` must write a real one. (Task 3)
-5. **`make pkg` from a dirty tree**: the version says so (`.dirty`), a rebuild always upgrades (`pkgver` changes with the commit count and hash), and `target/` and ignored files never enter the tarball. (Task 2)
+5. **`make pkg` from a dirty tree**: the version says so (`.dirty<YYYYMMDDHHMMSS>`), a rebuild of a changed tree gets a new version (the commit count and hash, and dirty builds carry a timestamp), an unstaged deletion neither breaks the build nor enters the tarball, and `target/` and ignored files never enter the tarball. (Task 2)
 
 ---
 
@@ -453,7 +454,7 @@ git commit -m 'feat(packaging): the pacman install hook and the removal guard' -
 **Interfaces:**
 - Consumes: Task 1's `aleph-keyring.install`, `remove-guard`, `aleph-remove-guard.hook`.
 - Produces:
-  - `common.sh`: `aleph_build` (run in `build()`: `cargo build --release --workspace --locked` in `$_srcdir`) and `aleph_package` (run in `package()`: installs the files below into `$pkgdir` from `$_srcdir`; uses `$pkgname` for the license directory).
+  - `common.sh`: `aleph_build` (run in `build()`: `cargo build --release --workspace --locked` in `$srcdir/$_srcname`) and `aleph_package` (run in `package()`: installs the files below into `$pkgdir` from `$srcdir/$_srcname`; uses `$pkgname` for the license directory).
   - `make-pkg.sh local`: builds `target/pkg/aleph-keyring-local-<ver>-1-x86_64.pkg.tar.zst` from the working tree and prints its path.
   - `files.expected`: lines `<mode> <path>` (paths without a leading slash; the license lines use `%PKGNAME%`).
   - `test-packages.sh`: runs as root in an Arch container; exits 0 only if every check passes. Tasks 3 extends it.
@@ -491,7 +492,7 @@ Create `packaging/arch/files.expected`:
 
 - [ ] **Step 2: Write `common.sh`**
 
-Create `packaging/arch/common.sh` (sourced by each PKGBUILD inside `build()` and `package()`; `$_srcdir`, `$pkgdir`, `$pkgname` come from the PKGBUILD):
+Create `packaging/arch/common.sh` (sourced by each PKGBUILD inside `build()` and `package()`; `$_srcname`, `$pkgdir`, `$pkgname` come from the PKGBUILD):
 
 ```bash
 # Shared by the three PKGBUILDs: what to build and what to install. The
@@ -499,13 +500,13 @@ Create `packaging/arch/common.sh` (sourced by each PKGBUILD inside `build()` and
 # license files (spec: docs/superpowers/specs/2026-09-29-aleph-arch-packaging-design.md).
 
 aleph_build() {
-  cd "$_srcdir"
+  cd "$srcdir/$_srcname"
   export CARGO_TARGET_DIR=target
   cargo build --release --workspace --locked
 }
 
 aleph_package() {
-  cd "$_srcdir"
+  cd "$srcdir/$_srcname"
   local r=target/release
 
   install -Dm755 "$r/alephctl" "$pkgdir/usr/bin/alephctl"
@@ -553,8 +554,9 @@ pkgdesc='A Rust Secret Service keyring backed by a TPM and FIDO2 keys'
 arch=('x86_64')
 url='https://github.com/kisom/aleph-keyring'
 license=('Apache-2.0')
-depends=(tpm2-tss libfido2 pam dbus)
+depends=(tpm2-tss libfido2 pam dbus openssl hicolor-icon-theme wayland libxkbcommon libglvnd)
 makedepends=(rust clang pkgconf)
+options=('!debug')
 provides=('org.freedesktop.secrets' 'aleph-keyring')
 conflicts=('aleph-keyring' 'aleph-keyring-git')
 backup=('etc/pam.d/aleph-check')
@@ -562,7 +564,7 @@ install=aleph-keyring.install
 source=("aleph-src.tar.gz")
 sha256sums=('SKIP')   # the tarball is made by make-pkg.sh from the working tree
 
-_srcdir="$srcdir/aleph-src"
+_srcname=aleph-src
 
 build() {
   . "$startdir/common.sh"
@@ -702,7 +704,7 @@ grep -q '^aleph-src/\.git/' /tmp/tarball.list && fail "the tarball must not cont
 info=$(pacman -Qip "$pkg")
 echo "$info" | grep -q '^Name *: aleph-keyring-local' && pass "the package name" || fail "the package name"
 echo "$info" | grep -q '^Licenses *: Apache-2.0' && pass "the license" || fail "the license"
-for dep in tpm2-tss libfido2 pam dbus; do
+for dep in tpm2-tss libfido2 pam dbus openssl hicolor-icon-theme wayland libxkbcommon libglvnd; do
     echo "$info" | grep -q "^Depends On .*\\b$dep\\b" && pass "depends on $dep" || fail "depends on $dep"
 done
 echo "$info" | grep -q '^Provides .*org.freedesktop.secrets' && pass "provides org.freedesktop.secrets" \
@@ -917,8 +919,9 @@ pkgdesc='A Rust Secret Service keyring backed by a TPM and FIDO2 keys'
 arch=('x86_64')
 url='https://github.com/kisom/aleph-keyring'
 license=('Apache-2.0')
-depends=(tpm2-tss libfido2 pam dbus)
+depends=(tpm2-tss libfido2 pam dbus openssl hicolor-icon-theme wayland libxkbcommon libglvnd)
 makedepends=(rust clang pkgconf git)
+options=('!debug')
 provides=('org.freedesktop.secrets' 'aleph-keyring')
 conflicts=('aleph-keyring' 'aleph-keyring-local')
 backup=('etc/pam.d/aleph-check')
@@ -926,7 +929,7 @@ install=aleph-keyring.install
 source=("aleph-src::git+$url.git")
 sha256sums=('SKIP')   # a git source has no checksum
 
-_srcdir="$srcdir/aleph-src"
+_srcname=aleph-src
 
 pkgver() {
   cd "$srcdir/aleph-src"
@@ -957,8 +960,9 @@ pkgdesc='A Rust Secret Service keyring backed by a TPM and FIDO2 keys'
 arch=('x86_64')
 url='https://github.com/kisom/aleph-keyring'
 license=('Apache-2.0')
-depends=(tpm2-tss libfido2 pam dbus)
+depends=(tpm2-tss libfido2 pam dbus openssl hicolor-icon-theme wayland libxkbcommon libglvnd)
 makedepends=(rust clang pkgconf)
+options=('!debug')
 provides=('org.freedesktop.secrets')
 conflicts=('aleph-keyring-git' 'aleph-keyring-local')
 backup=('etc/pam.d/aleph-check')
@@ -966,7 +970,7 @@ install=aleph-keyring.install
 source=("aleph-keyring-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')  # FILLED AT RELEASE by `make pkgbuild-release TAG=vX.Y.Z`
 
-_srcdir="$srcdir/aleph-keyring-$pkgver"
+_srcname="aleph-keyring-$pkgver"
 
 build() {
   . "$startdir/common.sh"

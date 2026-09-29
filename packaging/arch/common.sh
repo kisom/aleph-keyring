@@ -8,6 +8,10 @@
 aleph_build() {
   cd "$srcdir/$_srcname"
   export CARGO_TARGET_DIR=target
+  # (Generated code's panic locations name OUT_DIR, under $srcdir: with
+  # options=('!debug') makepkg no longer remaps it, so this does, the way
+  # makepkg's debug option would.)
+  export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$srcdir=/usr/src/debug/$pkgname"
   cargo build --release --workspace --locked
 }
 

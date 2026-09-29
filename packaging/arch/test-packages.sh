@@ -9,25 +9,24 @@ set -eu
 
 src=${ALEPH_SRC:-/src}
 work=/work
+# (cargo's registry; the PKGBUILD builds in its own srcdir, common.sh sets
+# CARGO_TARGET_DIR there.)
 export CARGO_HOME=/work/cargo
-export CARGO_TARGET_DIR=/work/target
 
 failures=0
 fail() { printf 'not ok - %s\n' "$1" >&2; failures=$((failures + 1)); }
 pass() { printf 'ok - %s\n' "$1"; }
-check() { # check DESCRIPTION COMMAND...
-    desc=$1
-    shift
-    if "$@" >/tmp/check.out 2>&1; then pass "$desc"; else
-        cat /tmp/check.out >&2
-        fail "$desc"
-    fi
-}
+
+# The package's depends (the PKGBUILD's list): makepkg checks them too.
+rundeps='tpm2-tss libfido2 pam dbus openssl hicolor-icon-theme wayland libxkbcommon libglvnd'
+# Those only aleph-gui loads with dlopen, removed again before pacman -U so
+# that the install must bring them back through depends.
+guideps='wayland libxkbcommon libglvnd'
 
 # --- environment: an unprivileged builder, the build dependencies, a copy of the tree
 # (Three tries: a mirror that drops the connection fails the whole transaction.)
 for try in 1 2 3; do
-    if pacman -Syu --noconfirm --needed rust clang pkgconf git tpm2-tss libfido2 pam dbus namcap >/dev/null; then
+    if pacman -Syu --noconfirm --needed rust clang pkgconf git namcap $rundeps >/dev/null; then
         break
     fi
     [ "$try" -lt 3 ] || { echo "test-packages.sh: pacman could not install the build dependencies" >&2; exit 1; }
@@ -60,8 +59,11 @@ if [ -f "$work/tree/.git" ]; then
     git -C "$work/tree" reset -q
 fi
 # A dirty tree on purpose (Review Focus 5): an untracked file the package
-# tarball must carry, and the version must say so.
+# tarball must carry, a tracked file deleted without staging the deletion
+# (the tarball must leave it out, and the build must not fail on it), and
+# the version must say so.
 echo marker >"$work/tree/untracked-marker.txt"
+rm "$work/tree/README.md"
 chown -R builder: "$work"
 
 as_builder() { su builder -c "cd $work/tree && $*"; }
@@ -78,7 +80,7 @@ chmod +x /usr/local/bin/systemctl
 # (makepkg's messages and the path go to /tmp/pkg.out, cargo's progress to
 # stderr; a failed build stops here, since nothing below can run.)
 pkgname=aleph-keyring-local
-if as_builder 'CARGO_HOME=/work/cargo CARGO_TARGET_DIR=/work/target sh packaging/arch/make-pkg.sh local' >/tmp/pkg.out; then
+if as_builder 'CARGO_HOME=/work/cargo sh packaging/arch/make-pkg.sh local' >/tmp/pkg.out; then
     pkg=$(tail -n 1 /tmp/pkg.out)
 else
     cat /tmp/pkg.out >&2
@@ -92,15 +94,32 @@ if [ -f "$pkg" ]; then pass "make pkg builds a package of the working tree"; els
 fi
 
 # (Review Focus 5.) The tree was made dirty on purpose: the version says so,
-# the tarball carries the untracked file and never target/ or .git.
-case $pkg in
-*.dirty-*) pass "a dirty tree gives a .dirty version" ;;
-*) fail "a dirty tree gives a .dirty version (package: $pkg)" ;;
+# the tarball carries the untracked file, not the deleted one, and never
+# target/ or .git; the real index is left alone.
+case ${pkg##*/} in
+"$pkgname"-*.dirty[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-1-x86_64.pkg.tar.zst)
+    pass "a dirty tree gives a .dirty<timestamp> version" ;;
+*) fail "a dirty tree gives a .dirty<timestamp> version (package: $pkg)" ;;
 esac
+# (Two dirty builds a second apart: the later one must be newer to pacman.)
+v1=$(as_builder 'ALEPH_PKGVER_NOW=20260929134500 sh packaging/arch/pkgver.sh .')
+v2=$(as_builder 'ALEPH_PKGVER_NOW=20260929134501 sh packaging/arch/pkgver.sh .')
+[ "$(vercmp "$v2" "$v1")" = 1 ] && pass "a later dirty build is newer to vercmp ($v2 > $v1)" \
+    || fail "a later dirty build is newer to vercmp: vercmp $v2 $v1 = $(vercmp "$v2" "$v1")"
 tarball=$work/tree/target/pkg/local/aleph-src.tar.gz
 tar -tzf "$tarball" >/tmp/tarball.list
 if grep -q '^aleph-src/untracked-marker.txt$' /tmp/tarball.list; then pass "the tarball carries an untracked file"; else
     fail "the tarball carries an untracked file"
+fi
+if grep -q '^aleph-src/README.md$' /tmp/tarball.list; then fail "the tarball must not carry a deleted tracked file"; else
+    pass "the tarball leaves out a deleted tracked file"
+fi
+if (cd "$work/tree" && git status --porcelain -- README.md untracked-marker.txt) >/tmp/status.out &&
+    grep -qx ' D README.md' /tmp/status.out && grep -qx '?? untracked-marker.txt' /tmp/status.out; then
+    pass "the build left the index alone (the deletion is unstaged, the marker untracked)"
+else
+    cat /tmp/status.out >&2
+    fail "the build left the index alone (the deletion is unstaged, the marker untracked)"
 fi
 if grep -q '^aleph-src/Cargo.lock$' /tmp/tarball.list; then pass "the tarball carries the tracked files"; else
     fail "the tarball carries the tracked files"
@@ -118,7 +137,7 @@ fi
 info=$(pacman -Qip "$pkg")
 echo "$info" | grep -q "^Name *: $pkgname\$" && pass "the package name" || fail "the package name"
 echo "$info" | grep -q '^Licenses *: Apache-2.0' && pass "the license" || fail "the license"
-for dep in tpm2-tss libfido2 pam dbus; do
+for dep in $rundeps; do
     echo "$info" | grep -q "^Depends On .*\\b$dep\\b" && pass "depends on $dep" || fail "depends on $dep"
 done
 echo "$info" | grep -q '^Provides .*org\.freedesktop\.secrets' && pass "provides org.freedesktop.secrets" \
@@ -144,14 +163,53 @@ if diff -u /tmp/files.want /tmp/files.actual >/tmp/files.diff; then pass "the fi
     cat /tmp/files.diff >&2
     fail "the file list and modes match files.expected"
 fi
+# (The build directory must not leak into the binaries: generated code's
+# panic locations name OUT_DIR, under $srcdir; common.sh remaps it.)
+if grep -rl "$work/tree/target/pkg/local/src" /tmp/extract/usr >/tmp/srcdir.refs; then
+    cat /tmp/srcdir.refs >&2
+    fail "no file in the package names the build directory"
+else
+    pass "no file in the package names the build directory"
+fi
 
 # --- the hook, with the stub systemctl, through pacman
+# (The GUI's libraries go first, -dd: only the package's depends may bring
+# them back.)
+pacman -Rdd --noconfirm $guideps >/dev/null
+for so in libwayland-client.so.0 libxkbcommon.so.0 libEGL.so.1; do
+    [ ! -e "/usr/lib/$so" ] || fail "/usr/lib/$so is still there before pacman -U"
+done
 : >/tmp/systemctl.calls
 pacman -U --noconfirm "$pkg" >/tmp/install.out 2>&1 || { cat /tmp/install.out >&2; fail "pacman -U installs the package"; }
 want='daemon-reload;enable --now aleph-tpmd.socket;--global enable alephd.socket;'
 got=$(tr '\n' ';' </tmp/systemctl.calls)
 [ "$got" = "$want" ] && pass "post_install ran the spec's systemctl calls" || fail "post_install calls: $got"
 grep -q 'alephctl setup' /tmp/install.out && pass "post_install printed the next steps" || fail "post_install printed the next steps"
+
+# --- run-time libraries, now that pacman installed the package and its
+# depends. The linked ones (NEEDED) must resolve; aleph-gui (the prompter
+# alephd starts) loads its Wayland, xkbcommon and EGL libraries with
+# dlopen, so they are not NEEDED: each soname it names must be installed.
+for bin in /usr/bin/alephctl /usr/bin/aleph-gui /usr/lib/aleph/alephd /usr/lib/aleph/aleph-tpmd \
+    /usr/lib/security/pam_aleph.so; do
+    echo "NEEDED by $bin: $(readelf -d "$bin" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | tr '\n' ' ')"
+    if ldd "$bin" >/tmp/ldd.out 2>&1 && ! grep -q 'not found' /tmp/ldd.out; then
+        pass "every linked library of $bin resolves"
+    else
+        cat /tmp/ldd.out >&2
+        fail "every linked library of $bin resolves"
+    fi
+done
+echo "sonames named in aleph-gui (dlopen): $(strings /usr/bin/aleph-gui | grep -oE 'lib[A-Za-z0-9_+-]+\.so\.[0-9]+' | sort -u | tr '\n' ' ')"
+for so in libwayland-client.so.0 libwayland-egl.so.1 libxkbcommon.so.0 libEGL.so.1; do
+    if ! strings /usr/bin/aleph-gui | grep -q "$so"; then
+        fail "aleph-gui names $so (the list of dlopen'd libraries is out of date)"
+    elif owner=$(pacman -Qqo "/usr/lib/$so" 2>/dev/null); then
+        pass "aleph-gui's $so is installed (from $owner)"
+    else
+        fail "aleph-gui's $so is installed"
+    fi
+done
 
 : >/tmp/systemctl.calls
 pacman -U --noconfirm "$pkg" >/tmp/upgrade.out 2>&1 || { cat /tmp/upgrade.out >&2; fail "pacman -U reinstalls"; }

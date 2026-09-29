@@ -8,8 +8,13 @@ pkgdesc='A Rust Secret Service keyring backed by a TPM and FIDO2 keys'
 arch=('x86_64')
 url='https://github.com/kisom/aleph-keyring'
 license=('Apache-2.0')
-depends=(tpm2-tss libfido2 pam dbus)
+# (openssl: alephd links libcrypto; wayland, libxkbcommon and libglvnd:
+# aleph-gui loads libwayland-client/-egl, libxkbcommon and libEGL with
+# dlopen; hicolor-icon-theme: the icons' directories.)
+depends=(tpm2-tss libfido2 pam dbus openssl hicolor-icon-theme wayland libxkbcommon libglvnd)
 makedepends=(rust clang pkgconf)
+# (No -debug package: the release profile has no debug info to split.)
+options=('!debug')
 provides=('org.freedesktop.secrets' 'aleph-keyring')
 conflicts=('aleph-keyring' 'aleph-keyring-git')
 backup=('etc/pam.d/aleph-check')

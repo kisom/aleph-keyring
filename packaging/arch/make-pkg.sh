@@ -13,24 +13,23 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
 arch=packaging/arch
 
-version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-count=$(git rev-list --count HEAD)
-hash=$(git rev-parse --short HEAD)
-dirty=
-if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
-    dirty=.dirty
-fi
-# (pkgver may not contain a hyphen; the commit count and hash make every
-# rebuild of a changed tree an upgrade.)
-pkgver="$version.r$count.g$hash$dirty"
+# (0.1.0.r<count>.g<hash>, and .dirty<timestamp> for uncommitted changes.)
+pkgver=$(sh "$arch/pkgver.sh" "$root")
 
 out=target/pkg/$variant
 rm -rf "$out"
 mkdir -p "$out"
 
-# The working tree, as a tarball with one top directory (aleph-src).
-git ls-files -z --cached --others --exclude-standard |
-    tar --null -T - --transform 's,^,aleph-src/,' -czf "$out/aleph-src.tar.gz"
+# The working tree, as a tarball with one top directory (aleph-src): a
+# temporary index gets every change (`add -A` keeps .gitignore, adds
+# untracked files, drops deleted ones), and git archive writes its tree.
+# The real index and the working tree are left alone.
+tmpidx=$root/$out/index.tmp
+cp "$(git rev-parse --path-format=absolute --git-path index)" "$tmpidx"
+GIT_INDEX_FILE=$tmpidx git add -A
+tree=$(GIT_INDEX_FILE=$tmpidx git write-tree)
+rm -f "$tmpidx"
+git archive --prefix=aleph-src/ -o "$out/aleph-src.tar.gz" "$tree"
 
 sed "s/^pkgver=.*/pkgver=$pkgver/" "$arch/local/PKGBUILD" >"$out/PKGBUILD"
 cp "$arch/common.sh" "$arch/aleph-keyring.install" "$out/"

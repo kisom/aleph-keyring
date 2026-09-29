@@ -35,8 +35,9 @@ owner runs them with `sudo`), and everything NixOS.
 - **`make pkg`** tars the working tree (tracked and untracked files, minus
   what `.gitignore` ignores, so no `target/`) into a build directory and
   runs `makepkg -f` there, as the user. `pkgver` is `0.1.0.r<commits>.g<hash>`,
-  with `.dirty` appended when there are uncommitted changes, so a rebuild
-  always upgrades. Install with `sudo pacman -U`. The package name is
+  with `.dirty<YYYYMMDDHHMMSS>` (UTC) appended when there are uncommitted
+  changes, so a rebuild of a changed tree gets a new version (dirty builds
+  carry a timestamp). Install with `sudo pacman -U`. The package name is
   `aleph-keyring-local`, provides and conflicts as below.
 - **`aleph-keyring-git`** derives `pkgver()` from `git describe` (the commit
   count and hash while there is no tag).
@@ -53,13 +54,19 @@ owner runs them with `sudo`), and everything NixOS.
 - `pkgdesc`: A Rust Secret Service keyring backed by a TPM and FIDO2 keys.
   `url`: `https://github.com/kisom/aleph-keyring`. `license=('Apache-2.0')`.
   `arch=('x86_64')`. Maintainer line: `K. Isom <kyle@imap.cc>`.
-- `depends=(tpm2-tss libfido2 pam dbus)`; `makedepends=(rust clang pkgconf)`
-  (`clang` because the workspace uses `bindgen`), plus `git` for `-git`.
+- `depends=(tpm2-tss libfido2 pam dbus openssl hicolor-icon-theme wayland
+  libxkbcommon libglvnd)` (`openssl`: alephd links `libcrypto`; `wayland`,
+  `libxkbcommon`, `libglvnd`: `aleph-gui` loads `libwayland-client`,
+  `libwayland-egl`, `libxkbcommon` and `libEGL` with `dlopen`;
+  `hicolor-icon-theme`: the icons' directories);
+  `makedepends=(rust clang pkgconf)` (`clang` because the workspace uses
+  `bindgen`), plus `git` for `-git`.
 - `provides=('org.freedesktop.secrets' 'aleph-keyring')`; `conflicts` with
   the other two variants; **no** `conflicts` with `gnome-keyring` (setup
   switches between them).
-- `backup=('etc/pam.d/aleph-check')`. `options=(!lto)` if the build shows it
-  is needed.
+- `backup=('etc/pam.d/aleph-check')`. `options=('!debug')` (the release
+  profile has no debug info, so a `-debug` package would be empty);
+  `!lto` is not needed (the build works with makepkg's default `lto`).
 - `build()`: `cargo build --release --workspace --locked`.
   `check()` does not run the test suite: it needs `swtpm` and takes minutes,
   and CI runs the full gate.
