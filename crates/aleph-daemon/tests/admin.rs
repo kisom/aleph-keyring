@@ -1,6 +1,7 @@
 //! `io.aleph.Admin1` over a private bus, with the test as the prompter on
 //! its end of a socketpair (as the `aleph` CLI is).
 
+use std::collections::BTreeMap;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 
@@ -193,6 +194,181 @@ async fn setting_config_reauthenticates_and_saves() {
             .idle_timeout,
         900
     );
+}
+
+/// `SetConfigs` with a prompter answering `replies`; what it was sent.
+async fn converse_configs(
+    d: &Daemon,
+    values: &[(&str, &str)],
+    replies: Vec<FromPrompter>,
+) -> Vec<ToPrompter> {
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let prompter = Interactive::new(replies);
+    prompter.respond(ours);
+    let fd = zbus::zvariant::OwnedFd::from(OwnedFd::from(theirs));
+    admin(d)
+        .await
+        .call_method("SetConfigs", &(fd, map(values)))
+        .await
+        .unwrap();
+    tokio::task::spawn_blocking(move || prompter.sent())
+        .await
+        .unwrap()
+}
+
+fn map(values: &[(&str, &str)]) -> BTreeMap<String, String> {
+    values
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+async fn get_config(d: &Daemon, key: &str) -> String {
+    admin(d).await.call("GetConfig", &(key,)).await.unwrap()
+}
+
+/// Several settings change with one confirmation: one `Begin`, one
+/// question, the operation naming every change in key order.
+#[tokio::test(flavor = "multi_thread")]
+async fn several_settings_change_with_one_confirmation() {
+    let d = daemon().await;
+    converse(&d, "Create", &["password"], vec![password(PW)]).await;
+    let sent = converse_configs(
+        &d,
+        &[
+            ("prompt.timeout", "600"),
+            ("lock.on_suspend", "false"),
+            ("lock.idle_timeout", "900"),
+        ],
+        vec![password(PW)],
+    )
+    .await;
+    assert!(done(&sent).0, "{sent:?}");
+    let begins: Vec<&ToPrompter> = sent
+        .iter()
+        .filter(|m| matches!(m, ToPrompter::Begin { .. }))
+        .collect();
+    assert_eq!(begins.len(), 1, "{sent:?}");
+    assert!(matches!(
+        begins[0],
+        ToPrompter::Begin { operation, .. }
+            if operation
+                == "Set lock.idle_timeout = 900, lock.on_suspend = false, prompt.timeout = 600"
+    ));
+    assert_eq!(
+        sent.iter()
+            .filter(|m| matches!(m, ToPrompter::Ask { .. }))
+            .count(),
+        1,
+        "{sent:?}"
+    );
+    // No closing message: the window would hold its confirmation open.
+    assert_eq!(done(&sent), (true, None));
+    assert_eq!(get_config(&d, "lock.idle_timeout").await, "900");
+    assert_eq!(get_config(&d, "lock.on_suspend").await, "false");
+    assert_eq!(get_config(&d, "prompt.timeout").await, "600");
+    let saved = Config::load(&d.paths.config_file).unwrap();
+    assert_eq!(
+        (
+            saved.lock.idle_timeout,
+            saved.lock.on_suspend,
+            saved.prompt.timeout
+        ),
+        (900, false, 600)
+    );
+}
+
+/// A declined confirmation writes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_declined_confirmation_changes_no_setting() {
+    let d = daemon().await;
+    converse(&d, "Create", &["password"], vec![password(PW)]).await;
+    let sent = converse_configs(
+        &d,
+        &[("lock.idle_timeout", "900")],
+        vec![FromPrompter::Cancel {}],
+    )
+    .await;
+    assert!(!done(&sent).0, "{sent:?}");
+    assert_eq!(get_config(&d, "lock.idle_timeout").await, "0");
+    assert!(!d.paths.config_file.exists());
+}
+
+/// One bad pair, or none at all, is refused before any question.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bad_pair_or_an_empty_map_is_refused_before_any_question() {
+    let d = daemon().await;
+    converse(&d, "Create", &["password"], vec![password(PW)]).await;
+    for values in [
+        &[("lock.idle_timeout", "900"), ("prompt.timeout", "0")][..],
+        &[("lock.idel", "1")][..],
+        &[][..],
+    ] {
+        let (_ours, theirs) = UnixStream::pair().unwrap();
+        let fd = zbus::zvariant::OwnedFd::from(OwnedFd::from(theirs));
+        assert!(
+            admin(&d)
+                .await
+                .call_method("SetConfigs", &(fd, map(values)))
+                .await
+                .is_err(),
+            "{values:?}"
+        );
+    }
+    // (Not even the good pair of the first call was applied.)
+    assert_eq!(get_config(&d, "lock.idle_timeout").await, "0");
+    assert!(!d.paths.config_file.exists());
+}
+
+/// Re-authentication needs the vault open, so a locked one refuses.
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_are_not_saved_while_the_vault_is_locked() {
+    let d = daemon().await;
+    converse(&d, "Create", &["password"], vec![password(PW)]).await;
+    admin(&d).await.call_method("Lock", &()).await.unwrap();
+    let sent = converse_configs(&d, &[("lock.idle_timeout", "900")], vec![]).await;
+    assert!(!done(&sent).0, "{sent:?}");
+    assert_eq!(get_config(&d, "lock.idle_timeout").await, "0");
+    assert!(!d.paths.config_file.exists());
+}
+
+/// (Review Focus 1.) The pairs go onto the live configuration as it is
+/// when the confirmation ends: a change made by another call in between
+/// (`alephctl config set`, say) is not put back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_later_call_keeps_an_earlier_change() {
+    let d = daemon().await;
+    converse(&d, "Create", &["password"], vec![password(PW)]).await;
+    converse(
+        &d,
+        "SetConfig",
+        &["lock.idle_timeout", "900"],
+        vec![password(PW)],
+    )
+    .await;
+    let sent = converse_configs(&d, &[("prompt.timeout", "600")], vec![password(PW)]).await;
+    assert!(done(&sent).0, "{sent:?}");
+    assert_eq!(get_config(&d, "lock.idle_timeout").await, "900");
+    assert_eq!(get_config(&d, "prompt.timeout").await, "600");
+    let saved = Config::load(&d.paths.config_file).unwrap();
+    assert_eq!((saved.lock.idle_timeout, saved.prompt.timeout), (900, 600));
+}
+
+/// (Review Focus 2.) A file that cannot be written leaves the live
+/// configuration as it was, and the conversation ends in failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_save_leaves_the_live_configuration_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = daemon().await;
+    converse(&d, "Create", &["password"], vec![password(PW)]).await;
+    let dir = d.paths.config_file.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let sent = converse_configs(&d, &[("lock.idle_timeout", "900")], vec![password(PW)]).await;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!done(&sent).0, "{sent:?}");
+    assert_eq!(get_config(&d, "lock.idle_timeout").await, "0");
+    assert!(!d.paths.config_file.exists());
 }
 
 /// `Reauth` proves an enrolled method again and does nothing else: the

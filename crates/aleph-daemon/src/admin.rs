@@ -10,6 +10,7 @@
 //! Every method that changes keyslots or configuration re-authenticates
 //! first (the keyring engine does this).
 
+use std::collections::BTreeMap;
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -422,6 +423,50 @@ impl Admin {
                 next.save(&file)?;
                 *current = next;
                 Ok(Some(format!("{key} = {value}")))
+            })
+        })
+    }
+
+    /// Change several settings on one confirmation (the manager's SAVE):
+    /// every pair is checked before anything is asked, and all are applied
+    /// to the live configuration and saved once, or none is.
+    async fn set_configs(
+        &self,
+        prompter: zbus::zvariant::OwnedFd,
+        values: BTreeMap<String, String>,
+    ) -> zbus::fdo::Result<()> {
+        // Reject a bad key or value (or nothing at all) now.
+        self.config
+            .lock()
+            .unwrap()
+            .clone()
+            .set_many(&values)
+            .map_err(failed)?;
+        let operation = format!(
+            "Set {}",
+            values
+                .iter()
+                .map(|(k, v)| format!("{k} = {v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let (config, file) = (self.config.clone(), self.paths.config_file.clone());
+        self.converse(prompter, move |k, chan| {
+            k.with_reauth(chan, &operation, || {
+                // (The configuration as it is now, not the copy checked above:
+                // a change made meanwhile stays.)
+                let mut current = config.lock().unwrap();
+                let mut next = current.clone();
+                next.set_many(&values)?;
+                next.save(&file)?;
+                *current = next;
+                // (Keys only, never values.)
+                tracing::info!(
+                    "settings changed: {}",
+                    values.keys().cloned().collect::<Vec<_>>().join(", ")
+                );
+                // (No message: the manager's confirmation would stay up for it.)
+                Ok(None)
             })
         })
     }

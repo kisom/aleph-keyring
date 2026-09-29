@@ -3,6 +3,7 @@
 //! Unknown keys are errors, so a typo is reported rather than silently
 //! ignored. `alephctl config get|set` addresses values as `section.key`.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -150,6 +151,20 @@ impl Config {
         }
         Ok(())
     }
+
+    /// Every pair, or none: on an error `self` is unchanged. An empty map
+    /// is an error (there is nothing to confirm).
+    pub fn set_many(&mut self, values: &BTreeMap<String, String>) -> Result<()> {
+        if values.is_empty() {
+            return Err(Error::Config("no settings to change".into()));
+        }
+        let mut next = self.clone();
+        for (key, value) in values {
+            next.set(key, value)?;
+        }
+        *self = next;
+        Ok(())
+    }
 }
 
 fn unknown(key: &str) -> Error {
@@ -162,6 +177,41 @@ fn unknown(key: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_many_applies_all_or_none() {
+        use std::collections::BTreeMap;
+        let pairs = |p: &[(&str, &str)]| -> BTreeMap<String, String> {
+            p.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let mut c = Config::default();
+        let before = c.clone();
+        // One bad value: nothing changes, not even the good pair.
+        assert!(
+            c.set_many(&pairs(&[
+                ("lock.idle_timeout", "900"),
+                ("prompt.timeout", "0")
+            ]))
+            .is_err()
+        );
+        assert_eq!(c, before);
+        // An unknown key too, and an empty map.
+        assert!(c.set_many(&pairs(&[("lock.idel", "1")])).is_err());
+        assert!(c.set_many(&BTreeMap::new()).is_err());
+        assert_eq!(c, before);
+        c.set_many(&pairs(&[
+            ("lock.idle_timeout", "900"),
+            ("prompt.timeout", "600"),
+            ("lock.on_suspend", "false"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            (c.lock.idle_timeout, c.prompt.timeout, c.lock.on_suspend),
+            (900, 600, false)
+        );
+    }
 
     #[test]
     fn a_missing_file_gives_the_defaults() {
