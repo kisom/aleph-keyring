@@ -164,6 +164,17 @@ impl Timeout {
     pub fn reset(&mut self) {
         *self = Self::new(self.kind, self.read);
     }
+
+    /// `read` is what is in force now: unedited, the control follows it
+    /// (a `Kept` or a preset equal to the old value becomes the new
+    /// value's entry); edited, it keeps the choice and what was typed.
+    fn rebase(&mut self, read: u64) {
+        if self.edited() {
+            self.read = read;
+        } else {
+            *self = Self::new(self.kind, read);
+        }
+    }
 }
 
 /// The VAULT section's controls, and what was read (so that only what
@@ -239,6 +250,26 @@ impl Form {
         out
     }
 
+    /// alephd's values read again (after a save that may or may not have
+    /// gone through): they become what the edits are compared with. A
+    /// control left as it was follows its new value; an edited one keeps
+    /// the edit (and is no edit any more if it now matches). A reply that
+    /// cannot be read changes nothing.
+    pub fn rebase(&mut self, values: &BTreeMap<String, String>) -> Result<(), String> {
+        let fresh = Self::from_values(values)?;
+        if self.on_suspend == self.read_suspend {
+            self.on_suspend = fresh.read_suspend;
+        }
+        if self.on_screen_lock == self.read_screen_lock {
+            self.on_screen_lock = fresh.read_screen_lock;
+        }
+        self.read_suspend = fresh.read_suspend;
+        self.read_screen_lock = fresh.read_screen_lock;
+        self.idle.rebase(fresh.idle.read());
+        self.prompt.rebase(fresh.prompt.read());
+        Ok(())
+    }
+
     /// Put back what was read.
     pub fn cancel(&mut self) {
         self.on_suspend = self.read_suspend;
@@ -256,6 +287,18 @@ pub enum Values {
     Loading,
     Failed(String),
     Ready(Form),
+}
+
+impl Values {
+    /// Worth reading again (the screen reopened, the link back): a failed
+    /// read, or a form with no edits to keep.
+    pub(crate) fn is_stale(&self) -> bool {
+        match self {
+            Self::Failed(_) => true,
+            Self::Ready(f) => !f.edited(),
+            Self::Unknown | Self::Loading => false,
+        }
+    }
 }
 
 /// A section's header line.
@@ -594,6 +637,72 @@ mod tests {
         assert_eq!(f.prompt.error(), None);
         assert!(f.valid());
         assert_eq!(f.changes()["prompt.timeout"], "1200");
+    }
+
+    /// The reveal hold's list has no "Custom…", but its bounds are an hour
+    /// in whole minutes, should one be typed.
+    #[test]
+    fn typed_reveal_minutes_are_at_most_an_hour() {
+        assert_eq!(typed(Kind::Reveal, "0"), Ok(0));
+        assert_eq!(typed(Kind::Reveal, "60"), Ok(3600));
+        assert_eq!(
+            typed(Kind::Reveal, "61"),
+            Err("whole minutes, 0 to 60".to_string())
+        );
+    }
+
+    /// After an interrupted save the values are read again: what is in
+    /// force becomes the baseline, an unedited control follows it, and an
+    /// edited one keeps the edit.
+    #[test]
+    fn a_rebase_keeps_the_edits_and_follows_the_rest() {
+        let mut f = form("0", "300");
+        f.idle.choice = Choice::Preset(900);
+        f.on_screen_lock = false;
+        // alephd now holds: idle 0 (as read), prompt 900 (changed
+        // elsewhere), suspend off (changed elsewhere), screen lock on.
+        f.rebase(&values("0", "900", "false")).unwrap();
+        assert_eq!(f.idle.choice, Choice::Preset(900), "an edit stays");
+        assert!(!f.on_screen_lock, "an edit stays");
+        assert_eq!(f.prompt.choice, Choice::Preset(900), "follows");
+        assert!(!f.on_suspend, "follows");
+        assert_eq!(
+            f.changes(),
+            BTreeMap::from([
+                ("lock.idle_timeout".to_string(), "900".to_string()),
+                ("lock.on_screen_lock".to_string(), "false".to_string()),
+            ])
+        );
+        // The save had gone through: nothing is an edit any more.
+        let mut saved = values("900", "900", "false");
+        saved.insert("lock.on_screen_lock".into(), "false".into());
+        f.rebase(&saved).unwrap();
+        assert!(!f.edited(), "{f:?}");
+        // A kept value (not a preset) follows too; a typed one stays.
+        let mut f = form("7200", "90");
+        f.prompt.choose_custom();
+        f.prompt.typed = "20".into();
+        f.rebase(&values("5400", "600", "true")).unwrap();
+        assert_eq!(f.idle.choice, Choice::Kept);
+        assert_eq!(f.idle.value(), Ok(5400));
+        assert_eq!(f.prompt.choice, Choice::Custom);
+        assert_eq!(f.prompt.typed, "20");
+        assert_eq!(f.prompt.read(), 600);
+        // A reply that cannot be read changes nothing.
+        let before = f.clone();
+        assert!(f.rebase(&values("soon", "600", "true")).is_err());
+        assert_eq!(f, before);
+    }
+
+    #[test]
+    fn stale_values_are_read_again_and_edits_are_not() {
+        assert!(Values::Failed("x".into()).is_stale());
+        let mut f = form("0", "300");
+        assert!(Values::Ready(f.clone()).is_stale());
+        f.on_suspend = false;
+        assert!(!Values::Ready(f).is_stale());
+        assert!(!Values::Unknown.is_stale());
+        assert!(!Values::Loading.is_stale());
     }
 
     #[test]

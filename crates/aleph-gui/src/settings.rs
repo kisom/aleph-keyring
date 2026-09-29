@@ -54,15 +54,16 @@ impl Settings {
     /// The file's settings; the defaults if it is missing, and (with a
     /// warning) if it is unreadable: a prompt must still open.
     pub fn load(path: &Path) -> (Self, Option<String>) {
-        match Self::read(path) {
+        match Self::read_strict(path) {
             Ok(s) => (s, None),
             Err(e) => (Self::default(), Some(format!("{e} (using the defaults)"))),
         }
     }
 
     /// The file's settings, the defaults if it does not exist, and an
-    /// error naming the file if it cannot be read as settings.
-    fn read(path: &Path) -> Result<Self, String> {
+    /// error naming the file if it cannot be read as settings (no
+    /// defaults then: a DISPLAY change starts from what is in the file).
+    pub fn read_strict(path: &Path) -> Result<Self, String> {
         match std::fs::read_to_string(path) {
             Ok(text) => toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -74,7 +75,7 @@ impl Settings {
     /// overwritten (the owner fixes it, or resets it). Comments in the
     /// file are lost: the whole file is rewritten.
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        Self::read(path)?;
+        Self::read_strict(path)?;
         self.write(path)
     }
 
@@ -83,15 +84,25 @@ impl Settings {
         Self::default().write(path)
     }
 
-    /// Atomically: a temp file, then a rename; the directory is created.
+    /// Atomically: a temp file (this process's own, on disk before the
+    /// rename), then a rename; the directory is created. A temp file left
+    /// by a failure is removed.
     fn write(&self, path: &Path) -> Result<(), String> {
+        use std::io::Write;
         let at = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
         let dir = path.parent().ok_or_else(|| at(&"no directory"))?;
         std::fs::create_dir_all(dir).map_err(|e| at(&e))?;
         let text = toml::to_string(self).map_err(|e| at(&e))?;
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, text).map_err(|e| at(&e))?;
-        std::fs::rename(&tmp, path).map_err(|e| at(&e))
+        let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+        let written = std::fs::File::create(&tmp).and_then(|mut f| {
+            f.write_all(text.as_bytes())?;
+            f.sync_all()
+        });
+        let done = written.and_then(|()| std::fs::rename(&tmp, path));
+        if done.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        done.map_err(|e| at(&e))
     }
 }
 
@@ -245,6 +256,23 @@ mod tests {
         // Reset is the way out: it writes the defaults.
         Settings::reset(&file).unwrap();
         assert_eq!(Settings::load(&file), (Settings::default(), None));
+    }
+
+    /// A write whose rename fails (the file's place is taken by a
+    /// directory) says so and leaves no temp file behind.
+    #[test]
+    fn a_failed_rename_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("gui.toml");
+        std::fs::create_dir(&file).unwrap();
+        std::fs::write(file.join("inside"), b"x").unwrap();
+        assert!(Settings::reset(&file).is_err());
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[test]

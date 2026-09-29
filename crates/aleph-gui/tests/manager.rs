@@ -1366,6 +1366,12 @@ fn a_broken_gui_toml_is_shown_and_never_overwritten_until_reset() {
     frames(&mut h);
     h.get_by_label_contains("unknown field `scanline`");
     // The controls are disabled: a click changes nothing.
+    for control in ["Auto", "Neon", "Scanlines"] {
+        assert!(
+            h.get_by_label(control).accesskit_node().is_disabled(),
+            "{control} is enabled"
+        );
+    }
     h.get_by_label("Auto").click();
     h.get_by_label("Scanlines").click();
     frames(&mut h);
@@ -1396,6 +1402,77 @@ fn a_failed_write_says_so_and_the_change_holds() {
     frames(&mut h);
     h.get_by_label_contains("not saved");
     assert_eq!(h.state().settings().theme, ThemeChoice::Neon);
+}
+
+/// A write that works again clears the "not saved" it follows.
+#[test]
+fn a_write_that_works_again_clears_the_not_saved_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, b"a file, not a directory").unwrap();
+    let file = blocker.join("gui.toml");
+    let (mut h, _store) = display_window(ThemeChoice::Auto, file.clone(), None);
+    h.get_by_label("SETTINGS").click();
+    frames(&mut h);
+    h.get_by_label("Neon").click();
+    frames(&mut h);
+    h.get_by_label_contains("not saved");
+    std::fs::remove_file(&blocker).unwrap();
+    h.get_by_label("Auto").click();
+    frames(&mut h);
+    assert!(h.query_by_label_contains("not saved").is_none());
+    assert_eq!(gui_toml(&file).theme, ThemeChoice::Auto);
+}
+
+/// A DISPLAY change writes only its own field over what is in the file
+/// now: a hand-edit made while the window runs is kept.
+#[test]
+fn a_display_change_keeps_a_hand_edit_made_meanwhile() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("gui.toml");
+    std::fs::write(&file, "theme = \"neon\"\n").unwrap();
+    let (mut h, _store) = display_window(ThemeChoice::Auto, file.clone(), None);
+    h.get_by_label("SETTINGS").click();
+    frames(&mut h);
+    std::fs::write(&file, "theme = \"neon\"\nreveal_hold = 900\n").unwrap();
+    h.get_by_label("Scanlines").click();
+    frames(&mut h);
+    let on_disk = gui_toml(&file);
+    assert_eq!(on_disk.reveal_hold, 900, "the hand-edit was reverted");
+    assert_eq!(on_disk.theme, ThemeChoice::Neon);
+    assert!(!on_disk.scanlines);
+    assert!(!h.state().settings().scanlines);
+}
+
+/// A reset that cannot be written changes nothing: the settings in force
+/// and the file's error stay, and the window says so.
+#[test]
+fn a_failed_reset_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("gui.toml");
+    std::fs::create_dir(&file).unwrap();
+    std::fs::write(file.join("inside"), b"x").unwrap();
+    let broken = format!("{}: Is a directory (using the defaults)", file.display());
+    let (mut h, _store) = display_window(ThemeChoice::Neon, file.clone(), Some(&broken));
+    h.get_by_label("SETTINGS").click();
+    frames(&mut h);
+    let palette = h.state().palette.clone();
+    h.get_by_label("RESET TO DEFAULTS").click();
+    frames(&mut h);
+    h.get_by_label_contains("not reset");
+    assert_eq!(h.state().settings().theme, ThemeChoice::Neon);
+    assert_eq!(h.state().palette.accent, palette.accent);
+    h.get_by_label_contains("Is a directory (using the defaults)");
+    h.get_by_label("RESET TO DEFAULTS");
+}
+
+/// Reduced motion: the Scanlines control says they are off anyway.
+#[test]
+fn the_scanlines_control_says_reduced_motion_turns_them_off() {
+    let (mut h, _store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("SETTINGS").click();
+    frames(&mut h);
+    h.get_by_label_contains("reduced motion");
 }
 
 /// Every view, in both themes.

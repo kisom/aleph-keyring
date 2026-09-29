@@ -131,6 +131,9 @@ pub struct Manager<S: Store, B: Backend> {
     settings: Settings,
     settings_file: Option<PathBuf>,
     display_broken: Option<String>,
+    /// The status a failed DISPLAY write or reset put up: the next one
+    /// that works takes it down.
+    display_error: Option<String>,
     home: Option<PathBuf>,
     still: bool,
     pub palette: Palette,
@@ -174,6 +177,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
             settings,
             settings_file: None,
             display_broken: None,
+            display_error: None,
             home,
             still,
             palette,
@@ -200,35 +204,57 @@ impl<S: Store, B: Backend> Manager<S, B> {
     /// A DISPLAY change: in effect now, and written to gui.toml. A write
     /// that fails is said so; the change holds for this run.
     fn apply_display(&mut self, ctx: &egui::Context, action: DisplayAction) {
-        match action {
-            DisplayAction::Theme(t) => self.settings.theme = t,
-            DisplayAction::Scanlines(on) => self.settings.scanlines = on,
-            DisplayAction::Reveal(secs) => self.settings.reveal_hold = secs,
-            DisplayAction::Reset => {
-                self.settings = Settings::default();
-                let done = match &self.settings_file {
-                    Some(file) => Settings::reset(file),
-                    None => Ok(()),
-                };
-                match done {
-                    Ok(()) => self.display_broken = None,
-                    Err(e) => self.status = Some(format!("not reset: {e}")),
-                }
-                self.palette = theme::resolve(&self.settings, self.home.as_deref());
-                theme::apply(ctx, &self.palette);
+        // (Only the field changed is written, over what the file holds
+        // now: a hand-edit made while the window runs is kept.)
+        let set = |s: &mut Settings| match action {
+            DisplayAction::Theme(t) => s.theme = t,
+            DisplayAction::Scanlines(on) => s.scanlines = on,
+            DisplayAction::Reveal(secs) => s.reveal_hold = secs,
+            DisplayAction::Reset => *s = Settings::default(),
+        };
+        if action == DisplayAction::Reset {
+            // (Nothing changes unless the defaults are written.)
+            let done = match &self.settings_file {
+                Some(file) => Settings::reset(file),
+                None => Ok(()),
+            };
+            if let Err(e) = done {
+                self.display_failed(format!("not reset: {e}"));
                 return;
             }
+            self.display_broken = None;
         }
+        set(&mut self.settings);
         self.palette = theme::resolve(&self.settings, self.home.as_deref());
         theme::apply(ctx, &self.palette);
         let written = match &self.settings_file {
-            Some(file) => self.settings.save(file),
+            _ if action == DisplayAction::Reset => Ok(()),
+            Some(file) => Settings::read_strict(file).and_then(|mut on_disk| {
+                set(&mut on_disk);
+                on_disk.save(file)
+            }),
             None => Err("no configuration directory".to_string()),
         };
-        if let Err(e) = written {
-            self.status = Some(format!(
+        match written {
+            Ok(()) => self.display_worked(),
+            Err(e) => self.display_failed(format!(
                 "not saved: {e} (the change holds until the window closes)"
-            ));
+            )),
+        }
+    }
+
+    /// A DISPLAY write or reset failed: the status says so.
+    fn display_failed(&mut self, why: String) {
+        self.status = Some(why.clone());
+        self.display_error = Some(why);
+    }
+
+    /// One worked: a failure's status still up goes (not another one).
+    fn display_worked(&mut self) {
+        if let Some(why) = self.display_error.take()
+            && self.status.as_ref() == Some(&why)
+        {
+            self.status = None;
         }
     }
 
@@ -387,12 +413,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     if up && !was_up {
                         // (The link is back: read again, unless there are
                         // edits, which stay.)
-                        let again = match &self.values {
-                            Values::Failed(_) => true,
-                            Values::Ready(f) => !f.edited(),
-                            _ => false,
-                        };
-                        if again {
+                        if self.values.is_stale() {
                             self.values = Values::Unknown;
                         }
                     }
@@ -601,12 +622,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
             if page == Page::Settings && self.page != Page::Settings {
                 // (Opening the screen reads the values again, unless there
                 // are edits, which stay.)
-                let again = match &self.values {
-                    Values::Failed(_) => true,
-                    Values::Ready(f) => !f.edited(),
-                    _ => false,
-                };
-                if again {
+                if self.values.is_stale() {
                     self.values = Values::Unknown;
                 }
             }
