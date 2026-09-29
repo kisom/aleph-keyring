@@ -26,6 +26,7 @@ pub const SUSPEND_WARNING: &str =
 pub const SAVE_NOTE: &str =
     "Saving asks you to confirm it is you, once (a FIDO2 touch or your login password).";
 pub const LOCKED_NOTE: &str = "VAULT SEALED :: SAVE WILL UNLOCK FIRST";
+pub const FOCUS_NOTE: &str = "unlocked: click this window to finish saving";
 
 /// Which duration a control sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -315,6 +316,9 @@ pub struct VaultView {
     pub sealed: bool,
     /// An unlock asked for by Save is under way: Save waits for it.
     pub unlocking: bool,
+    /// That unlock is done, but the window lacks the keyboard: the save
+    /// waits for it instead (and says so).
+    pub unlocked_waiting_focus: bool,
 }
 
 /// What the person asked of the VAULT section.
@@ -421,7 +425,9 @@ pub fn vault_section(
         if ui.add_enabled(ready, egui::Button::new("SAVE")).clicked() {
             action = Some(VaultAction::Save);
         }
-        if view.unlocking {
+        if view.unlocked_waiting_focus {
+            ui.label(FOCUS_NOTE);
+        } else if view.unlocking {
             ui.label("waiting for the unlock…");
         }
     });

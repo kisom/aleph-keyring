@@ -848,6 +848,9 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     enabled: up,
                     sealed,
                     unlocking: self.save_after_unlock,
+                    // (Still waiting once open: `resume_save` waits for focus.)
+                    unlocked_waiting_focus: self.save_after_unlock
+                        && matches!(self.vault, Vault::Unlocked(_)),
                 };
                 action = settings_page::vault_section(ui, p, form, &view);
             }

@@ -1403,13 +1403,21 @@ fn a_resumed_save_waits_for_the_window_to_be_focused() {
     // (alephd's unlock prompt has the keyboard.)
     h.input_mut().focused = false;
     h.event(egui::Event::WindowFocused(false));
+    frames(&mut h);
+    h.get_by_label("waiting for the unlock…");
     store.send(StoreEvent::Vault(vault()));
     frames(&mut h);
     assert!(store.take().is_empty(), "confirmation opened unseen");
-    h.get_by_label("waiting for the unlock…");
+    // (Unlocked now: what it waits for is this window.)
+    assert!(h.query_by_label("waiting for the unlock…").is_none());
+    h.get_by_label("unlocked: click this window to finish saving");
     h.input_mut().focused = true;
     h.event(egui::Event::WindowFocused(true));
     frames(&mut h);
+    assert!(
+        h.query_by_label("unlocked: click this window to finish saving")
+            .is_none()
+    );
     let (_fd, map) = saved_map(only(store.take()));
     assert_eq!(
         map,
