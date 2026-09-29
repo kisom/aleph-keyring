@@ -378,6 +378,12 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     if !up && matches!(self.values, Values::Loading) {
                         self.values = Values::Unknown;
                     }
+                    if !up && self.save_after_unlock {
+                        // (No `Done` comes for an unlock that alephd went away
+                        // in: the waiting save is dropped here.)
+                        self.save_after_unlock = false;
+                        self.status = Some("alephd went away: nothing was saved".into());
+                    }
                     if up && !was_up {
                         // (The link is back: read again, unless there are
                         // edits, which stay.)
@@ -592,6 +598,18 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 });
             });
         if let Some(page) = go {
+            if page == Page::Settings && self.page != Page::Settings {
+                // (Opening the screen reads the values again, unless there
+                // are edits, which stay.)
+                let again = match &self.values {
+                    Values::Failed(_) => true,
+                    Values::Ready(f) => !f.edited(),
+                    _ => false,
+                };
+                if again {
+                    self.values = Values::Unknown;
+                }
+            }
             self.page = page;
         }
         match self.page {

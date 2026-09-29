@@ -1085,6 +1085,43 @@ fn unsaved_edits_are_kept_across_screens() {
     assert!(h.state().form().unwrap().edited());
 }
 
+/// Reopening SETTINGS with nothing edited reads the values again.
+#[test]
+fn reopening_settings_reads_again_when_unedited() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_settings(&mut h, &store, "0", "300", "true");
+    h.get_by_label("SECRETS").click();
+    frames(&mut h);
+    assert!(store.take().is_empty());
+    h.get_by_label("SETTINGS").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Config));
+    store.send(config("900", "300", "true"));
+    frames(&mut h);
+    h.get_by_label("Idle lock: 15 min");
+}
+
+/// alephd going away during the unlock a save waits for drops the save.
+#[test]
+fn alephd_going_away_drops_a_save_waiting_for_the_unlock() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, Vault::Locked);
+    open_settings(&mut h, &store, "0", "300", "true");
+    pick(&mut h, "Idle lock", "15 min");
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Unlock));
+    store.send(StoreEvent::Vault(Vault::Unreachable("gone".into())));
+    frames(&mut h);
+    h.get_by_label_contains("nothing was saved");
+    store.send(StoreEvent::Vault(vault()));
+    frames(&mut h);
+    assert!(
+        store.take().is_empty(),
+        "no save, no re-read of an edited form"
+    );
+    h.get_by_label("Idle lock: 15 min");
+}
+
 /// A locked vault: the values show, Save says it will unlock first, asks
 /// alephd to unlock, and confirms and saves once the vault is open.
 #[test]
