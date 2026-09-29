@@ -168,7 +168,7 @@ while prototyping") and pinned by a test that was seen to fail without it.
 - **A reveal confirmation holds for 5 minutes,** and not past a lock (5c
   may make the length a setting). It is the guard against a glance that
   §6 describes, not security; the manager says so where it asks. alephd
-  gains `Reauth` for it.
+  gains `Reauth` for it. (Now a setting: see I1.)
 - **Import and export stay** in `alephctl setup` and `setup --revert`.
 
 ## 2026-09-28: Plan 5a (the prompter), design

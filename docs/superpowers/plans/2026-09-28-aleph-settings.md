@@ -30,7 +30,7 @@ Each line has a test in the task named after it.
 
 1. **Another program changes the configuration while the form is open** (`alephctl config set`): `SetConfigs` must apply the pairs to alephd's live configuration as it is then, not to a copy read earlier, so an unrelated earlier change survives. (Task 1)
 2. **The configuration file cannot be written** (a read-only directory): the live configuration must stay as it was and the conversation must end `Done { ok: false }`. (Task 1)
-3. **Typed minutes that look like numbers but are not**: empty, `0` for the prompt timeout, ` 15 ` (spaces), `+5`, `-1`, `1e3`, `１５` (full-width digits), and one so large that `× 60` would overflow: all rejected, none panics. (Task 4)
+3. **Typed minutes that look like numbers but are not**: empty, `0` for the prompt timeout, `+5`, `-1`, `1e3`, `１５` (full-width digits), and one so large that `× 60` would overflow: all rejected, none panics. (Surrounding spaces, as in ` 15 `, are trimmed and accepted.) (Task 4)
 4. **A hand-edited `gui.toml`**: `reveal_hold` above 3600, a value that is not a preset, and a broken file: read as 3600, shown as `Custom (N s)`, and never overwritten. (Tasks 2, 6)
 5. **The vault locks, the window loses focus, or alephd refuses, while the confirmation is on screen; or the unlock Save asked for is dismissed**: the edits stay, the window says nothing was saved, and Save cannot fire twice (and a later unlock by something else does not resume a dropped save). (Task 5)
 

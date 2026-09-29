@@ -1128,14 +1128,15 @@ three plans (DECISIONS.md H7):
   through `org.freedesktop.secrets`, over an encrypted session). Folders
   and a searchable item list, a detail pane (label, attributes read-only,
   dates, the secret masked); show and copy after a re-authentication that
-  holds for 5 minutes and not past a lock (a UX guard, §6); copies go to
+  holds for the `reveal_hold` setting (default 5 minutes) and not past a
+  lock (a UX guard, §6); copies go to
   the Wayland clipboard with the MIME hint `x-kde-passwordManagerHint:
   secret`, so clipboard-history tools skip them, and are cleared after
   30 s; items are created, renamed, given a new secret, and deleted;
   folders are created and deleted (alephd confirms). A `.desktop` entry
   puts it in the Omarchy launcher, with the icons in `assets/icons/` (§8).
-- **Settings (Plan 5c):** lock policy, prompt timeout, theme and
-  scanlines.
+- **Settings (Plan 5c):** lock policy, prompt timeout, theme,
+  scanlines and the reveal hold.
 - **Admin (Plan 5d):** the GUI equivalent of `alephctl`: status, lock and
   unlock, keyslots, master-key rotation, recovery key, backup, restore and
   recover.
