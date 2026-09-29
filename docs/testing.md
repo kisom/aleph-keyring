@@ -261,6 +261,14 @@ installed with it), on the account aleph serves:
    `+ ITEM` still work (the manager opens a new session with the new
    alephd). (Stopping alephd shows `LINK DOWN` only briefly: the manager's
    own calls start it again, through D-Bus activation.)
+9. The LOCK and EXIT buttons sit at the bottom of the sidebar. Show a
+   secret, then LOCK: no confirmation; the window shows `VAULT SEALED`,
+   the secret is gone (`alephctl status` says `locked`), and LOCK is greyed
+   while sealed (and with alephd stopped). EXIT closes the window and does
+   not lock the vault. In SETTINGS, change a value without saving and press
+   EXIT: the window stays and says `Unsaved settings will be lost: press
+   EXIT again to quit`; a second press closes it. With nothing edited (or
+   after CANCEL) one press closes.
 
 ### The manager's settings (Plan 5c)
 

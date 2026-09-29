@@ -1802,3 +1802,162 @@ fn snapshots() {
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// The nav's LOCK: one `Request::Lock`, no confirmation, and the window
+/// follows the vault event to VAULT SEALED (a shown secret goes) on the
+/// same page.
+#[test]
+fn lock_asks_alephd_to_lock_and_the_window_follows() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.state_mut().reauth.confirmed(Instant::now());
+    h.get_by_label("GitHub token").click();
+    frames(&mut h);
+    h.get_by_label("SHOW").click();
+    frames(&mut h);
+    store.take();
+    secret(&store, "/c/login/1", b"ghp_s3cret");
+    frames(&mut h);
+    h.get_by_label("ghp_s3cret");
+    assert!(!h.get_by_label("LOCK").accesskit_node().is_disabled());
+    h.get_by_label("LOCK").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Lock));
+    done(&store, "lock", None);
+    store.send(StoreEvent::Vault(Vault::Locked));
+    frames(&mut h);
+    h.get_by_label("VAULT SEALED");
+    assert!(h.query_by_label("ghp_s3cret").is_none());
+    assert_eq!(h.state().page(), aleph_gui::manager::Page::Secrets);
+    assert!(!h.state().exit_requested());
+}
+
+/// A refused lock says why in the status line.
+#[test]
+fn a_failed_lock_says_why() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("LOCK").click();
+    frames(&mut h);
+    store.take();
+    done(&store, "lock", Some("alephd went away"));
+    frames(&mut h);
+    h.get_by_label_contains("cannot lock: alephd went away");
+}
+
+/// LOCK is only for an open vault: greyed while sealed, unreachable or
+/// connecting, and a click sends nothing.
+#[test]
+fn lock_is_disabled_unless_the_vault_is_open() {
+    for v in [
+        Vault::Locked,
+        Vault::Unreachable("no such name".into()),
+        Vault::Connecting,
+    ] {
+        let (mut h, store, _) = window(ThemeChoice::Neon, v.clone());
+        assert!(h.get_by_label("LOCK").accesskit_node().is_disabled());
+        h.get_by_label("LOCK").click();
+        frames(&mut h);
+        assert!(store.take().is_empty(), "{v:?}");
+    }
+}
+
+/// While a confirmation runs LOCK is greyed like the other nav buttons.
+#[test]
+fn lock_is_disabled_during_a_confirmation() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    let _fd = save_an_edit(&mut h, &store);
+    settle(&mut h);
+    assert!(h.get_by_label("LOCK").accesskit_node().is_disabled());
+    h.get_by_label("LOCK").click();
+    frames(&mut h);
+    assert!(store.take().is_empty());
+    assert!(!h.state().exit_requested());
+}
+
+/// EXIT closes the window, and does not lock.
+#[test]
+fn exit_closes_the_window_without_locking() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    assert!(!h.state().exit_requested());
+    h.get_by_label("EXIT").click();
+    frames(&mut h);
+    assert!(h.state().exit_requested());
+    assert!(store.take().is_empty());
+}
+
+/// EXIT is there with the link down and with the vault sealed.
+#[test]
+fn exit_works_with_the_link_down_and_sealed() {
+    for v in [Vault::Unreachable("no such name".into()), Vault::Locked] {
+        let (mut h, _, _) = window(ThemeChoice::Neon, v);
+        assert!(!h.get_by_label("EXIT").accesskit_node().is_disabled());
+        h.get_by_label("EXIT").click();
+        frames(&mut h);
+        assert!(h.state().exit_requested());
+    }
+}
+
+/// Settings edits are not lost by one click: the first says so, the second
+/// closes.
+#[test]
+fn exit_with_unsaved_settings_asks_to_press_it_again() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_settings(&mut h, &store, "0", "300", "true");
+    pick(&mut h, "Idle lock", "15 min");
+    h.get_by_label("EXIT").click();
+    frames(&mut h);
+    assert!(!h.state().exit_requested());
+    h.get_by_label_contains("Unsaved settings will be lost: press EXIT again to quit");
+    h.get_by_label("EXIT").click();
+    frames(&mut h);
+    assert!(h.state().exit_requested());
+}
+
+/// Nothing edited, nothing to warn about: one click closes.
+#[test]
+fn exit_with_an_unedited_form_closes_at_once() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_settings(&mut h, &store, "0", "300", "true");
+    h.get_by_label("EXIT").click();
+    frames(&mut h);
+    assert!(h.state().exit_requested());
+    assert!(h.query_by_label_contains("Unsaved settings").is_none());
+}
+
+/// Cancelling the edits (or moving to another screen) puts the warning
+/// away: the next click starts again.
+#[test]
+fn the_exit_warning_is_disarmed_by_cancel_and_by_changing_screens() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_settings(&mut h, &store, "0", "300", "true");
+    pick(&mut h, "Idle lock", "15 min");
+    h.get_by_label("EXIT").click();
+    frames(&mut h);
+    assert!(!h.state().exit_requested());
+    // Another screen and back (the edits stay): armed again from scratch.
+    h.get_by_label("SECRETS").click();
+    frames(&mut h);
+    h.get_by_label("SETTINGS").click();
+    frames(&mut h);
+    h.get_by_label("EXIT").click();
+    frames(&mut h);
+    assert!(!h.state().exit_requested(), "closed on the second click");
+    // Cancel, and one click closes.
+    h.get_by_label("CANCEL").click();
+    frames(&mut h);
+    h.get_by_label("EXIT").click();
+    frames(&mut h);
+    assert!(h.state().exit_requested());
+}
+
+/// EXIT during a confirmation ends it and closes (it does not hang alephd's
+/// conversation).
+#[test]
+fn exit_during_a_confirmation_ends_it_and_closes() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    let _fd = save_an_edit(&mut h, &store);
+    settle(&mut h);
+    assert!(!h.get_by_label("EXIT").accesskit_node().is_disabled());
+    h.get_by_label("EXIT").click();
+    frames(&mut h);
+    assert!(h.state().exit_requested());
+}

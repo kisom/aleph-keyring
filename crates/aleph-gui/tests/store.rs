@@ -145,6 +145,31 @@ async fn a_lock_shows_and_an_unlock_through_the_prompt_restores() {
     store.unlocked(|c| !c.is_empty()).await;
 }
 
+/// LOCK asks alephd's admin interface to lock: the store then reports the
+/// vault locked, and locking a locked vault is still a completed request.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_request_locks_the_vault() {
+    let d = daemon(true, vec![]).await;
+    let mut store = Probe::new(&d.bus.address);
+    store.unlocked(|c| !c.is_empty()).await;
+    store.request(Request::Lock);
+    assert_eq!(store.done("lock").await, (None, false));
+    store
+        .until(|e| matches!(e, StoreEvent::Vault(Vault::Locked)).then_some(()))
+        .await;
+    store.request(Request::Lock);
+    assert_eq!(store.done("lock").await, (None, false));
+}
+
+/// Without alephd a lock request fails with a reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_alephd_a_lock_request_fails() {
+    let bus = aleph_daemon::testing::bus();
+    let mut store = Probe::new(&bus.address);
+    store.request(Request::Lock);
+    assert!(store.done("lock").await.0.is_some());
+}
+
 /// Folders are created and deleted; alephd confirms each through its own
 /// prompt (answered yes here).
 #[tokio::test(flavor = "multi_thread")]
@@ -468,6 +493,8 @@ async fn polling_without_the_default_folder_is_not_use() {
 fn only_changes_are_followed_by_a_listing() {
     assert!(!Request::Secret("/i".into()).changes());
     assert!(!Request::Reauth(std::os::unix::net::UnixStream::pair().unwrap().0.into()).changes());
+    // (The lock state follows alephd's signals and the poll.)
+    assert!(!Request::Lock.changes());
     assert!(Request::Unlock.changes());
     assert!(Request::DeleteItem("/i".into()).changes());
     assert!(

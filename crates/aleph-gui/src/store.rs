@@ -83,6 +83,8 @@ pub enum Vault {
 pub enum Request {
     /// Ask alephd to unlock (its prompt window opens).
     Unlock,
+    /// Lock the vault (alephd's admin `Lock`: no prompt, no confirmation).
+    Lock,
     /// One item's secret.
     Secret(String),
     SetLabel {
@@ -118,7 +120,7 @@ impl Request {
     pub fn changes(&self) -> bool {
         !matches!(
             self,
-            Self::Secret(_) | Self::Reauth(_) | Self::Config | Self::SetConfigs(..)
+            Self::Secret(_) | Self::Reauth(_) | Self::Config | Self::SetConfigs(..) | Self::Lock
         )
     }
 
@@ -126,6 +128,7 @@ impl Request {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Unlock => "unlock",
+            Self::Lock => "lock",
             Self::Secret(_) => "fetch the secret",
             Self::SetLabel { .. } => "rename",
             Self::SetSecret { .. } => "change the secret",
@@ -541,6 +544,14 @@ impl Client {
                     .await
                     .map_err(err)?;
                 Ok((self.prompt(&prompt).await?, None))
+            }
+            Request::Lock => {
+                self.admin()
+                    .await?
+                    .call::<_, _, ()>("Lock", &())
+                    .await
+                    .map_err(err)?;
+                Ok((false, None))
             }
             Request::Secret(path) => {
                 let secret = match self.fetch(&path).await {

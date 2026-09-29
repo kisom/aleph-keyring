@@ -152,6 +152,10 @@ pub struct Manager<S: Store, B: Backend> {
     /// After an interrupted save: the values to read again, under the
     /// edits ([`Form::rebase`]).
     rebase_on_config: Rebase,
+    /// EXIT was pressed once with unsaved VAULT edits: the next press quits.
+    exit_armed: bool,
+    /// EXIT closed the window (the close command was sent).
+    exit_requested: bool,
 }
 
 /// Where the re-read after an interrupted save stands.
@@ -232,6 +236,8 @@ impl<S: Store, B: Backend> Manager<S, B> {
             saving_settings: false,
             save_after_unlock: false,
             rebase_on_config: Rebase::No,
+            exit_armed: false,
+            exit_requested: false,
         }
     }
 
@@ -318,6 +324,12 @@ impl<S: Store, B: Backend> Manager<S, B> {
 
     pub fn page(&self) -> Page {
         self.page
+    }
+
+    /// Whether EXIT has sent the close command (the tests cannot see
+    /// viewport commands: the harness drains them).
+    pub fn exit_requested(&self) -> bool {
+        self.exit_requested
     }
 
     /// The VAULT form, once read.
@@ -423,6 +435,23 @@ impl<S: Store, B: Backend> Manager<S, B> {
         if let Some(app) = self.confirm.take() {
             app.shutdown();
         }
+    }
+
+    /// EXIT: close the window as its own close does. With unsaved VAULT
+    /// edits the first press only says so; the second closes. A running
+    /// confirmation is ended (and its save given up) and the window closes.
+    fn exit(&mut self, ctx: &egui::Context) {
+        if self.confirm.is_some() {
+            self.end_confirm();
+            self.saving_settings = false;
+        } else if self.form().is_some_and(|f| f.edited()) && !self.exit_armed {
+            self.exit_armed = true;
+            self.status = Some("Unsaved settings will be lost: press EXIT again to quit".into());
+            return;
+        }
+        self.exit_armed = false;
+        self.exit_requested = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
     /// A settings save was cut short (a lock, alephd gone, the window left,
@@ -683,10 +712,15 @@ impl<S: Store, B: Backend> Manager<S, B> {
             }
         }
         self.take_events();
+        if !self.form().is_some_and(|f| f.edited()) {
+            // (A cancel or a save takes the warning away.)
+            self.exit_armed = false;
+        }
         self.resume_save(&ui.ctx().clone());
         self.ask_config();
         let p = self.palette.clone();
         let mut go = None;
+        let (mut lock, mut exit) = (false, false);
         egui::Panel::left("aleph-nav")
             .exact_size(130.0)
             .resizable(false)
@@ -707,8 +741,29 @@ impl<S: Store, B: Backend> Manager<S, B> {
                         }
                     }
                 });
+                // Pinned to the bottom (the first added sits lowest).
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    ui.add_space(8.0);
+                    exit = ui.button(RichText::new("EXIT").strong()).clicked();
+                    // (Only an open vault can be locked; not while a
+                    // confirmation runs, like the buttons above.)
+                    let open = self.confirm.is_none() && matches!(self.vault, Vault::Unlocked(_));
+                    ui.add_enabled_ui(open, |ui| {
+                        lock = ui.button(RichText::new("LOCK").strong()).clicked();
+                    });
+                });
             });
+        if lock {
+            // (No confirmation: the vault follows alephd's signal.)
+            self.store.request(Request::Lock);
+        }
+        if exit {
+            self.exit(&ui.ctx().clone());
+        }
         if let Some(page) = go {
+            if page != self.page {
+                self.exit_armed = false;
+            }
             if page == Page::Settings && self.page != Page::Settings {
                 // (Opening the screen reads the values again, unless there
                 // are edits, which stay.)
