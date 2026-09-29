@@ -55,6 +55,18 @@ pub async fn portal_present(address: Option<&str>) -> bool {
     dbus.name_has_owner(name).await.unwrap_or(false)
 }
 
+/// Answers that there is no dialog: the typed-path field shows. The
+/// manager's default (the real one, [`Portal`], is set by `main`).
+pub struct Unavailable;
+
+impl FilePicker for Unavailable {
+    fn start(&self, _suggested: String, _dir: Option<PathBuf>) -> Receiver<Pick> {
+        let (tx, rx) = mpsc::channel();
+        let _ = tx.send(Pick::Unavailable);
+        rx
+    }
+}
+
 /// The real dialog.
 pub struct Portal;
 
@@ -119,8 +131,16 @@ impl Fake {
 
 impl FilePicker for Fake {
     fn start(&self, suggested: String, dir: Option<PathBuf>) -> Receiver<Pick> {
-        self.asked.lock().unwrap().push((suggested, dir));
-        let next = self.picks.lock().unwrap().pop().unwrap_or(Pick::Cancelled);
+        self.asked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((suggested, dir));
+        let next = self
+            .picks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop()
+            .unwrap_or(Pick::Cancelled);
         let (tx, rx) = mpsc::channel();
         let _ = tx.send(next);
         rx

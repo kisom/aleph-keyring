@@ -46,7 +46,8 @@ fn manage() -> ExitCode {
             let store = store::DbusStore::start(None, move || ctx.request_repaint());
             let mut app =
                 manager::Manager::new(store, clipboard::Wayland::default(), settings, home, still)
-                    .with_settings_file(file, broken);
+                    .with_settings_file(file, broken)
+                    .with_file_picker(Box::new(aleph_gui::filepicker::Portal));
             aleph_gui::theme::apply(&cc.egui_ctx, &app.palette);
             if still {
                 cc.egui_ctx.all_styles_mut(|s| s.animation_time = 0.0);

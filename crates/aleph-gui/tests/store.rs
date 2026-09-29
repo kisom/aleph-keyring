@@ -686,7 +686,10 @@ async fn a_backup_is_written_into_the_file_it_is_given() {
     let (_ours, theirs) = UnixStream::pair().unwrap();
     store.request(Request::Backup(theirs.into(), file.into()));
     let (error, _) = store.done("back up").await;
-    assert!(error.unwrap().contains("inside"), "refused");
+    assert!(
+        error.as_deref().is_some_and(|e| e.contains("inside")),
+        "{error:?}"
+    );
 }
 
 #[test]

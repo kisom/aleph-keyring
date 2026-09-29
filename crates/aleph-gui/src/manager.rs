@@ -15,7 +15,7 @@ use crate::admin_page::{self, AdminAction, AdminState, AdminView, Ask, Link};
 use crate::app::PromptApp;
 use crate::clipboard::{Backend, Clipboard};
 use crate::conversation::{Screen, shown};
-use crate::filepicker::{FilePicker, Pick, Portal};
+use crate::filepicker::{FilePicker, Pick, Unavailable};
 use crate::reauth::Reauth;
 use crate::settings::Settings;
 use crate::settings_page::{
@@ -159,7 +159,8 @@ pub struct Manager<S: Store, B: Backend> {
     ask: Option<Ask>,
     /// The "touch alone" checkbox for a new security key.
     touch_alone: bool,
-    /// Where the save dialog comes from (the tests use a fake).
+    /// Where the save dialog comes from: none by default (the typed-path
+    /// field), the portal in `main`, a fake in the tests.
     picker: Box<dyn FilePicker>,
     /// A save dialog that is open: its answer, polled each frame.
     picking: Option<Receiver<Pick>>,
@@ -254,14 +255,15 @@ impl<S: Store, B: Backend> Manager<S, B> {
             admin: AdminState::Unknown,
             ask: None,
             touch_alone: false,
-            picker: Box::new(Portal),
+            // (No real dialog unless asked for: `main` sets the portal.)
+            picker: Box::new(Unavailable),
             picking: None,
             backup_path: None,
             backup_error: None,
         }
     }
 
-    /// Use another save dialog (the tests' fake).
+    /// Use a save dialog (the real portal, or the tests' fake).
     pub fn with_file_picker(mut self, picker: Box<dyn FilePicker>) -> Self {
         self.picker = picker;
         self
