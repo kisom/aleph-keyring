@@ -309,6 +309,40 @@ them back at the end.
     start them): while it is down VAULT says LINK DOWN; it reads again
     when the link returns.
 
+### The manager's admin page (Plan 5d)
+
+After `make && make install`, on the account aleph serves, with the test
+YubiKey plugged in. Keep the terminal open with `alephctl status` to
+compare.
+
+1. Open the manager, then ADMIN: the STATUS lines and the slot list match
+   `alephctl status` and `alephctl keyslot list`.
+2. `+ SECURITY KEY`: alephd's confirmation opens in the window (PIN, touch);
+   afterwards `KEYSLOT ADDED` and the new slot in the list. Try a wrong PIN
+   once: it says so and costs one retry.
+3. REMOVE the key just added: the Yes/No step first (No leaves it); Yes, then
+   the confirmation; `KEYSLOT REMOVED`, the slot gone.
+4. `+ TPM` (only if a TPM slot is missing), then REMOVE it again.
+5. ROTATE MASTER KEY: one confirmation, `MASTER KEY ROTATED`; the vault
+   still unlocks (`alephctl lock`, then unlock).
+6. NEW RECOVERY KEY: the Yes/No step, the confirmation, the new key shown
+   once; write it down (the old one stops working), type two groups back;
+   `NEW RECOVERY KEY ISSUED`.
+7. BACK UP…: the portal's save dialog opens with `aleph-backup-<date>.aleph`;
+   save into a new file: `BACKED UP :: <path>`; the file is mode 600 and not
+   empty. Repeat with an existing file: "choose a new name", the file
+   untouched. Cancel the dialog: nothing happens.
+8. Stop the portal (`systemctl --user stop xdg-desktop-portal.service`,
+   after noting whether it was running), then BACK UP…: the typed-path
+   field appears, prefilled; a new path works. Start the portal again.
+9. `alephctl lock`, then ADMIN: STATUS and the slots show; the banner
+   `VAULT SEALED :: ACTIONS ON THIS PAGE UNLOCK FIRST`; press ROTATE MASTER
+   KEY: alephd's unlock window opens, then the confirmation (two proofs).
+   Dismiss the unlock on a second try: `nothing was changed`.
+10. Stop alephd (`systemctl --user stop alephd.service alephd.socket`, then
+    start them): while it is down the page says LINK DOWN; it reads again
+    when the link returns.
+
 ## Emergency manual revert
 
 If login or the lock screen misbehaves after `sudo alephctl system apply`,

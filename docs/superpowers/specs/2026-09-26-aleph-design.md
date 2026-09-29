@@ -1137,9 +1137,10 @@ three plans (DECISIONS.md H7):
   puts it in the Omarchy launcher, with the icons in `assets/icons/` (§8).
 - **Settings (Plan 5c):** lock policy, prompt timeout, theme,
   scanlines and the reveal hold.
-- **Admin (Plan 5d):** the GUI equivalent of `alephctl`: status, lock and
-  unlock, keyslots, master-key rotation, recovery key, backup, restore and
-  recover.
+- **Admin (Plan 5d):** status, keyslots (add TPM or security key, remove,
+  retry), master-key rotation, recovery-key reissue and backup, through
+  alephd's own re-authentication. Restore, recover, `--from-bak` and
+  `--accept-rollback` stay in `alephctl restore`.
 - Import and export stay in `alephctl setup` and `setup --revert`
   (DECISIONS.md E3).
 

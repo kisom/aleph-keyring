@@ -1,7 +1,7 @@
 # aleph manager: admin (Plan 5d) — design
 
 - **Date:** 2026-09-28
-- **Status:** Draft, awaiting the owner's review
+- **Status:** Approved; implemented by docs/superpowers/plans/2026-09-28-aleph-admin.md
 - **Extends:** `docs/superpowers/specs/2026-09-28-aleph-manager-design.md`,
   `docs/superpowers/specs/2026-09-28-aleph-settings-design.md` (Plan 5c),
   and `docs/superpowers/specs/2026-09-26-aleph-design.md` §6 and §7. Where

@@ -2185,6 +2185,32 @@ fn snapshots() {
         h.get_by_label("SETTINGS").click();
         frames(&mut h);
         shot(&mut h, "settings_broken");
+        // ADMIN: the page, a Yes/No step, sealed, with warnings, the typed path.
+        let (mut h, store, _) = window(theme, vault());
+        open_admin(&mut h, &store, admin_status());
+        shot(&mut h, "admin");
+        h.get_by_label("Remove keyslot yubikey").click();
+        frames(&mut h);
+        shot(&mut h, "admin_ask");
+        let (mut h, store, _) = window(theme, Vault::Locked);
+        let mut sealed = admin_status();
+        sealed.locked = true;
+        open_admin(&mut h, &store, sealed);
+        shot(&mut h, "admin_sealed");
+        let (mut h, store, _) = window(theme, vault());
+        let mut s = admin_status();
+        s.untrusted = Some("rolled back to an older version".into());
+        s.rotation_pending = true;
+        s.secret_service = Some("another program".into());
+        open_admin(&mut h, &store, s);
+        shot(&mut h, "admin_warnings");
+        let (mut h, store, _) = window(theme, vault());
+        open_admin(&mut h, &store, admin_status());
+        h.get_by_label("type a path instead").click();
+        frames(&mut h);
+        // The field starts with today's date in the name: pin it.
+        retype(&mut h, "Backup path", "/home/u/aleph-backup.aleph");
+        shot(&mut h, "admin_path");
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }

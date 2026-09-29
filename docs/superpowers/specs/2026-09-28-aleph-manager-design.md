@@ -19,7 +19,7 @@ The manager is built in three plans:
 |---|---|
 | **5b (this document)** | The window, the secrets browser, the launcher entry |
 | 5c | Settings: alephd's `config.toml` (lock policy, prompt timeout) and the GUI's `gui.toml` (theme, scanlines; the reveal window, below) |
-| 5d | Admin: the GUI equivalent of `alephctl` (status, lock and unlock, keyslots, master-key rotation, recovery key, backup, restore and recover) |
+| 5d | Admin: status, keyslots (add TPM or security key, remove, retry), master-key rotation, recovery-key reissue and backup, through alephd's own re-authentication; restore, recover, `--from-bak` and `--accept-rollback` stay in `alephctl restore` |
 
 Import from and export to gnome-keyring stay where Plan 4c put them
 (`alephctl setup` and `setup --revert`, DECISIONS.md E3): not in the

@@ -7,6 +7,27 @@ first. The spec (`docs/superpowers/specs/2026-09-26-aleph-design.md`)
 is updated to match wherever a decision changes it. Decisions the owner
 made directly are marked as such.
 
+## 2026-09-28: Plan 5d (the manager's admin page), design
+
+### J1. The manager's admin page: scope and approach
+
+The admin spec (`docs/superpowers/specs/2026-09-28-aleph-admin-design.md`)
+records these:
+
+- **The admin page covers status, keyslots (add TPM or security key,
+  remove, retry), master-key rotation, recovery-key reissue and backup.**
+  Restore, recover, `--from-bak` and `--accept-rollback` stay in
+  `alephctl restore`.
+- **One scrolling page:** STATUS, KEYSLOTS, KEEPING IT SAFE.
+- **The manager asks Yes/No (default No) only before REMOVE and NEW
+  RECOVERY KEY;** alephd's re-authentication guards everything.
+- **On a sealed vault an action unlocks first, then confirms:** two proofs.
+- **Backup uses a native portal save dialog (`rfd`),** with a typed-path
+  fallback when the portal is unavailable; the file is new, `0600`, and
+  never overwritten.
+- **One task state machine serves reveal, settings save and admin
+  operations.**
+
 ## 2026-09-28: Plan 5c (the manager's settings), design
 
 ### I1. The manager's settings: scope and approach
