@@ -3,6 +3,17 @@
 Results of the manual checks in [testing.md](testing.md), newest first.
 Each release's notes summarize the entries since the previous release.
 
+## 2026-09-28, commit 587414a (the manager's settings, Plan 5c, and LOCK/EXIT)
+
+Host: as below. Installed with `make install` after 587414a.
+
+### The manager's settings and the sidebar's LOCK and EXIT (testing.md)
+
+| Step | Result |
+|---|---|
+| The manager's settings, 1–12 | Pass, as reported by the owner (the steps were not recorded one by one) |
+| The manager, LOCK and EXIT (LOCK seals the vault and hides a shown secret, greyed while sealed; EXIT closes, and warns once about unsaved settings edits) | Pass, as reported by the owner |
+
 ## 2026-09-28, commit 35b9544 (the manager, Plan 5b)
 
 Host: as below. Installed with `make install` after 35b9544.
