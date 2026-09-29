@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
@@ -490,6 +490,12 @@ impl<S: Store, B: Backend> Manager<S, B> {
         }
     }
 
+    /// Whether the confirmation on screen has sent alephd an answer (so it
+    /// may have gone past its question). Read before `end_confirm`.
+    fn confirm_answered(&self) -> bool {
+        self.confirm.as_ref().is_some_and(PromptApp::answered)
+    }
+
     /// End the confirmation, if one runs (alephd holds its conversation
     /// lock until it ends).
     fn end_confirm(&mut self) {
@@ -517,8 +523,13 @@ impl<S: Store, B: Backend> Manager<S, B> {
             return;
         }
         if self.confirm.is_some() {
+            let answered = self.confirm_answered();
             self.end_confirm();
-            self.running = None;
+            // (The window closes: nothing to say, but a backup that had its
+            // answer keeps its file.)
+            if let Some(Running::Job(mut job)) = self.running.take() {
+                job.interrupted(answered);
+            }
         }
         self.exit_armed = false;
         self.exit_requested = true;
@@ -547,15 +558,17 @@ impl<S: Store, B: Backend> Manager<S, B> {
         self.reauth.forget();
         self.shown = None;
         self.awaiting = None;
+        let answered = self.confirm_answered();
         self.end_confirm();
         // (A reveal's confirmation just ends; a job's says it may have gone
         // through.)
-        if let Some(Running::Job(job)) = self.running.take() {
+        if let Some(Running::Job(mut job)) = self.running.take() {
             let why = match now {
                 Vault::Locked => "the vault locked",
                 _ => "alephd went away",
             };
-            self.status = Some(format!("{why}: {}", job.may_not_have_gone_through()));
+            let kept = job.interrupted(answered);
+            self.status = Some(format!("{why}: {}{kept}", job.may_not_have_gone_through()));
             self.save_interrupted(&job);
         }
         if let Mode::Edit {
@@ -771,7 +784,10 @@ impl<S: Store, B: Backend> Manager<S, B> {
                         let admin = matches!(job, Job::Admin(_));
                         if let Some(e) = error {
                             self.end_confirm();
-                            self.running = None;
+                            if let Some(Running::Job(job)) = self.running.take() {
+                                // (A backup's file goes, even written.)
+                                job.failed();
+                            }
                             self.status = Some(format!("cannot {request}: {e}"));
                             if admin {
                                 self.admin = AdminState::Unknown;
@@ -816,10 +832,12 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 .any(|e| matches!(e, egui::Event::WindowFocused(false)))
         }) {
             self.shown = None;
+            let answered = self.confirm_answered();
             self.end_confirm();
-            if let Some(Running::Job(job)) = self.running.take() {
+            if let Some(Running::Job(mut job)) = self.running.take() {
+                let kept = job.interrupted(answered);
                 self.status = Some(format!(
-                    "the window lost focus: {}",
+                    "the window lost focus: {}{kept}",
                     job.may_not_have_been_done()
                 ));
                 self.save_interrupted(&job);
@@ -1043,7 +1061,9 @@ impl<S: Store, B: Backend> Manager<S, B> {
         let ctx = ui.ctx().clone();
         if let Some(mut path) = self.backup_path.take() {
             match admin_page::backup_field(ui, p, &mut path, self.backup_error.as_deref()) {
-                Some(admin_page::BackupField::Go) => self.backup_to(&ctx, path.trim(), true),
+                Some(admin_page::BackupField::Go) => {
+                    self.backup_to(&ctx, Path::new(path.trim()), true)
+                }
                 Some(admin_page::BackupField::Cancel) => self.backup_error = None,
                 None => self.backup_path = Some(path),
             }
@@ -1147,7 +1167,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
             Pick::Chosen(_) if !here => {
                 self.status = Some("not backed up: the ADMIN page was left".into());
             }
-            Pick::Chosen(path) => self.backup_to(ctx, &path.display().to_string(), false),
+            Pick::Chosen(path) => self.backup_to(ctx, &path, false),
             Pick::Cancelled => {}
             // (No portal to ask: the person types the path.)
             Pick::Unavailable if here => self.backup_path = Some(self.suggested_path()),
@@ -1159,7 +1179,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
     /// if the vault is sealed). A path that cannot be used says why; a
     /// `typed` one leaves the typed-path field open with it (one from the
     /// dialog does not: BACK UP… asks again).
-    fn backup_to(&mut self, ctx: &egui::Context, path: &str, typed: bool) {
+    fn backup_to(&mut self, ctx: &egui::Context, path: &Path, typed: bool) {
         // (What `begin` would refuse, refused before a file is made, and
         // said: it would drop the job silently.)
         let refused = if self.running.is_some() || self.waiting.is_some() {
@@ -1173,7 +1193,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
             self.status = Some(why.into());
             return;
         }
-        match BackupTarget::open(std::path::Path::new(path)) {
+        match BackupTarget::open(path) {
             Ok(target) => {
                 self.backup_error = None;
                 self.backup_path = None;
@@ -1183,7 +1203,8 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 self.status = Some(e.clone());
                 if typed {
                     self.backup_error = Some(e);
-                    self.backup_path = Some(path.to_string());
+                    // (Typed, so text already.)
+                    self.backup_path = Some(path.to_string_lossy().into_owned());
                 }
             }
         }
@@ -1452,9 +1473,10 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 Screen::Finished { ok, message } => Some((*ok, message.clone())),
                 _ => None,
             };
+            let answered = app.answered();
             self.end_confirm();
             match self.running.take() {
-                Some(Running::Job(job)) => self.job_finished(job, finished, now),
+                Some(Running::Job(job)) => self.job_finished(job, finished, answered, now),
                 Some(Running::Reveal { path, want }) if finished.is_some_and(|(ok, _)| ok) => {
                     self.reauth.confirmed(now);
                     self.fetch(path, want);
@@ -1465,12 +1487,20 @@ impl<S: Store, B: Backend> Manager<S, B> {
     }
 
     /// A job's confirmation closed: `finished` is what alephd ended it with
-    /// (`None`: closed with no `Done`, which may mean it went ahead).
-    fn job_finished(&mut self, job: Job, finished: Option<(bool, Option<String>)>, now: Instant) {
+    /// (`None`: closed with no `Done`, which may mean it went ahead), and
+    /// `answered` whether an answer had gone to alephd.
+    fn job_finished(
+        &mut self,
+        job: Job,
+        finished: Option<(bool, Option<String>)>,
+        answered: bool,
+        now: Instant,
+    ) {
         match (job, finished) {
-            (job, None) => {
+            (mut job, None) => {
+                let kept = job.interrupted(answered);
                 self.status = Some(format!(
-                    "the confirmation ended early: {}",
+                    "the confirmation ended early: {}{kept}",
                     job.may_not_have_been_done()
                 ));
                 self.save_interrupted(&job);
@@ -1499,6 +1529,8 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 if admin {
                     self.admin = AdminState::Unknown;
                 }
+                // (Not done: a backup's file goes, even written.)
+                job.failed();
             }
         }
     }
@@ -1877,7 +1909,59 @@ impl<S: Store, B: Backend> eframe::App for Manager<S, B> {
 
 #[cfg(test)]
 mod tests {
-    use super::date;
+    use super::*;
+
+    #[derive(Default)]
+    struct NoStore(std::cell::RefCell<Vec<Request>>);
+
+    impl Store for NoStore {
+        fn request(&self, r: Request) {
+            self.0.borrow_mut().push(r);
+        }
+        fn events(&self) -> Vec<StoreEvent> {
+            Vec::new()
+        }
+    }
+
+    struct NoClipboard;
+
+    impl Backend for NoClipboard {
+        fn offer(&mut self, _: Zeroizing<Vec<u8>>) -> Result<(), String> {
+            Ok(())
+        }
+        fn still_ours(&self) -> bool {
+            false
+        }
+        fn clear(&mut self) {}
+    }
+
+    /// (M10.) A request that cannot be built (the backup file's handle
+    /// cannot be cloned): nothing is sent, the confirmation ends, the
+    /// status says why, and the empty file goes.
+    #[test]
+    fn a_request_that_cannot_be_made_ends_the_confirmation_and_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.aleph");
+        let target = BackupTarget::open(&path).unwrap().unclonable();
+        let mut m = Manager::new(
+            NoStore::default(),
+            NoClipboard,
+            Settings::default(),
+            None,
+            true,
+        );
+        m.vault = Vault::Unlocked(Vec::new());
+        let ctx = egui::Context::default();
+        m.begin(&ctx, Job::Admin(AdminOp::Backup(target)));
+        assert!(m.store.0.borrow().is_empty(), "nothing sent");
+        assert!(m.confirm.is_none() && m.running.is_none());
+        let status = m.status.clone().unwrap_or_default();
+        assert!(
+            status.starts_with("cannot use the backup file:"),
+            "{status}"
+        );
+        assert!(!path.exists());
+    }
 
     #[test]
     fn dates_are_utc_calendar_days() {

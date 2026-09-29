@@ -194,10 +194,23 @@ what happened, in capitals like the rest: `KEYSLOT ADDED`,
 - alephd refuses an operation: its message in the status line (for
   example "would leave only the recovery slot"); nothing else changes,
   and STATUS is read again.
-- **Backup cleanup:** if the operation fails, is cancelled, or is
-  interrupted after the manager created the file, the manager removes the
-  file it created, but only while it is still empty. A half-made backup
-  never sits at the path.
+- **Backup cleanup:** the manager only ever removes a file it created
+  itself, and only while the path still names that same file (compared by
+  device and inode; something put there meanwhile is left alone). A file
+  that was already there (empty) is never removed.
+  - Nothing sent, or the confirmation ended (a lock, alephd going away,
+    focus loss, EXIT, the socket closing with no `done`) before any answer
+    (password, key touch, PIN, choice) went to alephd: alephd cannot have
+    got past re-authentication, so the file, still empty, is removed.
+  - The confirmation ended after an answer went to alephd: alephd may be
+    writing the backup (the store's `Done` for these requests arrives
+    before the password is asked, so there is no later signal), so the
+    file is kept whatever its size, and the status adds
+    `; check <path> (an empty file means it did not)`.
+  - alephd reports failure (a `Done` error for the request, or the
+    confirmation's `done` with `ok: false`): the file is removed whatever
+    its size, so a half-made backup never sits at the path.
+  - Success keeps it.
 - Interruptions use the settings spec's wording ("may not have gone
   through") and read STATUS again, so the slot list shows what is really
   there.

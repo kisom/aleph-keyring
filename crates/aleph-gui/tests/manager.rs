@@ -2915,6 +2915,223 @@ fn exit_during_a_backup_removes_the_empty_file() {
     assert!(!path.exists());
 }
 
+/// Play alephd for a backup up to the password: it asks, takes the answer
+/// (if one comes), and holds the conversation until `hold` is sent to or
+/// dropped. It returns whether a password came.
+fn alephd_takes_the_password(
+    fd: std::os::fd::OwnedFd,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<bool>) {
+    let (hold, wait) = std::sync::mpsc::channel::<()>();
+    let alephd = std::thread::spawn(move || {
+        let mut chan = Channel::from_fd(fd, Duration::from_secs(10)).unwrap();
+        chan.send(&ToPrompter::Begin {
+            purpose: Purpose::Reauth,
+            operation: "Back up the vault".into(),
+            caller: None,
+        })
+        .unwrap();
+        let reply = chan
+            .ask(&ToPrompter::Ask {
+                methods: vec![Method::Password],
+                error: None,
+                retry_after: None,
+            })
+            .ok();
+        let _ = wait.recv();
+        matches!(reply, Some(FromPrompter::Password { .. }))
+    });
+    (hold, alephd)
+}
+
+/// Start a backup and answer alephd's ask with the password: from here
+/// alephd may be writing the file.
+fn backup_answered(
+    path: &std::path::Path,
+) -> (
+    Window,
+    Fake,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<bool>,
+) {
+    let (mut h, store, fd, _file) = start_backup(path);
+    let (hold, alephd) = alephd_takes_the_password(fd);
+    settle(&mut h);
+    type_into(&mut h, "Login password", "hunter2");
+    h.key_press(egui::Key::Enter);
+    frames(&mut h);
+    (h, store, hold, alephd)
+}
+
+/// What the status says when a backup that had its answer is cut short.
+fn check_the_file(path: &std::path::Path) -> String {
+    format!(
+        "; check {} (an empty file means it did not)",
+        path.display()
+    )
+}
+
+/// (F1.) A lock while alephd's ask is still unanswered: alephd cannot have
+/// got past it, so the empty file goes.
+#[test]
+fn a_lock_before_any_answer_removes_the_empty_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, store, fd, _file) = start_backup(&path);
+    let (hold, alephd) = alephd_takes_the_password(fd);
+    settle(&mut h);
+    h.get_by_label("Login password");
+    store.send(StoreEvent::Vault(Vault::Locked));
+    settle(&mut h);
+    h.get_by_label("the vault locked: the operation may not have gone through");
+    assert!(!path.exists());
+    drop(hold);
+    assert!(!alephd.join().unwrap());
+}
+
+/// (F1.) A lock after the password went to alephd: it may be writing the
+/// file, so the file stays, and the status says where to look.
+#[test]
+fn a_lock_after_the_answer_keeps_the_backup_and_names_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, store, hold, alephd) = backup_answered(&path);
+    store.send(StoreEvent::Vault(Vault::Locked));
+    settle(&mut h);
+    h.get_by_label(&format!(
+        "the vault locked: the operation may not have gone through{}",
+        check_the_file(&path)
+    ));
+    assert!(path.exists());
+    drop(hold);
+    assert!(alephd.join().unwrap());
+    drop(h);
+    assert!(path.exists(), "kept once the window is gone too");
+}
+
+/// (F1.) The socket closing with no `done` after the answer keeps the file.
+#[test]
+fn a_confirmation_ended_after_the_answer_keeps_the_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, _store, hold, alephd) = backup_answered(&path);
+    hold.send(()).unwrap();
+    assert!(alephd.join().unwrap());
+    settle(&mut h);
+    h.get_by_label(&format!(
+        "the confirmation ended early: the operation may not have gone through{}",
+        check_the_file(&path)
+    ));
+    assert!(path.exists());
+}
+
+/// (F1.) Leaving the window after the answer keeps the file.
+#[test]
+fn leaving_the_window_after_the_answer_keeps_the_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, _store, hold, alephd) = backup_answered(&path);
+    h.event(egui::Event::WindowFocused(false));
+    settle(&mut h);
+    h.get_by_label(&format!(
+        "the window lost focus: the operation may not have gone through{}",
+        check_the_file(&path)
+    ));
+    assert!(path.exists());
+    drop(hold);
+    assert!(alephd.join().unwrap());
+}
+
+/// (F1.) EXIT after the answer keeps the file.
+#[test]
+fn exit_after_the_answer_keeps_the_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, _store, hold, alephd) = backup_answered(&path);
+    h.get_by_label("EXIT").click();
+    settle(&mut h);
+    assert!(h.state().exit_requested());
+    drop(hold);
+    assert!(alephd.join().unwrap());
+    drop(h);
+    assert!(path.exists());
+}
+
+/// (F1.) alephd reports failure after writing part: the half-made backup
+/// goes.
+#[test]
+fn a_backup_alephd_says_failed_is_removed_even_written() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, store, _fd, file) = start_backup(&path);
+    (&std::fs::File::from(file)).write_all(b"half").unwrap();
+    store.send(done_event("back up", Some("no space left on device")));
+    settle(&mut h);
+    h.get_by_label_contains("cannot back up: no space left on device");
+    assert!(!path.exists());
+}
+
+/// (F1, and a refusal through the confirmation's closing screen.) alephd
+/// writes part, then ends the conversation with its reason: the file goes,
+/// the reason shows, and STATUS is read again.
+#[test]
+fn a_backup_refused_in_the_confirmation_is_removed_and_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, store, fd, file) = start_backup(&path);
+    let alephd = std::thread::spawn(move || {
+        let mut chan = Channel::from_fd(fd, Duration::from_secs(10)).unwrap();
+        chan.send(&ToPrompter::Begin {
+            purpose: Purpose::Reauth,
+            operation: "Back up the vault".into(),
+            caller: None,
+        })
+        .unwrap();
+        chan.ask(&ToPrompter::Ask {
+            methods: vec![Method::Password],
+            error: None,
+            retry_after: None,
+        })
+        .unwrap();
+        use std::io::Write;
+        (&std::fs::File::from(file)).write_all(b"half").unwrap();
+        chan.done(false, Some("no space left on device".into()));
+    });
+    settle(&mut h);
+    type_into(&mut h, "Login password", "hunter2");
+    h.key_press(egui::Key::Enter);
+    frames(&mut h);
+    alephd.join().unwrap();
+    settle(&mut h);
+    h.get_by_label("Close").click();
+    settle(&mut h);
+    h.get_by_label("not done: no space left on device");
+    assert!(!path.exists());
+    assert!(matches!(only(store.take()), Request::Status));
+}
+
+/// (M10.) An operation alephd ends unconfirmed, with no reason, through the
+/// confirmation: cancelled, and STATUS is read again.
+#[test]
+fn an_operation_ended_unconfirmed_is_cancelled_and_reads_the_status_again() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_admin(&mut h, &store, admin_status());
+    h.get_by_label("ROTATE MASTER KEY").click();
+    frames(&mut h);
+    let Request::RotateMaster(fd) = only(store.take()) else {
+        panic!("no rotation");
+    };
+    let alephd = alephd_confirms(fd, "hunter2");
+    settle(&mut h);
+    type_into(&mut h, "Login password", "wrong");
+    h.key_press(egui::Key::Enter);
+    frames(&mut h);
+    assert!(!alephd.join().unwrap());
+    settle(&mut h);
+    h.get_by_label("cancelled: nothing was changed");
+    assert!(matches!(only(store.take()), Request::Status));
+}
+
 /// A sealed vault: the path is chosen and the file made first, then alephd
 /// unlocks, then the confirmation.
 #[test]

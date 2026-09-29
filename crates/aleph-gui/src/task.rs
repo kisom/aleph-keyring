@@ -40,14 +40,24 @@ pub enum AdminOp {
 }
 
 /// A backup's new file, opened by the manager (alephd writes into it
-/// through the descriptor it is handed). If the manager made the file and it
-/// is still empty when this is dropped (the backup was cancelled, refused,
-/// or cut short), it is removed: a half-made backup never sits at the path.
+/// through the descriptor it is handed). Only a file the manager made is
+/// ever removed, and only while the path still names that file:
+/// - dropped while still empty (nothing was sent to alephd, or it was cut
+///   short before any answer went to it), it is removed, unless it was
+///   [kept](Self::keep);
+/// - [kept](Self::keep) (cut short after an answer went to alephd, which
+///   may be writing it), it stays whatever its size;
+/// - [discarded](Self::discard) (alephd said it failed), it is removed
+///   whatever its size.
 #[derive(Debug)]
 pub struct BackupTarget {
     pub path: PathBuf,
     file: std::fs::File,
     created: bool,
+    kept: bool,
+    /// (A seam for the tests: `file` fails, as a failed clone would.)
+    #[cfg(test)]
+    unclonable: bool,
 }
 
 impl BackupTarget {
@@ -67,11 +77,22 @@ impl BackupTarget {
                 let f = options
                     .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                     .open(path)
-                    .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+                    .map_err(|e| {
+                        // (A FIFO with no reader, or a symbolic link, fails
+                        // to open: say what it is.)
+                        if std::fs::symlink_metadata(path).is_ok_and(|m| !m.is_file()) {
+                            not_regular(path)
+                        } else {
+                            format!("cannot open {}: {e}", path.display())
+                        }
+                    })?;
                 let meta = f
                     .metadata()
                     .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-                if !meta.is_file() || meta.len() > 0 {
+                if !meta.is_file() {
+                    return Err(not_regular(path));
+                }
+                if meta.len() > 0 {
                     return Err(format!(
                         "{} already exists and is not empty: choose a new name",
                         path.display()
@@ -85,19 +106,68 @@ impl BackupTarget {
             path: path.to_path_buf(),
             file,
             created,
+            kept: false,
+            #[cfg(test)]
+            unclonable: false,
         })
     }
 
     /// A handle on the same file, for the request.
     pub fn file(&self) -> std::io::Result<std::fs::File> {
+        #[cfg(test)]
+        if self.unclonable {
+            return Err(std::io::Error::other("no more descriptors"));
+        }
         self.file.try_clone()
     }
+
+    /// Leave the file in place whatever its size (alephd may be writing
+    /// it).
+    pub fn keep(&mut self) {
+        self.kept = true;
+    }
+
+    /// alephd said the backup failed: a file the manager made goes, even
+    /// one it wrote part of.
+    pub fn discard(mut self) {
+        self.remove();
+        self.kept = true;
+    }
+
+    /// Remove the file if the manager made it and the path still names it
+    /// (something put in its place is not touched).
+    fn remove(&self) {
+        use std::os::unix::fs::MetadataExt;
+        if !self.created {
+            return;
+        }
+        let (Ok(ours), Ok(there)) = (self.file.metadata(), std::fs::symlink_metadata(&self.path))
+        else {
+            return;
+        };
+        if (ours.dev(), ours.ino()) == (there.dev(), there.ino()) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unclonable(mut self) -> Self {
+        self.unclonable = true;
+        self
+    }
+}
+
+fn not_regular(path: &Path) -> String {
+    format!(
+        "{} is not a regular file: choose a new name",
+        path.display()
+    )
 }
 
 impl Drop for BackupTarget {
     fn drop(&mut self) {
-        if self.created && self.file.metadata().is_ok_and(|m| m.len() == 0) {
-            let _ = std::fs::remove_file(&self.path);
+        if !self.kept && self.file.metadata().is_ok_and(|m| m.len() == 0) {
+            self.remove();
         }
     }
 }
@@ -118,18 +188,15 @@ impl AdminOp {
     /// What the status line says when it went through.
     pub fn done_text(&self) -> String {
         match self {
-            Self::Backup(t) => {
-                return format!(
-                    "BACKED UP :: {} (it opens only with your recovery key)",
-                    t.path.display()
-                );
-            }
-            Self::AddTpm | Self::AddFido2 { .. } => "KEYSLOT ADDED",
-            Self::Remove { .. } => "KEYSLOT REMOVED",
-            Self::RotateMaster => "MASTER KEY ROTATED",
-            Self::NewRecoveryKey => "NEW RECOVERY KEY ISSUED",
+            Self::Backup(t) => format!(
+                "BACKED UP :: {} (it opens only with your recovery key)",
+                t.path.display()
+            ),
+            Self::AddTpm | Self::AddFido2 { .. } => "KEYSLOT ADDED".into(),
+            Self::Remove { .. } => "KEYSLOT REMOVED".into(),
+            Self::RotateMaster => "MASTER KEY ROTATED".into(),
+            Self::NewRecoveryKey => "NEW RECOVERY KEY ISSUED".into(),
         }
-        .into()
     }
 
     /// The store request, conversing on `prompter` (a backup's file handle
@@ -194,6 +261,29 @@ impl Job {
 
     pub fn cancelled(&self) -> String {
         format!("cancelled: {}", self.nothing())
+    }
+
+    /// Its confirmation was cut short (`answered`: after an answer went to
+    /// alephd). A backup that had its answer may be being written: its file
+    /// is kept, and what this returns (added to the status) says where.
+    pub fn interrupted(&mut self, answered: bool) -> String {
+        match self {
+            Self::Admin(AdminOp::Backup(t)) if answered => {
+                t.keep();
+                format!(
+                    "; check {} (an empty file means it did not)",
+                    t.path.display()
+                )
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// alephd said it failed: a backup's file goes, even written.
+    pub fn failed(self) {
+        if let Self::Admin(AdminOp::Backup(t)) = self {
+            t.discard();
+        }
     }
 
     /// alephd ended the conversation without success, with its message.
@@ -277,15 +367,66 @@ mod tests {
         let fifo = dir.path().join("fifo.aleph");
         let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        assert!(BackupTarget::open(&fifo).is_err());
+        let e = BackupTarget::open(&fifo).err().unwrap();
+        assert!(e.contains("is not a regular file"), "{e}");
         assert!(fifo.exists());
 
         let target = dir.path().join("elsewhere");
         std::fs::write(&target, b"").unwrap();
         let link = dir.path().join("link.aleph");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(BackupTarget::open(&link).is_err());
+        let e = BackupTarget::open(&link).err().unwrap();
+        assert!(e.contains("is not a regular file"), "{e}");
         assert!(target.exists() && link.exists());
+    }
+
+    /// Removal is of the file the manager opened: another file put at the
+    /// path meanwhile stays.
+    #[test]
+    fn a_file_that_replaced_the_backup_is_not_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.aleph");
+        let t = BackupTarget::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"other").unwrap();
+        drop(t);
+        assert_eq!(std::fs::read(&path).unwrap(), b"other");
+
+        let t = BackupTarget::open(&dir.path().join("c.aleph")).unwrap();
+        std::fs::rename(dir.path().join("b.aleph"), dir.path().join("c.aleph")).unwrap();
+        t.discard();
+        assert_eq!(std::fs::read(dir.path().join("c.aleph")).unwrap(), b"other");
+    }
+
+    /// A kept backup stays, even empty (alephd may still be writing it).
+    #[test]
+    fn a_kept_backup_stays_even_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.aleph");
+        let mut t = BackupTarget::open(&path).unwrap();
+        t.keep();
+        drop(t);
+        assert!(path.exists());
+    }
+
+    /// alephd said it failed: a file the manager made goes, written or not;
+    /// one that was already there stays.
+    #[test]
+    fn a_discarded_backup_goes_even_written() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.aleph");
+        let t = BackupTarget::open(&path).unwrap();
+        (&t.file().unwrap()).write_all(b"half").unwrap();
+        t.discard();
+        assert!(!path.exists());
+
+        let theirs = dir.path().join("theirs.aleph");
+        std::fs::write(&theirs, b"").unwrap();
+        let t = BackupTarget::open(&theirs).unwrap();
+        (&t.file().unwrap()).write_all(b"half").unwrap();
+        t.discard();
+        assert!(theirs.exists(), "not made by the manager: not removed");
     }
 
     #[test]
@@ -304,7 +445,6 @@ mod tests {
         );
     }
 
-    /// The words the Plan 5c tests pin for a settings save.
     #[test]
     fn an_admin_job_has_its_own_words() {
         let j = Job::Admin(AdminOp::RotateMaster);
@@ -341,6 +481,7 @@ mod tests {
         );
     }
 
+    /// The words the Plan 5c tests pin for a settings save.
     #[test]
     fn a_settings_save_keeps_its_words() {
         let j = Job::Settings;

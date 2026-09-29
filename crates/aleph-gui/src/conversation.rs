@@ -111,6 +111,8 @@ pub struct Conversation {
     pub screen: Screen,
     /// A question is waiting for its one answer.
     awaiting: bool,
+    /// An answer (not a Cancel) has been sent to alephd.
+    answered: bool,
 }
 
 impl Default for Conversation {
@@ -127,11 +129,19 @@ impl Conversation {
             caller: None,
             screen: Screen::Working,
             awaiting: false,
+            answered: false,
         }
     }
 
     pub fn finished(&self) -> bool {
         matches!(self.screen, Screen::Finished { .. })
+    }
+
+    /// Whether an answer (a password, a PIN, a key, a choice: not a Cancel)
+    /// has been sent. Until one is, alephd cannot have got past its
+    /// question.
+    pub fn answered(&self) -> bool {
+        self.answered
     }
 
     /// Take a message from alephd. Returns an answer to send at once, if
@@ -270,6 +280,7 @@ impl Conversation {
             _ => return None,
         };
         self.awaiting = false;
+        self.answered = true;
         self.screen = Screen::Working;
         Some(reply)
     }
@@ -447,6 +458,28 @@ mod tests {
             c.act(Action::RecoveryCheck(groups()), now),
             Some(FromPrompter::RecoveryCheck { groups: groups() })
         );
+    }
+
+    /// Whether an answer went to alephd: a Cancel, or an action that answers
+    /// nothing, is not one.
+    #[test]
+    fn an_answer_sent_is_remembered_and_a_cancel_is_not_one() {
+        let now = Instant::now();
+        let mut c = begun(Purpose::Reauth);
+        c.receive(ask(vec![Method::Password], None), now);
+        assert!(!c.answered());
+        assert_eq!(c.act(Action::Fido2, now), None);
+        assert!(!c.answered(), "nothing was sent");
+        assert!(c.act(Action::Password(Secret::new("pw")), now).is_some());
+        assert!(c.answered());
+        // (Asked again after a wrong answer: one was still sent.)
+        c.receive(ask(vec![Method::Password], None), now);
+        assert!(c.answered());
+
+        let mut c = begun(Purpose::Reauth);
+        c.receive(ask(vec![Method::Password], None), now);
+        assert!(c.act(Action::Cancel, now).is_some());
+        assert!(!c.answered());
     }
 
     #[test]

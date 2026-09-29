@@ -85,6 +85,12 @@ impl PromptApp {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
 
+    /// Whether an answer has been sent to alephd (see
+    /// [`Conversation::answered`](crate::conversation::Conversation::answered)).
+    pub fn answered(&self) -> bool {
+        self.ui.conversation.answered()
+    }
+
     /// Re-theme live when the Omarchy theme changes (spec §7).
     pub fn watch_theme(&mut self, ctx: &egui::Context) {
         self.watch = self
