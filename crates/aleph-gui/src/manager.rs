@@ -548,7 +548,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
             }
             // (An interrupted operation may have gone through: the status
             // is read again.)
-            Job::Admin(_) => self.admin = AdminState::Unknown,
+            Job::Admin(_) => self.admin.invalidate(),
         }
     }
 
@@ -618,12 +618,12 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     // (The link went: what it was reading may never come; the
                     // link came back, or the vault locked or unlocked: what
                     // STATUS says has changed.)
-                    if !up && matches!(self.admin, AdminState::Loading) {
+                    if !up && matches!(self.admin, AdminState::Loading { .. }) {
                         self.admin = AdminState::Unknown;
                     }
                     let opened = matches!(self.vault, Vault::Unlocked(_));
-                    if (up && !was_up || opened != was_unlocked) && self.admin.is_stale() {
-                        self.admin = AdminState::Unknown;
+                    if up && !was_up || opened != was_unlocked {
+                        self.admin.invalidate();
                     }
                     // (The selection goes if its item or folder went.)
                     let gone = match &self.selected {
@@ -656,12 +656,17 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     }
                 }
                 StoreEvent::Status(result) => {
-                    // (Only the answer being waited for.)
-                    if matches!(self.admin, AdminState::Loading) {
-                        self.admin = match result {
-                            Ok(s) => AdminState::Ready(s),
-                            Err(e) => AdminState::Failed(e),
-                        };
+                    // (Only the answer being waited for; one from before a
+                    // change is not shown, but asked for again.)
+                    match self.admin {
+                        AdminState::Loading { stale: false } => {
+                            self.admin = match result {
+                                Ok(s) => AdminState::Ready(s),
+                                Err(e) => AdminState::Failed(e),
+                            };
+                        }
+                        AdminState::Loading { stale: true } => self.admin = AdminState::Unknown,
+                        _ => {}
                     }
                 }
                 StoreEvent::Config(result) => {
@@ -775,7 +780,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
                         if let Some(e) = error {
                             self.status = Some(format!("cannot {request}: {e}"));
                         }
-                        self.admin = AdminState::Unknown;
+                        self.admin.invalidate();
                         continue;
                     }
                     if let Some(Running::Job(job)) = &self.running
@@ -790,7 +795,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
                             }
                             self.status = Some(format!("cannot {request}: {e}"));
                             if admin {
-                                self.admin = AdminState::Unknown;
+                                self.admin.invalidate();
                             }
                         }
                         continue;
@@ -1030,7 +1035,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
     fn ask_status(&mut self) {
         let up = matches!(self.vault, Vault::Locked | Vault::Unlocked(_));
         if self.page == Page::Admin && up && matches!(self.admin, AdminState::Unknown) {
-            self.admin = AdminState::Loading;
+            self.admin = AdminState::Loading { stale: false };
             self.store.request(Request::Status);
         }
     }
@@ -1141,6 +1146,9 @@ impl<S: Store, B: Backend> Manager<S, B> {
     /// "type a path instead": the typed-path field, prefilled.
     fn type_backup_path(&mut self) {
         if self.running.is_none() && self.waiting.is_none() {
+            // (A dialog still open is forgotten: its late answer must not
+            // reset the text or start a backup while the person types.)
+            self.picking = None;
             self.backup_error = None;
             self.backup_path = Some(self.suggested_path());
         }
@@ -1518,7 +1526,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     self.touch_alone = false;
                 }
                 self.status = Some(op.done_text());
-                self.admin = AdminState::Unknown;
+                self.admin.invalidate();
             }
             (job, Some((false, message))) => {
                 let admin = matches!(job, Job::Admin(_));
@@ -1527,7 +1535,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     None => job.cancelled(),
                 });
                 if admin {
-                    self.admin = AdminState::Unknown;
+                    self.admin.invalidate();
                 }
                 // (Not done: a backup's file goes, even written.)
                 job.failed();

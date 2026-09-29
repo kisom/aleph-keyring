@@ -17,7 +17,12 @@ pub const TOUCH_WARNING: &str = "anyone holding the key can unlock";
 pub enum AdminState {
     /// Not asked for yet (or nothing worth keeping when the link went).
     Unknown,
-    Loading,
+    /// Asked for; `stale` once something changed what STATUS says while
+    /// the answer was on its way (that answer is then not shown: it is
+    /// asked for again).
+    Loading {
+        stale: bool,
+    },
     Failed(String),
     Ready(AdminStatus),
 }
@@ -26,6 +31,16 @@ impl AdminState {
     /// What a link's return, or a lock or unlock, reads again.
     pub fn is_stale(&self) -> bool {
         matches!(self, Self::Failed(_) | Self::Ready(_))
+    }
+
+    /// What STATUS says has changed (a lock or unlock, the link's return,
+    /// an operation's end): read it again. An answer already on its way is
+    /// not asked for twice; it is marked, and asked for again when it comes.
+    pub fn invalidate(&mut self) {
+        match self {
+            Self::Loading { stale } => *stale = true,
+            _ => *self = Self::Unknown,
+        }
     }
 }
 
@@ -196,7 +211,7 @@ pub fn admin_section(
             }
             return action;
         }
-        AdminState::Unknown | AdminState::Loading => {
+        AdminState::Unknown | AdminState::Loading { .. } => {
             match &view.link {
                 Link::Up => ui.label("LOADING…"),
                 Link::Connecting => ui.label("CONNECTING…"),
@@ -511,7 +526,25 @@ mod tests {
     fn a_failed_or_known_state_is_stale_and_a_loading_one_is_not() {
         assert!(AdminState::Failed("x".into()).is_stale());
         assert!(AdminState::Ready(status()).is_stale());
-        assert!(!AdminState::Loading.is_stale());
+        assert!(!AdminState::Loading { stale: false }.is_stale());
+        assert!(!AdminState::Loading { stale: true }.is_stale());
         assert!(!AdminState::Unknown.is_stale());
+    }
+
+    /// Invalidating marks an answer on its way, and reads anything else
+    /// again.
+    #[test]
+    fn invalidating_marks_a_read_on_its_way_and_forgets_the_rest() {
+        let mut s = AdminState::Loading { stale: false };
+        s.invalidate();
+        assert!(matches!(s, AdminState::Loading { stale: true }));
+        for mut s in [
+            AdminState::Ready(status()),
+            AdminState::Failed("x".into()),
+            AdminState::Unknown,
+        ] {
+            s.invalidate();
+            assert!(matches!(s, AdminState::Unknown));
+        }
     }
 }

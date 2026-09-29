@@ -2045,6 +2045,82 @@ fn a_lock_or_unlock_reads_the_status_again() {
     assert!(matches!(only(store.take()), Request::Status));
 }
 
+/// (M5.) A lock while the status is on its way: the answer, from before
+/// the lock, is not shown; the status is read again.
+#[test]
+fn a_status_answer_from_before_a_lock_is_not_shown_and_is_read_again() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("ADMIN").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Status));
+    store.send(StoreEvent::Vault(Vault::Locked));
+    frames(&mut h);
+    assert!(store.take().is_empty(), "not asked twice at once");
+    store.send(StoreEvent::Status(Ok(admin_status())));
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Status));
+    assert!(
+        h.query_by_label("vault  unlocked · secret service  alephd")
+            .is_none()
+    );
+    h.get_by_label("LOADING…");
+}
+
+/// (M5.) An operation ending while the status is on its way: the answer
+/// on its way is not shown; the status is read again.
+#[test]
+fn a_status_answer_from_before_an_operation_ended_is_read_again() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_admin(&mut h, &store, admin_status());
+    h.get_by_label("Retry keyslot login password").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::RetryKeyslot(_)));
+    h.get_by_label("SECRETS").click();
+    frames(&mut h);
+    h.get_by_label("ADMIN").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Status));
+    store.send(done_event("retry the keyslot", None));
+    frames(&mut h);
+    assert!(store.take().is_empty(), "not asked twice at once");
+    store.send(StoreEvent::Status(Ok(admin_status())));
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Status));
+    h.get_by_label("LOADING…");
+}
+
+/// (M5.) A status answer nobody is waiting for is ignored.
+#[test]
+fn a_status_answer_not_waited_for_is_ignored() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_admin(&mut h, &store, admin_status());
+    let mut s = admin_status();
+    s.locked = true;
+    store.send(StoreEvent::Status(Ok(s)));
+    frames(&mut h);
+    h.get_by_label("vault  unlocked · secret service  alephd");
+    assert!(store.take().is_empty());
+}
+
+/// (M5.) The link lost while the status is on its way: back to waiting for
+/// the link, and asked again when it returns.
+#[test]
+fn a_link_lost_while_the_status_loads_asks_again_when_back() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("ADMIN").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Status));
+    store.send(StoreEvent::Vault(Vault::Unreachable("gone".into())));
+    frames(&mut h);
+    h.get_by_label("LINK DOWN");
+    store.send(StoreEvent::Status(Ok(admin_status())));
+    frames(&mut h);
+    h.get_by_label("LINK DOWN");
+    store.send(StoreEvent::Vault(Vault::Locked));
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Status));
+}
+
 /// A refused RETRY says why, and the status is read again.
 #[test]
 fn a_refused_retry_says_why_and_reads_the_status_again() {
@@ -2822,22 +2898,7 @@ fn leaving_the_page_forgets_the_typed_path() {
 fn a_path_chosen_after_leaving_the_page_is_not_used() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mine.aleph");
-    let (tx, rx) = std::sync::mpsc::channel();
-    struct Slow(std::sync::Mutex<Option<std::sync::mpsc::Receiver<Pick>>>);
-    impl aleph_gui::filepicker::FilePicker for Slow {
-        fn start(
-            &self,
-            _: String,
-            _: Option<std::path::PathBuf>,
-        ) -> std::sync::mpsc::Receiver<Pick> {
-            self.0.lock().unwrap().take().unwrap()
-        }
-    }
-    let slow = Slow(std::sync::Mutex::new(Some(rx)));
-    let (mut h, store, _) = window_with(ThemeChoice::Neon, vault(), SIZE, move |m| {
-        m.with_file_picker(Box::new(slow))
-    });
-    open_admin(&mut h, &store, admin_status());
+    let (mut h, store, tx) = slow_backup_window(vault());
     h.get_by_label("BACK UP…").click();
     frames(&mut h);
     h.get_by_label("SECRETS").click();
@@ -2847,6 +2908,108 @@ fn a_path_chosen_after_leaving_the_page_is_not_used() {
     assert!(store.take().is_empty());
     assert!(!path.exists());
     h.get_by_label_contains("not backed up");
+}
+
+/// A save dialog that answers only when the test sends the answer.
+struct Slow(std::sync::Mutex<Option<std::sync::mpsc::Receiver<Pick>>>);
+
+impl aleph_gui::filepicker::FilePicker for Slow {
+    fn start(&self, _: String, _: Option<std::path::PathBuf>) -> std::sync::mpsc::Receiver<Pick> {
+        self.0.lock().unwrap().take().unwrap()
+    }
+}
+
+/// A window on the ADMIN page whose (one) save dialog answers with what
+/// is sent on the returned sender.
+fn slow_backup_window(v: Vault) -> (Window, Fake, std::sync::mpsc::Sender<Pick>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let slow = Slow(std::sync::Mutex::new(Some(rx)));
+    let (mut h, store, _) = window_with(ThemeChoice::Neon, v, SIZE, move |m| {
+        m.with_file_picker(Box::new(slow))
+    });
+    open_admin(&mut h, &store, admin_status());
+    (h, store, tx)
+}
+
+/// (M7.) A dialog still open when the person chooses to type the path: a
+/// late choice starts nothing and leaves the typed text alone.
+#[test]
+fn a_late_choice_is_ignored_once_the_path_is_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    let typed = dir.path().join("typed.aleph");
+    let chosen = dir.path().join("chosen.aleph");
+    let (mut h, store, tx) = slow_backup_window(vault());
+    h.get_by_label("BACK UP…").click();
+    frames(&mut h);
+    h.get_by_label("type a path instead").click();
+    frames(&mut h);
+    retype(&mut h, "Backup path", typed.to_str().unwrap());
+    let _ = tx.send(Pick::Chosen(chosen.clone()));
+    settle(&mut h);
+    assert!(store.take().is_empty());
+    assert!(!chosen.exists() && !typed.exists());
+    assert_eq!(
+        h.get_by_label("Backup path").value().unwrap_or_default(),
+        typed.to_str().unwrap()
+    );
+}
+
+/// (M7.) Nor does a late "no portal" put the suggestion back over the
+/// typed text.
+#[test]
+fn a_late_no_portal_leaves_the_typed_path_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let typed = dir.path().join("typed.aleph");
+    let (mut h, _store, tx) = slow_backup_window(vault());
+    h.get_by_label("BACK UP…").click();
+    frames(&mut h);
+    h.get_by_label("type a path instead").click();
+    frames(&mut h);
+    retype(&mut h, "Backup path", typed.to_str().unwrap());
+    let _ = tx.send(Pick::Unavailable);
+    settle(&mut h);
+    assert_eq!(
+        h.get_by_label("Backup path").value().unwrap_or_default(),
+        typed.to_str().unwrap()
+    );
+}
+
+/// (M10.) A path chosen while another action waits for the unlock is
+/// refused before any file is made, and says so.
+#[test]
+fn a_path_chosen_while_another_action_waits_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, store, tx) = slow_backup_window(Vault::Locked);
+    h.get_by_label("BACK UP…").click();
+    frames(&mut h);
+    h.get_by_label("ROTATE MASTER KEY").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Unlock));
+    tx.send(Pick::Chosen(path.clone())).unwrap();
+    settle(&mut h);
+    h.get_by_label("not backed up: another operation is under way");
+    assert!(store.take().is_empty());
+    assert!(!path.exists());
+}
+
+/// (M10.) A typed path while alephd cannot be reached is refused before
+/// any file is made, and says so.
+#[test]
+fn a_typed_path_while_alephd_is_unreachable_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, store, _) = backup_window(vec![]);
+    h.get_by_label("type a path instead").click();
+    frames(&mut h);
+    retype(&mut h, "Backup path", path.to_str().unwrap());
+    store.send(StoreEvent::Vault(Vault::Unreachable("gone".into())));
+    frames(&mut h);
+    h.get_by_label("BACK UP").click();
+    frames(&mut h);
+    h.get_by_label("not backed up: alephd cannot be reached");
+    assert!(store.take().is_empty());
+    assert!(!path.exists());
 }
 
 /// (Review Focus 2.) alephd refuses a path inside its own directory: the
