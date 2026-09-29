@@ -5,6 +5,10 @@
 //! happens on finish. The words each kind uses are here, so
 //! `manager.rs` never branches on the kind to say something.
 
+use std::os::fd::OwnedFd;
+
+use crate::store::Request;
+
 /// What a fetched secret is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Want {
@@ -19,6 +23,53 @@ pub enum Job {
     /// The VAULT settings' SAVE (the changes are read from the form when it
     /// starts).
     Settings,
+    /// An ADMIN operation.
+    Admin(AdminOp),
+}
+
+/// One admin operation (the admin spec, "The screen").
+#[derive(Debug)]
+pub enum AdminOp {
+    AddTpm,
+    AddFido2 { touch_only: bool },
+    Remove { id: String, label: String },
+    RotateMaster,
+    NewRecoveryKey,
+}
+
+impl AdminOp {
+    /// The store request's name (`Request::name`).
+    pub fn request_name(&self) -> &'static str {
+        match self {
+            Self::AddTpm => "add the TPM slot",
+            Self::AddFido2 { .. } => "add the security key",
+            Self::Remove { .. } => "remove the keyslot",
+            Self::RotateMaster => "rotate the master key",
+            Self::NewRecoveryKey => "issue a new recovery key",
+        }
+    }
+
+    /// What the status line says when it went through.
+    pub fn done_text(&self) -> String {
+        match self {
+            Self::AddTpm | Self::AddFido2 { .. } => "KEYSLOT ADDED",
+            Self::Remove { .. } => "KEYSLOT REMOVED",
+            Self::RotateMaster => "MASTER KEY ROTATED",
+            Self::NewRecoveryKey => "NEW RECOVERY KEY ISSUED",
+        }
+        .into()
+    }
+
+    /// The store request, conversing on `prompter`.
+    pub fn request(&self, prompter: OwnedFd) -> Request {
+        match self {
+            Self::AddTpm => Request::AddTpm(prompter),
+            Self::AddFido2 { touch_only } => Request::AddFido2(prompter, *touch_only),
+            Self::Remove { id, .. } => Request::RemoveKeyslot(prompter, id.clone()),
+            Self::RotateMaster => Request::RotateMaster(prompter),
+            Self::NewRecoveryKey => Request::ReissueRecovery(prompter),
+        }
+    }
 }
 
 impl Job {
@@ -26,6 +77,7 @@ impl Job {
     pub fn request_name(&self) -> &'static str {
         match self {
             Self::Settings => "save the settings",
+            Self::Admin(op) => op.request_name(),
         }
     }
 
@@ -33,6 +85,7 @@ impl Job {
     pub fn may_not_have_gone_through(&self) -> &'static str {
         match self {
             Self::Settings => "the save may not have gone through",
+            Self::Admin(_) => "the operation may not have gone through",
         }
     }
 
@@ -40,6 +93,7 @@ impl Job {
     pub fn may_not_have_been_done(&self) -> &'static str {
         match self {
             Self::Settings => "the settings may not have been saved",
+            Self::Admin(_) => "the operation may not have gone through",
         }
     }
 
@@ -47,6 +101,7 @@ impl Job {
     pub fn nothing(&self) -> &'static str {
         match self {
             Self::Settings => "nothing was saved",
+            Self::Admin(_) => "nothing was changed",
         }
     }
 
@@ -54,6 +109,7 @@ impl Job {
     pub fn unlock_missed(&self) -> &'static str {
         match self {
             Self::Settings => "the settings were not saved",
+            Self::Admin(_) => "the operation was not run",
         }
     }
 
@@ -65,6 +121,7 @@ impl Job {
     pub fn refused(&self, message: &str) -> String {
         match self {
             Self::Settings => format!("not saved: {message}"),
+            Self::Admin(_) => format!("not done: {message}"),
         }
     }
 }
@@ -85,6 +142,42 @@ mod tests {
     use super::*;
 
     /// The words the Plan 5c tests pin for a settings save.
+    #[test]
+    fn an_admin_job_has_its_own_words() {
+        let j = Job::Admin(AdminOp::RotateMaster);
+        assert_eq!(j.request_name(), "rotate the master key");
+        assert_eq!(j.nothing(), "nothing was changed");
+        assert_eq!(j.cancelled(), "cancelled: nothing was changed");
+        assert_eq!(j.refused("no"), "not done: no");
+        assert_eq!(
+            j.may_not_have_gone_through(),
+            "the operation may not have gone through"
+        );
+        assert_eq!(
+            j.may_not_have_been_done(),
+            "the operation may not have gone through"
+        );
+        assert_eq!(j.unlock_missed(), "the operation was not run");
+        assert_eq!(AdminOp::RotateMaster.done_text(), "MASTER KEY ROTATED");
+        assert_eq!(
+            AdminOp::AddFido2 { touch_only: true }.done_text(),
+            "KEYSLOT ADDED"
+        );
+        assert_eq!(AdminOp::AddTpm.done_text(), "KEYSLOT ADDED");
+        assert_eq!(
+            AdminOp::Remove {
+                id: "1".into(),
+                label: "x".into()
+            }
+            .done_text(),
+            "KEYSLOT REMOVED"
+        );
+        assert_eq!(
+            AdminOp::NewRecoveryKey.done_text(),
+            "NEW RECOVERY KEY ISSUED"
+        );
+    }
+
     #[test]
     fn a_settings_save_keeps_its_words() {
         let j = Job::Settings;

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use egui::{Button, RichText, TextEdit};
 use zeroize::Zeroizing;
 
+use crate::admin_page::{self, AdminAction, AdminState, AdminView, Ask, Link};
 use crate::app::PromptApp;
 use crate::clipboard::{Backend, Clipboard};
 use crate::conversation::{Screen, shown};
@@ -20,7 +21,7 @@ use crate::settings_page::{
 };
 use crate::store::{Collection, Item, Request, Store, StoreEvent, Vault};
 pub use crate::task::Want;
-use crate::task::{Job, Running};
+use crate::task::{AdminOp, Job, Running};
 use crate::theme::{self, Palette};
 
 /// The window's first size.
@@ -50,6 +51,7 @@ pub enum Selection {
 pub enum Page {
     Secrets,
     Settings,
+    Admin,
 }
 
 /// A secret on screen.
@@ -148,6 +150,13 @@ pub struct Manager<S: Store, B: Backend> {
     exit_armed: bool,
     /// EXIT closed the window (the close command was sent).
     exit_requested: bool,
+    /// The ADMIN page's status: read when the page opens, and again after
+    /// every operation, lock, unlock and return of the link.
+    admin: AdminState,
+    /// A Yes/No step before REMOVE or NEW RECOVERY KEY.
+    ask: Option<Ask>,
+    /// The "touch alone" checkbox for a new security key.
+    touch_alone: bool,
 }
 
 /// What the status line says after the first EXIT with unsaved edits.
@@ -232,6 +241,9 @@ impl<S: Store, B: Backend> Manager<S, B> {
             rebase_on_config: Rebase::No,
             exit_armed: false,
             exit_requested: false,
+            admin: AdminState::Unknown,
+            ask: None,
+            touch_alone: false,
         }
     }
 
@@ -424,6 +436,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 theirs.into(),
                 self.form().map(Form::changes).unwrap_or_default(),
             ),
+            Job::Admin(op) => op.request(theirs.into()),
         };
         self.running = Some(Running::Job(job));
         self.store.request(request);
@@ -491,6 +504,9 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     self.rebase_on_config = Rebase::Due;
                 }
             }
+            // (An interrupted operation may have gone through: the status
+            // is read again.)
+            Job::Admin(_) => self.admin = AdminState::Unknown,
         }
     }
 
@@ -533,6 +549,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
                         self.sealed(&v);
                     }
                     let was_up = matches!(self.vault, Vault::Locked | Vault::Unlocked(_));
+                    let was_unlocked = matches!(self.vault, Vault::Unlocked(_));
                     self.vault = v;
                     let up = matches!(self.vault, Vault::Locked | Vault::Unlocked(_));
                     if !up && matches!(self.values, Values::Loading) {
@@ -553,6 +570,16 @@ impl<S: Store, B: Backend> Manager<S, B> {
                         if self.values.is_stale() {
                             self.values = Values::Unknown;
                         }
+                    }
+                    // (The link went: what it was reading may never come; the
+                    // link came back, or the vault locked or unlocked: what
+                    // STATUS says has changed.)
+                    if !up && matches!(self.admin, AdminState::Loading) {
+                        self.admin = AdminState::Unknown;
+                    }
+                    let opened = matches!(self.vault, Vault::Unlocked(_));
+                    if (up && !was_up || opened != was_unlocked) && self.admin.is_stale() {
+                        self.admin = AdminState::Unknown;
                     }
                     // (The selection goes if its item or folder went.)
                     let gone = match &self.selected {
@@ -584,8 +611,15 @@ impl<S: Store, B: Backend> Manager<S, B> {
                             Some(format!("'{}' was deleted elsewhere", shown(&label, NAME)));
                     }
                 }
-                // (Task 5 replaces this with the real handling of the status.)
-                StoreEvent::Status(_) => {}
+                StoreEvent::Status(result) => {
+                    // (Only the answer being waited for.)
+                    if matches!(self.admin, AdminState::Loading) {
+                        self.admin = match result {
+                            Ok(s) => AdminState::Ready(s),
+                            Err(e) => AdminState::Failed(e),
+                        };
+                    }
+                }
                 StoreEvent::Config(result) => {
                     // (Only the answer being waited for.)
                     if matches!(self.values, Values::Loading) {
@@ -688,13 +722,28 @@ impl<S: Store, B: Backend> Manager<S, B> {
                         // (The VAULT section shows why, with RETRY.)
                         continue;
                     }
+                    if request == "read the status" {
+                        // (The page shows why, with RETRY.)
+                        continue;
+                    }
+                    if request == "retry the keyslot" {
+                        match error {
+                            Some(e) => self.status = Some(format!("cannot {request}: {e}")),
+                            None => self.admin = AdminState::Unknown,
+                        }
+                        continue;
+                    }
                     if let Some(Running::Job(job)) = &self.running
                         && request == job.request_name()
                     {
+                        let admin = matches!(job, Job::Admin(_));
                         if let Some(e) = error {
                             self.end_confirm();
                             self.running = None;
                             self.status = Some(format!("cannot {request}: {e}"));
+                            if admin {
+                                self.admin = AdminState::Unknown;
+                            }
                         }
                         continue;
                     }
@@ -755,6 +804,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
         }
         self.resume_job(&ui.ctx().clone());
         self.ask_config();
+        self.ask_status();
         let p = self.palette.clone();
         let mut go = None;
         let (mut lock, mut exit) = (false, false);
@@ -768,7 +818,11 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 ui.add_space(16.0);
                 // (Not while a confirmation runs: it is drawn in the page.)
                 ui.add_enabled_ui(self.confirm.is_none(), |ui| {
-                    for (page, name) in [(Page::Secrets, "SECRETS"), (Page::Settings, "SETTINGS")] {
+                    for (page, name) in [
+                        (Page::Secrets, "SECRETS"),
+                        (Page::Settings, "SETTINGS"),
+                        (Page::Admin, "ADMIN"),
+                    ] {
                         let picked = self.page == page;
                         if ui
                             .add(Button::selectable(picked, RichText::new(name).strong()))
@@ -808,11 +862,19 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     self.values = Values::Unknown;
                 }
             }
+            if page == Page::Admin && self.page != Page::Admin {
+                // (No edits to keep: read it again.)
+                if self.admin.is_stale() {
+                    self.admin = AdminState::Unknown;
+                }
+                self.ask = None;
+            }
             self.page = page;
         }
         match self.page {
             Page::Secrets => self.secrets(ui, &p, now),
             Page::Settings => self.settings_screen(ui, &p, now),
+            Page::Admin => self.admin_screen(ui, &p, now),
         }
         if self.settings.scanlines && !self.still {
             theme::paint_scanlines(ui.ctx(), &p);
@@ -881,6 +943,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 &self.values,
                 Values::Ready(f) if self.page == Page::Settings && f.edited() && f.valid()
             ),
+            Job::Admin(_) => self.page == Page::Admin,
         };
         if !ready {
             // (Not silently: the edits stay, for another SAVE.)
@@ -904,6 +967,78 @@ impl<S: Store, B: Backend> Manager<S, B> {
         {
             self.rebase_on_config = Rebase::Asked;
             self.store.request(Request::Config);
+        }
+    }
+
+    /// Ask alephd for its status when the ADMIN page needs it.
+    fn ask_status(&mut self) {
+        let up = matches!(self.vault, Vault::Locked | Vault::Unlocked(_));
+        if self.page == Page::Admin && up && matches!(self.admin, AdminState::Unknown) {
+            self.admin = AdminState::Loading;
+            self.store.request(Request::Status);
+        }
+    }
+
+    fn admin_screen(&mut self, ui: &mut egui::Ui, p: &Palette, now: Instant) {
+        egui::CentralPanel::default().show(ui, |ui| {
+            self.status_line(ui, p);
+            if self.confirm.is_some() {
+                self.confirming(ui, now);
+                return;
+            }
+            egui::ScrollArea::vertical().show(ui, |ui| self.admin_body(ui, p));
+        });
+    }
+
+    /// How alephd can be reached now, as the ADMIN page says it.
+    fn link(&self) -> Link {
+        match &self.vault {
+            Vault::Connecting => Link::Connecting,
+            Vault::Unreachable(why) => Link::Down(why.clone()),
+            _ => Link::Up,
+        }
+    }
+
+    /// The ADMIN page's body: a Yes/No step, or STATUS, KEYSLOTS and
+    /// KEEPING IT SAFE, and what their buttons do.
+    fn admin_body(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let ctx = ui.ctx().clone();
+        if let Some(ask) = self.ask.clone() {
+            match admin_page::ask_section(ui, p, &ask) {
+                Some(true) => {
+                    self.ask = None;
+                    let op = match ask {
+                        Ask::Remove { id, label } => AdminOp::Remove { id, label },
+                        Ask::NewRecoveryKey => AdminOp::NewRecoveryKey,
+                    };
+                    self.begin(&ctx, Job::Admin(op));
+                }
+                Some(false) => self.ask = None,
+                None => {}
+            }
+            return;
+        }
+        let view = AdminView {
+            link: self.link(),
+            sealed: matches!(self.vault, Vault::Locked),
+            waiting: matches!(self.waiting, Some(Job::Admin(_))),
+        };
+        let action = admin_page::admin_section(ui, p, &self.admin, &view, &mut self.touch_alone);
+        match action {
+            None => {}
+            Some(AdminAction::Reload) => self.admin = AdminState::Unknown,
+            Some(AdminAction::Retry(id)) => self.store.request(Request::RetryKeyslot(id)),
+            Some(AdminAction::Remove { id, label }) => self.ask = Some(Ask::Remove { id, label }),
+            Some(AdminAction::NewRecoveryKey) => self.ask = Some(Ask::NewRecoveryKey),
+            Some(AdminAction::AddTpm) => self.begin(&ctx, Job::Admin(AdminOp::AddTpm)),
+            Some(AdminAction::AddFido2 { touch_only }) => {
+                self.begin(&ctx, Job::Admin(AdminOp::AddFido2 { touch_only }))
+            }
+            Some(AdminAction::RotateMaster | AdminAction::RotateNow) => {
+                self.begin(&ctx, Job::Admin(AdminOp::RotateMaster))
+            }
+            // (Task 6: the backup.)
+            Some(AdminAction::BackUp | AdminAction::TypePath) => {}
         }
     }
 
@@ -1199,11 +1334,20 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 self.status = Some("SETTINGS SAVED".into());
                 self.values = Values::Unknown;
             }
+            (Job::Admin(op), Some((true, _))) => {
+                self.reauth.confirmed(now);
+                self.status = Some(op.done_text());
+                self.admin = AdminState::Unknown;
+            }
             (job, Some((false, message))) => {
+                let admin = matches!(job, Job::Admin(_));
                 self.status = Some(match message {
                     Some(m) => job.refused(&m),
                     None => job.cancelled(),
                 });
+                if admin {
+                    self.admin = AdminState::Unknown;
+                }
             }
         }
     }

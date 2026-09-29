@@ -8,9 +8,11 @@ use std::time::{Duration, Instant};
 
 use aleph_daemon::prompt::{Channel, FromPrompter, Method, Purpose, ToPrompter};
 use aleph_gui::clipboard::Backend;
-use aleph_gui::manager::{Manager, SIZE};
+use aleph_gui::manager::{Manager, Page, SIZE};
 use aleph_gui::settings::{Settings, ThemeChoice};
-use aleph_gui::store::{Collection, Item, Request, Store, StoreEvent, Vault};
+use aleph_gui::store::{
+    AdminStatus, Collection, Item, Request, SlotInfo, Store, StoreEvent, Vault,
+};
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 use zeroize::Zeroizing;
@@ -1672,6 +1674,374 @@ fn the_scanlines_control_says_reduced_motion_turns_them_off() {
     h.get_by_label("SETTINGS").click();
     frames(&mut h);
     h.get_by_label_contains("reduced motion");
+}
+
+// --- ADMIN ---
+
+fn slot(id: &str, label: &str, kind: &str, stale: bool) -> SlotInfo {
+    SlotInfo {
+        id: id.into(),
+        label: label.into(),
+        kind: kind.into(),
+        created: 1_790_553_600,
+        stale,
+    }
+}
+
+fn admin_status() -> AdminStatus {
+    AdminStatus {
+        vault: true,
+        locked: false,
+        untrusted: None,
+        memory_locked: Some(true),
+        tpm: Some(true),
+        keyslots: vec![
+            slot("1", "tpm", "tpm", false),
+            slot("2", "yubikey", "fido2", false),
+            slot("3", "recovery", "recovery", false),
+            slot("4", "login password", "login-password", true),
+        ],
+        rotation_pending: false,
+        secret_service: Some("alephd".into()),
+    }
+}
+
+/// Open ADMIN and answer the status read.
+fn open_admin(h: &mut Window, store: &Fake, status: AdminStatus) {
+    h.get_by_label("ADMIN").click();
+    frames(h);
+    assert!(matches!(only(store.take()), Request::Status));
+    store.send(StoreEvent::Status(Ok(status)));
+    frames(h);
+}
+
+/// A `Done` for `request` (`done` above sends one; this builds it).
+fn done_event(request: &'static str, error: Option<&str>) -> StoreEvent {
+    StoreEvent::Done {
+        request,
+        error: error.map(String::from),
+        dismissed: false,
+    }
+}
+
+#[test]
+fn admin_reads_the_status_once_and_shows_it() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("ADMIN").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Status));
+    h.get_by_label("LOADING…");
+    frames(&mut h);
+    assert!(
+        store.take().is_empty(),
+        "not asked again while it is on its way"
+    );
+    store.send(StoreEvent::Status(Ok(admin_status())));
+    frames(&mut h);
+    h.get_by_label("vault  unlocked · secret service  alephd");
+    h.get_by_label("TPM  usable · master key  locked in RAM");
+    assert_eq!(h.state().page(), Page::Admin);
+    // Leaving and returning reads it again (there are no edits to keep).
+    h.get_by_label("SECRETS").click();
+    frames(&mut h);
+    h.get_by_label("ADMIN").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Status));
+}
+
+#[test]
+fn slots_get_their_buttons() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_admin(&mut h, &store, admin_status());
+    h.get_by_label("Remove keyslot tpm");
+    h.get_by_label("Remove keyslot yubikey");
+    h.get_by_label("Remove keyslot login password");
+    assert!(h.query_by_label("Remove keyslot recovery").is_none());
+    h.get_by_label("Retry keyslot login password");
+    assert!(h.query_by_label("Retry keyslot tpm").is_none());
+    h.get_by_label("STALE");
+}
+
+#[test]
+fn warnings_show_only_when_true_and_rotating_now_rotates() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_admin(&mut h, &store, admin_status());
+    assert!(h.query_by_label_contains("writes refused").is_none());
+    assert!(
+        h.query_by_label_contains("a password change is pending")
+            .is_none()
+    );
+    let mut s = admin_status();
+    s.untrusted = Some("rolled back to an older version".into());
+    s.rotation_pending = true;
+    // (Read again: leave and return.)
+    h.get_by_label("SECRETS").click();
+    frames(&mut h);
+    open_admin(&mut h, &store, s);
+    h.get_by_label_contains("writes refused: rolled back to an older version");
+    h.get_by_label_contains("a password change is pending");
+    h.get_by_label("ROTATE NOW").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::RotateMaster(_)));
+}
+
+/// Operations that go straight to alephd's confirmation, each with the
+/// request that fits.
+#[test]
+fn the_plain_actions_send_their_requests() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_admin(&mut h, &store, admin_status());
+    h.get_by_label("+ TPM").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::AddTpm(_)));
+    end_confirmation(&mut h, &store);
+
+    h.get_by_label("+ SECURITY KEY").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::AddFido2(_, false)));
+    end_confirmation(&mut h, &store);
+
+    h.get_by_label("touch alone").click();
+    frames(&mut h);
+    h.get_by_label("anyone holding the key can unlock");
+    h.get_by_label("+ SECURITY KEY").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::AddFido2(_, true)));
+    end_confirmation(&mut h, &store);
+
+    h.get_by_label("ROTATE MASTER KEY").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::RotateMaster(_)));
+}
+
+/// The request (and with it alephd's end of the confirmation) is gone:
+/// the confirmation closes with no answer, the operation may have gone
+/// through, so the status is read again; answer it, back on the page.
+fn end_confirmation(h: &mut Window, store: &Fake) {
+    settle(h);
+    h.get_by_label_contains("the operation may not have gone through");
+    assert!(matches!(only(store.take()), Request::Status));
+    store.send(StoreEvent::Status(Ok(admin_status())));
+    frames(h);
+}
+
+#[test]
+fn remove_asks_first_with_no_the_default() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_admin(&mut h, &store, admin_status());
+    h.get_by_label("Remove keyslot yubikey").click();
+    frames(&mut h);
+    assert!(store.take().is_empty(), "nothing before Yes");
+    h.get_by_label(
+        "Remove keyslot 'yubikey'? This rotates the master key. The key can no longer unlock the vault.",
+    );
+    // (No has the focus, though the click left it on REMOVE.)
+    assert!(h.get_by_label("No").accesskit_node().is_focused());
+    h.get_by_label("No").click();
+    frames(&mut h);
+    assert!(store.take().is_empty());
+    h.get_by_label("Remove keyslot yubikey").click();
+    frames(&mut h);
+    assert!(h.get_by_label("No").accesskit_node().is_focused());
+    h.get_by_label("Yes").click();
+    frames(&mut h);
+    match only(store.take()) {
+        Request::RemoveKeyslot(_, id) => assert_eq!(id, "2"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_new_recovery_key_asks_first() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_admin(&mut h, &store, admin_status());
+    h.get_by_label("NEW RECOVERY KEY").click();
+    frames(&mut h);
+    assert!(store.take().is_empty());
+    h.get_by_label("The current recovery key stops working as soon as the new one is issued.");
+    h.get_by_label("Yes").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::ReissueRecovery(_)));
+}
+
+#[test]
+fn retrying_a_slot_is_immediate_and_reads_the_status_again() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_admin(&mut h, &store, admin_status());
+    h.get_by_label("Retry keyslot login password").click();
+    frames(&mut h);
+    match only(store.take()) {
+        Request::RetryKeyslot(id) => assert_eq!(id, "4"),
+        other => panic!("{other:?}"),
+    }
+    store.send(done_event("retry the keyslot", None));
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Status));
+}
+
+/// A sealed vault: status shows, the note says every action unlocks first,
+/// and an action asks for the unlock, then its confirmation.
+#[test]
+fn a_sealed_vault_unlocks_first() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, Vault::Locked);
+    open_admin(&mut h, &store, admin_status());
+    h.get_by_label("VAULT SEALED :: ACTIONS ON THIS PAGE UNLOCK FIRST");
+    h.get_by_label("ROTATE MASTER KEY").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Unlock));
+    h.get_by_label("waiting for the unlock…");
+    // Nothing else starts while it waits.
+    h.get_by_label("+ TPM").click();
+    frames(&mut h);
+    assert!(store.take().is_empty());
+    store.send(done_event("unlock", None));
+    store.send(StoreEvent::Vault(vault()));
+    frames(&mut h);
+    let requests = store.take();
+    assert!(
+        requests
+            .iter()
+            .any(|r| matches!(r, Request::RotateMaster(_))),
+        "{requests:?}"
+    );
+    assert!(!requests.iter().any(|r| matches!(r, Request::AddTpm(_))));
+}
+
+/// (Review Focus 4.) A dismissed unlock runs nothing, and a later unlock by
+/// something else does not resume it.
+#[test]
+fn a_dismissed_unlock_runs_nothing() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, Vault::Locked);
+    open_admin(&mut h, &store, admin_status());
+    h.get_by_label("ROTATE MASTER KEY").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Unlock));
+    store.send(StoreEvent::Done {
+        request: "unlock",
+        error: None,
+        dismissed: true,
+    });
+    frames(&mut h);
+    h.get_by_label_contains("nothing was changed");
+    store.send(StoreEvent::Vault(vault()));
+    frames(&mut h);
+    let requests = store.take();
+    assert!(
+        !requests
+            .iter()
+            .any(|r| matches!(r, Request::RotateMaster(_))),
+        "{requests:?}"
+    );
+}
+
+/// (Review Focus 5.) A refusal says why, changes nothing, and the status is
+/// read again.
+#[test]
+fn a_refused_operation_says_why_and_reads_the_status_again() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_admin(&mut h, &store, admin_status());
+    h.get_by_label("ROTATE MASTER KEY").click();
+    frames(&mut h);
+    let Request::RotateMaster(_fd) = only(store.take()) else {
+        panic!("no rotation");
+    };
+    store.send(done_event(
+        "rotate the master key",
+        Some("would leave only the recovery slot"),
+    ));
+    frames(&mut h);
+    h.get_by_label_contains("cannot rotate the master key: would leave only the recovery slot");
+    assert!(matches!(only(store.take()), Request::Status));
+}
+
+/// (Review Focus 5.) A lock during the confirmation may have let the
+/// operation through: it says so, and the status is read again.
+#[test]
+fn a_lock_during_an_operation_may_have_let_it_through() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_admin(&mut h, &store, admin_status());
+    h.get_by_label("ROTATE MASTER KEY").click();
+    frames(&mut h);
+    let _request = only(store.take());
+    store.send(StoreEvent::Vault(Vault::Locked));
+    settle(&mut h);
+    h.get_by_label_contains("the operation may not have gone through");
+    let requests = store.take();
+    assert!(
+        requests.iter().any(|r| matches!(r, Request::Status)),
+        "{requests:?}"
+    );
+}
+
+#[test]
+fn a_successful_operation_says_so_and_reads_the_status_again() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_admin(&mut h, &store, admin_status());
+    h.get_by_label("ROTATE MASTER KEY").click();
+    frames(&mut h);
+    let Request::RotateMaster(fd) = only(store.take()) else {
+        panic!("no rotation");
+    };
+    let alephd = alephd_confirms(fd, "hunter2");
+    settle(&mut h);
+    type_into(&mut h, "Login password", "hunter2");
+    h.key_press(egui::Key::Enter);
+    frames(&mut h);
+    assert!(alephd.join().unwrap());
+    settle(&mut h);
+    h.get_by_label_contains("MASTER KEY ROTATED");
+    assert!(matches!(only(store.take()), Request::Status));
+}
+
+#[test]
+fn with_no_vault_the_page_says_so_and_offers_nothing() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    let mut s = admin_status();
+    s.vault = false;
+    s.keyslots.clear();
+    open_admin(&mut h, &store, s);
+    h.get_by_label_contains("no vault: run `alephctl setup`");
+    assert!(h.query_by_label("+ TPM").is_none());
+}
+
+#[test]
+fn with_alephd_down_the_page_waits_for_the_link() {
+    let (mut h, store, _) = window(
+        ThemeChoice::Neon,
+        Vault::Unreachable("org.freedesktop.secrets has no owner".into()),
+    );
+    h.get_by_label("ADMIN").click();
+    frames(&mut h);
+    assert!(store.take().is_empty(), "nothing to ask");
+    h.get_by_label("LINK DOWN");
+    store.send(StoreEvent::Vault(Vault::Locked));
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Status));
+}
+
+#[test]
+fn a_failed_status_read_says_why_and_can_be_retried() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("ADMIN").click();
+    frames(&mut h);
+    store.take();
+    store.send(StoreEvent::Status(Err("no reply from alephd".into())));
+    frames(&mut h);
+    h.get_by_label_contains("no reply from alephd");
+    h.get_by_label("RETRY").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Status));
+}
+
+/// A lock or unlock changes what STATUS says (locked, memory-locked): it
+/// is read again.
+#[test]
+fn a_lock_or_unlock_reads_the_status_again() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_admin(&mut h, &store, admin_status());
+    store.send(StoreEvent::Vault(Vault::Locked));
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Status));
 }
 
 /// Every view, in both themes.
