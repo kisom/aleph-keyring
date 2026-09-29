@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2024, zbus (D-Bus, `a{ss}` as `BTreeMap<String, String>`), egui/eframe 0.36, egui_kittest (window tests and PNG snapshots), toml 1 (serde), tempfile (tests).
 
-**Spec:** `docs/superpowers/specs/2026-09-28-aleph-settings-design.md` (read it first; commit `f93fd6a` corrects it: **Save needs an unlocked vault**, because alephd's `Keyring::reauth` returns `Error::Locked` on a locked vault). Extends `docs/superpowers/specs/2026-09-28-aleph-manager-design.md` and `docs/superpowers/specs/2026-09-26-aleph-design.md` §7.
+**Spec:** `docs/superpowers/specs/2026-09-28-aleph-settings-design.md` (read it first; commit `f93fd6a` corrects it: **Save needs an unlocked vault, so a locked one is unlocked first**, because alephd's `Keyring::reauth` returns `Error::Locked` on a locked vault). Extends `docs/superpowers/specs/2026-09-28-aleph-manager-design.md` and `docs/superpowers/specs/2026-09-26-aleph-design.md` §7.
 
 ## Global Constraints
 
@@ -19,7 +19,7 @@
 - aleph is live on this host: do not restart alephd, reinstall, or edit live units. The user runs `make install`; you never run `sudo`.
 - After removing a worktree used for this plan, run `cargo clean -p <pkg>` for each workspace package (`cargo metadata --no-deps` lists them): the target dir is shared.
 - Keep the FIDO2 PIN out of every command, file and message.
-- Copy rules (verbatim): the line above Save is "Saving asks you to confirm it is you, once (a FIDO2 touch or your login password)."; the DISPLAY header is "DISPLAY  // gui · changes apply now"; the VAULT header is "VAULT  // alephd"; the prompt-timeout error is "whole minutes, 1 to 1440"; the suspend warning is "the master key can reach a hibernation image unless swap is encrypted"; the locked line is "Unlock the vault to save: confirming it is you needs it open."; success is `SETTINGS SAVED`.
+- Copy rules (verbatim): the line above Save is "Saving asks you to confirm it is you, once (a FIDO2 touch or your login password)."; the DISPLAY header is "DISPLAY  // gui · changes apply now"; the VAULT header is "VAULT  // alephd"; the prompt-timeout error is "whole minutes, 1 to 1440"; the suspend warning is "the master key can reach a hibernation image unless swap is encrypted"; the locked note, beside the buttons while the vault is locked, is "VAULT SEALED :: SAVE WILL UNLOCK FIRST"; success is `SETTINGS SAVED`.
 - `prompt.program` is not in the manager. The manager sends only the keys that changed.
 - Values: prompt timeout 1 to 86 400 s (typed: 1 to 1440 whole minutes); idle lock 0 (Off) or more (typed: whole minutes, 0 or more); reveal hold 0 to 3600 s (default 300, a larger value in the file is read as 3600).
 - Code style: match the surrounding code (comments in parentheses for asides, `//!` module docs that cite the spec, no `unwrap` outside tests). `make gate` (fmt, clippy `-D warnings`, the full suite) must pass at the end of every task that says so.
@@ -32,7 +32,7 @@ Each line has a test in the task named after it.
 2. **The configuration file cannot be written** (a read-only directory): the live configuration must stay as it was and the conversation must end `Done { ok: false }`. (Task 1)
 3. **Typed minutes that look like numbers but are not**: empty, `0` for the prompt timeout, ` 15 ` (spaces), `+5`, `-1`, `1e3`, `１５` (full-width digits), and one so large that `× 60` would overflow: all rejected, none panics. (Task 4)
 4. **A hand-edited `gui.toml`**: `reveal_hold` above 3600, a value that is not a preset, and a broken file: read as 3600, shown as `Custom (N s)`, and never overwritten. (Tasks 2, 6)
-5. **The vault locks, the window loses focus, or alephd refuses, while the confirmation is on screen**: the edits stay, the window says nothing was saved, and Save cannot fire twice. (Task 5)
+5. **The vault locks, the window loses focus, or alephd refuses, while the confirmation is on screen; or the unlock Save asked for is dismissed**: the edits stay, the window says nothing was saved, and Save cannot fire twice (and a later unlock by something else does not resume a dropped save). (Task 5)
 
 ---
 
@@ -1087,7 +1087,7 @@ pub const PROMPT_MAX_MINUTES: u64 = 1440;
 pub const SUSPEND_WARNING: &str =
     "the master key can reach a hibernation image unless swap is encrypted";
 pub const SAVE_NOTE: &str = "Saving asks you to confirm it is you, once (a FIDO2 touch or your login password).";
-pub const LOCKED_NOTE: &str = "Unlock the vault to save: confirming it is you needs it open.";
+pub const LOCKED_NOTE: &str = "VAULT SEALED :: SAVE WILL UNLOCK FIRST";
 
 /// Which duration a control sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1348,7 +1348,7 @@ git commit -m 'feat(gui): the settings form model, presets and typed minutes' -m
 **Interfaces:**
 - Consumes: `Request::Config`, `Request::SetConfigs`, `StoreEvent::Config`, `Form`, `Values` (Tasks 3, 4); `Reauth::confirmed`.
 - Produces:
-  - `settings_page::VaultView { pub enabled: bool, pub can_save: bool }`, `enum VaultAction { Save, Cancel }`, `fn vault_section(ui: &mut egui::Ui, p: &Palette, form: &mut Form, view: &VaultView) -> Option<VaultAction>`; `fn header(ui, p, text)`.
+  - `settings_page::VaultView { pub enabled: bool, pub sealed: bool, pub unlocking: bool }`, `enum VaultAction { Save, Cancel }`, `fn vault_section(ui: &mut egui::Ui, p: &Palette, form: &mut Form, view: &VaultView) -> Option<VaultAction>`; `fn header(ui, p, text)`.
   - `manager::Page { Secrets, Settings }` (`Copy + PartialEq + Debug`), `Manager::page()`, `Manager::form() -> Option<&Form>`.
   - Window behavior: nav `SECRETS` / `SETTINGS`; `Request::Config` is sent once when SETTINGS is shown with the link up and no values; a Save sends one `Request::SetConfigs(fd, changes)` and draws the confirmation in the window; success sets the status `SETTINGS SAVED`, starts the reveal window and re-reads; failure or cancel keeps the edits.
   - Accessible names used by the tests: checkboxes `Lock on suspend`, `Lock on screen lock`; combos `Idle lock: <selected>` and `Prompt timeout: <selected>`; text fields `Idle lock minutes` and `Prompt timeout minutes`; buttons `SAVE`, `CANCEL`, `RETRY`.
@@ -1475,6 +1475,8 @@ fn settings_are_asked_for_once_and_shown() {
     h.get_by_label("Idle lock: 15 min");
     h.get_by_label("Prompt timeout: 5 min");
     h.get_by_label_contains("Saving asks you to confirm it is you, once");
+    // (Unlocked: nothing to say about a seal.)
+    assert!(h.query_by_label("VAULT SEALED :: SAVE WILL UNLOCK FIRST").is_none());
     assert_eq!(h.state().page(), aleph_gui::manager::Page::Settings);
 }
 
@@ -1595,24 +1597,58 @@ fn unsaved_edits_are_kept_across_screens() {
     assert!(h.state().form().unwrap().edited());
 }
 
-/// A locked vault: the values show and DISPLAY works, but the
-/// confirmation needs it open, so Save says so and sends nothing.
+/// A locked vault: the values show, Save says it will unlock first, asks
+/// alephd to unlock, and confirms and saves once the vault is open.
 #[test]
-fn a_locked_vault_shows_the_settings_and_cannot_save_them() {
+fn a_locked_vault_says_save_unlocks_first_and_then_saves() {
     let (mut h, store, _) = window(ThemeChoice::Neon, Vault::Locked);
     open_settings(&mut h, &store, "0", "300", "true");
     pick(&mut h, "Idle lock", "15 min");
-    h.get_by_label("Unlock the vault to save: confirming it is you needs it open.");
+    h.get_by_label("VAULT SEALED :: SAVE WILL UNLOCK FIRST");
     h.get_by_label("SAVE").click();
     frames(&mut h);
-    assert!(store.take().is_empty());
-    // Unlocked meanwhile: the same edit can be saved.
+    // Only the unlock, so far: no confirmation until the vault is open.
+    assert!(matches!(only(store.take()), Request::Unlock));
+    h.get_by_label("waiting for the unlock…");
+    store.send(StoreEvent::Done {
+        request: "unlock",
+        error: None,
+        dismissed: false,
+    });
+    frames(&mut h);
+    assert!(store.take().is_empty(), "the vault is not open yet");
     store.send(StoreEvent::Vault(vault()));
     frames(&mut h);
+    let (_fd, map) = saved_map(only(store.take()));
+    assert_eq!(
+        map,
+        BTreeMap::from([("lock.idle_timeout".to_string(), "900".to_string())])
+    );
+}
+
+/// A dismissed (or failed) unlock saves nothing and leaves the edits; a
+/// vault unlocked later, by anything else, does not resume the save.
+#[test]
+fn a_dismissed_unlock_saves_nothing() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, Vault::Locked);
+    open_settings(&mut h, &store, "0", "300", "true");
+    pick(&mut h, "Idle lock", "15 min");
     h.get_by_label("SAVE").click();
     frames(&mut h);
-    let (_fd, map) = saved_map(only(store.take()));
-    assert_eq!(map["lock.idle_timeout"], "900");
+    assert!(matches!(only(store.take()), Request::Unlock));
+    store.send(StoreEvent::Done {
+        request: "unlock",
+        error: None,
+        dismissed: true,
+    });
+    frames(&mut h);
+    h.get_by_label_contains("nothing was saved");
+    h.get_by_label("Idle lock: 15 min");
+    store.send(StoreEvent::Vault(vault()));
+    frames(&mut h);
+    assert!(store.take().is_empty(), "nothing asked for the save");
+    // (And the note is gone with the seal.)
+    assert!(h.query_by_label("VAULT SEALED :: SAVE WILL UNLOCK FIRST").is_none());
 }
 
 #[test]
@@ -1719,8 +1755,10 @@ pub fn header(ui: &mut egui::Ui, p: &Palette, text: &str) {
 pub struct VaultView {
     /// The controls work (alephd can be reached).
     pub enabled: bool,
-    /// Save can run: the vault is open, which the confirmation needs.
-    pub can_save: bool,
+    /// The vault is locked: Save will unlock it first (and says so).
+    pub sealed: bool,
+    /// An unlock asked for by Save is under way: Save waits for it.
+    pub unlocking: bool,
 }
 
 /// What the person asked of the VAULT section.
@@ -1807,8 +1845,9 @@ pub fn vault_section(
     }
     ui.add_space(8.0);
     ui.label(RichText::new(SAVE_NOTE).small().color(p.muted));
-    if !view.can_save {
-        ui.label(RichText::new(LOCKED_NOTE).small().color(p.warning));
+    if view.sealed {
+        // (Beside the buttons, and not small: what Save will do first.)
+        ui.label(RichText::new(LOCKED_NOTE).strong().color(p.warning));
     }
     let mut action = None;
     ui.horizontal(|ui| {
@@ -1818,9 +1857,12 @@ pub fn vault_section(
         {
             action = Some(VaultAction::Cancel);
         }
-        let ready = view.enabled && view.can_save && form.edited() && form.valid();
+        let ready = view.enabled && !view.unlocking && form.edited() && form.valid();
         if ui.add_enabled(ready, egui::Button::new("SAVE")).clicked() {
             action = Some(VaultAction::Save);
+        }
+        if view.unlocking {
+            ui.label("waiting for the unlock…");
         }
     });
     action
@@ -1854,9 +1896,12 @@ pub enum Page {
     values: Values,
     /// The confirmation on screen is for a settings save, not a reveal.
     saving_settings: bool,
+    /// SAVE was pressed while the vault was locked: it asked alephd to
+    /// unlock, and saves (with the edits as they are then) once it is open.
+    save_after_unlock: bool,
 ```
 
-and in `new`: `page: Page::Secrets, values: Values::Unknown, saving_settings: false,`. Add accessors:
+and in `new`: `page: Page::Secrets, values: Values::Unknown, saving_settings: false, save_after_unlock: false,`. Add accessors:
 
 ```rust
     pub fn page(&self) -> Page {
@@ -1967,9 +2012,20 @@ Add arms:
                 }
 ```
 
-and at the top of the `StoreEvent::Done { request, error, .. } =>` arm body, before `let save = ...`:
+and change the `StoreEvent::Done { request, error, .. } =>` arm's pattern to `StoreEvent::Done { request, error, dismissed } =>` (`dismissed` is used below; the arm's old code ignores it with `..` no longer) and add at the top of its body, before `let save = ...`:
 
 ```rust
+                    if request == "unlock" && self.save_after_unlock && (error.is_some() || dismissed) {
+                        // (A save waiting for the unlock is dropped; the edits stay.
+                        // A successful unlock keeps it: `resume_save` runs when the
+                        // vault event shows it open.)
+                        self.save_after_unlock = false;
+                        self.status = Some(match &error {
+                            Some(e) => format!("cannot unlock: {e}; nothing was saved"),
+                            None => "the unlock was dismissed: nothing was saved".into(),
+                        });
+                        continue;
+                    }
                     if request == "read the settings" {
                         // (The VAULT section shows why, with RETRY.)
                         continue;
@@ -1996,6 +2052,7 @@ Replace from `self.take_events();` through the end of the `match self.vault.clon
 
 ```rust
         self.take_events();
+        self.resume_save(&ui.ctx().clone());
         self.ask_config();
         let p = self.palette.clone();
         let mut go = None;
@@ -2050,6 +2107,23 @@ Move the old `other => {..}` arm body verbatim into it (it uses `p` as `&p`; adj
 8. The Settings screen and helpers:
 
 ```rust
+    /// A save that waited for the unlock (SAVE pressed while sealed): now
+    /// that the vault is open, confirm and save what is in the form. Not
+    /// if the form went (another screen, nothing left to save).
+    fn resume_save(&mut self, ctx: &egui::Context) {
+        if !self.save_after_unlock || !matches!(self.vault, Vault::Unlocked(_)) {
+            return;
+        }
+        self.save_after_unlock = false;
+        let changes = match &self.values {
+            Values::Ready(f) if self.page == Page::Settings && f.edited() && f.valid() => {
+                f.changes()
+            }
+            _ => return,
+        };
+        self.start_save(ctx, changes);
+    }
+
     /// Ask alephd for the VAULT values when the screen needs them.
     fn ask_config(&mut self) {
         let up = matches!(self.vault, Vault::Locked | Vault::Unlocked(_));
@@ -2075,7 +2149,7 @@ Move the old `other => {..}` arm body verbatim into it (it uses `p` as `&p`; adj
     fn vault_settings(&mut self, ui: &mut egui::Ui, p: &Palette) {
         settings_page::header(ui, p, "VAULT  // alephd");
         let up = matches!(self.vault, Vault::Locked | Vault::Unlocked(_));
-        let can_save = matches!(self.vault, Vault::Unlocked(_));
+        let sealed = matches!(self.vault, Vault::Locked);
         let mut action = None;
         match &mut self.values {
             Values::Ready(form) => {
@@ -2084,7 +2158,8 @@ Move the old `other => {..}` arm body verbatim into it (it uses `p` as `&p`; adj
                 }
                 let view = VaultView {
                     enabled: up,
-                    can_save,
+                    sealed,
+                    unlocking: self.save_after_unlock,
                 };
                 action = settings_page::vault_section(ui, p, form, &view);
             }
@@ -2110,9 +2185,15 @@ Move the old `other => {..}` arm body verbatim into it (it uses `p` as `&p`; adj
                 if let Values::Ready(form) = &mut self.values {
                     form.cancel();
                 }
+                self.save_after_unlock = false;
             }
             Some(VaultAction::Save) => {
-                if let Values::Ready(form) = &self.values {
+                if sealed {
+                    // (Confirming needs the vault open: unlock first, and
+                    // save when it is; `resume_save`.)
+                    self.save_after_unlock = true;
+                    self.store.request(Request::Unlock);
+                } else if let Values::Ready(form) = &self.values {
                     let changes = form.changes();
                     self.start_save(&ui.ctx().clone(), changes);
                 }
@@ -2606,7 +2687,7 @@ Inside the per-theme loop of `snapshots()` (after the `unreachable` shot):
 - [ ] **Step 2: Generate, then look at every new image**
 
 Run: `UPDATE_SNAPSHOTS=1 cargo test -p aleph-gui --test manager snapshots; cargo test -p aleph-gui --test manager snapshots`
-Expected: the second run PASSES. Read each new PNG in `crates/aleph-gui/tests/snapshots/manager_settings*_neon.png` and check: the VAULT and DISPLAY headers read exactly as in Global Constraints; the suspend warning shows in `settings` (suspend is off there); `settings_custom` shows `whole minutes, 1 to 1440` under the field; `settings_locked` shows the locked line; `settings_confirm` shows the password screen with no form behind it; `settings_broken` shows the error and RESET TO DEFAULTS with the controls dimmed. Nothing clipped at 900 × 560; fix the layout (spacing, `ScrollArea`) if it is, and regenerate.
+Expected: the second run PASSES. Read each new PNG in `crates/aleph-gui/tests/snapshots/manager_settings*_neon.png` and check: the VAULT and DISPLAY headers read exactly as in Global Constraints; the suspend warning shows in `settings` (suspend is off there); `settings_custom` shows `whole minutes, 1 to 1440` under the field; `settings_locked` shows the note `VAULT SEALED :: SAVE WILL UNLOCK FIRST` beside the buttons; `settings_confirm` shows the password screen with no form behind it; `settings_broken` shows the error and RESET TO DEFAULTS with the controls dimmed. Nothing clipped at 900 × 560; fix the layout (spacing, `ScrollArea`) if it is, and regenerate.
 
 - [ ] **Step 3: The manual checks**
 
@@ -2635,8 +2716,11 @@ them back at the end.
    again before leaving.
 7. Cancel the confirmation (Cancel, or Escape): nothing changes
    (`alephctl config get`), the edits stay on screen.
-8. `alephctl lock`, then SETTINGS: the values show, Save says to unlock
-   first; DISPLAY still works. Unlock: Save works.
+8. `alephctl lock`, then SETTINGS: the values show and DISPLAY works; beside
+   the buttons `VAULT SEALED :: SAVE WILL UNLOCK FIRST`. Edit something and
+   SAVE: alephd's unlock window opens; after it, the confirmation opens
+   (a second proof) and then `SETTINGS SAVED`. Repeat, and dismiss the
+   unlock: `nothing was saved`, the edits stay.
 9. `alephctl config set lock.idle_timeout 60` while the form is open with
    another value edited: SAVE sends only the edited key (the idle lock stays 60).
 10. DISPLAY: Theme Neon/Auto and Scanlines switch at once and
@@ -2652,7 +2736,7 @@ them back at the end.
 
 - [ ] **Step 4: Decisions and specs**
 
-1. `DECISIONS.md`: read its last section for the numbering and style, then add a section for Plan 5c with the settings spec's "Decisions" list (six lines: one Save/one confirmation through `SetConfigs`; DISPLAY applies at once; `prompt.program` not in the manager; the reveal hold is a setting, presets and default; idle/prompt are presets plus custom minutes checked as typed; a save also starts the reveal window) and one more: "**Saving VAULT needs an unlocked vault**: alephd's re-authentication refuses a locked one, so the locked manager reads and shows the values and says to unlock."
+1. `DECISIONS.md`: read its last section for the numbering and style, then add a section for Plan 5c with the settings spec's "Decisions" list (six lines: one Save/one confirmation through `SetConfigs`; DISPLAY applies at once; `prompt.program` not in the manager; the reveal hold is a setting, presets and default; idle/prompt are presets plus custom minutes checked as typed; a save also starts the reveal window) and one more: "**Saving VAULT unlocks a locked vault first**: alephd's re-authentication refuses a locked one, so Save (marked `VAULT SEALED :: SAVE WILL UNLOCK FIRST` while sealed) asks alephd to unlock, then confirms: two proofs. A dismissed unlock saves nothing."
 2. Main spec `2026-09-26-aleph-design.md`: in the Admin interface list add `SetConfigs` beside `SetConfig`, and add `SetConfigs` to the re-authentication list; grep `gui.toml` there and add `reveal_hold` (seconds; default 300; at most 3600) next to `theme` and `scanlines`, and say the manager writes the file.
 3. Manager spec `2026-09-28-aleph-manager-design.md`: the sidebar lists `SECRETS` and `SETTINGS`; "a confirmation holds for 5 minutes" becomes "for the `reveal_hold` setting (default 5 minutes)".
 4. Settings spec: change `Status:` to `Approved; implemented by docs/superpowers/plans/2026-09-28-aleph-settings.md`.
@@ -2682,7 +2766,7 @@ git commit -m 'docs,test(gui): snapshots of the settings screen, manual checks, 
 - Screen: nav; VAULT loading/values/Save-Cancel enable/presets/custom/kept/warning/note/confirmation drawn in the window/`SETTINGS SAVED`/edits kept/disabled while busy/LINK DOWN: Task 5. DISPLAY header, theme, scanlines (+ reduced-motion note), reveal choices with `Custom (N s)`, broken file with reset, write failure: Task 6.
 - Errors: failed read + Retry, refused save keeps edits, failed gui.toml write: Tasks 5–6.
 - Security/logging (keys only): Task 1 (`tracing::info!` names keys). Testing list: all covered; snapshots both themes and manual checks: Task 7.
-- **Locked-vault correction** (spec commit `f93fd6a`): Save disabled with the locked line: Task 5.
+- **Locked-vault correction** (spec commit `f93fd6a`, and the unlock-first change after it): Save marked `VAULT SEALED :: SAVE WILL UNLOCK FIRST`, unlocking first, confirming, saving; a dismissed unlock saves nothing: Task 5.
 
 **Placeholders.** None. Two spots name a fallback for an egui/kittest API that could not be checked without running it (`ui.selectable_label`, clicking a disabled widget, `get_all_by_label` in `pick`): each gives the exact replacement.
 

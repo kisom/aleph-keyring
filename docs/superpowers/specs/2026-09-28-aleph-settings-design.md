@@ -93,11 +93,17 @@ settable with `alephctl config set`.
 
 - **Sidebar:** `SECRETS` and `SETTINGS` (Admin, 5d, comes later).
   SETTINGS opens while the vault is locked: the values show (`GetConfig`
-  needs no unlock) and DISPLAY works. Saving VAULT does not: alephd's
-  re-authentication refuses a locked vault, so Save is disabled then,
-  with the line "Unlock the vault to save: confirming it is you needs
-  it open." (Found while planning: an earlier draft said the
-  confirmation works locked; it does not.)
+  needs no unlock) and DISPLAY works. Saving VAULT needs the vault open:
+  alephd's re-authentication refuses a locked one. So while it is locked
+  Save stays enabled, with a note beside the buttons, in the warning
+  colour: `VAULT SEALED :: SAVE WILL UNLOCK FIRST`. Save then asks alephd to
+  unlock (its usual prompt window) and, once the vault is open, starts the
+  confirmation with the edits as they are then. The person authenticates
+  twice: to unlock and to confirm (alephd's `SetConfigs` asks for its own
+  fresh proof; that guard stays). If the unlock is dismissed or fails,
+  nothing is saved, the edits stay, and the error line says so. (Found
+  while planning: an earlier draft said the confirmation works locked; it
+  does not.)
 
 ### VAULT
 
