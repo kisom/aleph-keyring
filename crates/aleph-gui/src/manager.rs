@@ -134,6 +134,9 @@ pub struct Manager<S: Store, B: Backend> {
     /// The status a failed DISPLAY write or reset put up: the next one
     /// that works takes it down.
     display_error: Option<String>,
+    /// DISPLAY fields in force whose write failed: written with the next
+    /// write (a reset, which writes the defaults, forgets them).
+    display_unsaved: Vec<DisplayField>,
     home: Option<PathBuf>,
     still: bool,
     pub palette: Palette,
@@ -159,6 +162,34 @@ enum Rebase {
     Due,
     /// Asked for: the next `Config` rebases the form.
     Asked,
+}
+
+/// One of gui.toml's fields, as a DISPLAY change sets it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DisplayField {
+    Theme,
+    Scanlines,
+    RevealHold,
+}
+
+impl DisplayField {
+    /// The field a change sets (a reset sets them all).
+    fn of(action: DisplayAction) -> Option<Self> {
+        match action {
+            DisplayAction::Theme(_) => Some(Self::Theme),
+            DisplayAction::Scanlines(_) => Some(Self::Scanlines),
+            DisplayAction::Reveal(_) => Some(Self::RevealHold),
+            DisplayAction::Reset => None,
+        }
+    }
+
+    fn copy(self, from: &Settings, to: &mut Settings) {
+        match self {
+            Self::Theme => to.theme = from.theme,
+            Self::Scanlines => to.scanlines = from.scanlines,
+            Self::RevealHold => to.reveal_hold = from.reveal_hold,
+        }
+    }
 }
 
 impl<S: Store, B: Backend> Manager<S, B> {
@@ -191,6 +222,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
             settings_file: None,
             display_broken: None,
             display_error: None,
+            display_unsaved: Vec::new(),
             home,
             still,
             palette,
@@ -241,10 +273,19 @@ impl<S: Store, B: Backend> Manager<S, B> {
         set(&mut self.settings);
         self.palette = theme::resolve(&self.settings, self.home.as_deref());
         theme::apply(ctx, &self.palette);
+        // (With it, every change whose write failed before, as it is in
+        // force now: none is dropped by a later write that works.)
+        if let Some(field) = DisplayField::of(action)
+            && !self.display_unsaved.contains(&field)
+        {
+            self.display_unsaved.push(field);
+        }
         let written = match &self.settings_file {
             _ if action == DisplayAction::Reset => Ok(()),
             Some(file) => Settings::read_strict(file).and_then(|mut on_disk| {
-                set(&mut on_disk);
+                for field in &self.display_unsaved {
+                    field.copy(&self.settings, &mut on_disk);
+                }
                 on_disk.save(file)
             }),
             None => Err("no configuration directory".to_string()),
@@ -257,14 +298,17 @@ impl<S: Store, B: Backend> Manager<S, B> {
         }
     }
 
-    /// A DISPLAY write or reset failed: the status says so.
+    /// A DISPLAY write or reset failed: the status says so (the fields
+    /// not written stay in `display_unsaved`).
     fn display_failed(&mut self, why: String) {
         self.status = Some(why.clone());
         self.display_error = Some(why);
     }
 
-    /// One worked: a failure's status still up goes (not another one).
+    /// One worked: nothing is left unsaved, so a failure's status still up
+    /// goes (not another one).
     fn display_worked(&mut self) {
+        self.display_unsaved.clear();
         if let Some(why) = self.display_error.take()
             && self.status.as_ref() == Some(&why)
         {

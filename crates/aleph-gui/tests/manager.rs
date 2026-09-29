@@ -1560,6 +1560,46 @@ fn a_write_that_works_again_clears_the_not_saved_status() {
     assert_eq!(gui_toml(&file).theme, ThemeChoice::Auto);
 }
 
+/// A change whose write failed is written with the next one that works:
+/// the "not saved" goes only once nothing is left unsaved.
+#[test]
+fn an_unsaved_change_is_written_with_the_next_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, b"a file, not a directory").unwrap();
+    let file = blocker.join("gui.toml");
+    let (mut h, _store) = display_window(ThemeChoice::Auto, file.clone(), None);
+    h.get_by_label("SETTINGS").click();
+    frames(&mut h);
+    h.get_by_label("Scanlines").click();
+    frames(&mut h);
+    h.get_by_label_contains("not saved");
+    std::fs::remove_file(&blocker).unwrap();
+    h.get_by_label("Neon").click();
+    frames(&mut h);
+    let on_disk = gui_toml(&file);
+    assert!(!on_disk.scanlines, "the unsaved change was dropped");
+    assert_eq!(on_disk.theme, ThemeChoice::Neon);
+    assert!(h.query_by_label_contains("not saved").is_none());
+}
+
+/// While writes keep failing, the "not saved" stays.
+#[test]
+fn a_second_failed_write_keeps_the_not_saved_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, b"a file, not a directory").unwrap();
+    let (mut h, _store) = display_window(ThemeChoice::Auto, blocker.join("gui.toml"), None);
+    h.get_by_label("SETTINGS").click();
+    frames(&mut h);
+    h.get_by_label("Scanlines").click();
+    frames(&mut h);
+    h.get_by_label_contains("not saved");
+    h.get_by_label("Neon").click();
+    frames(&mut h);
+    h.get_by_label_contains("not saved");
+}
+
 /// A DISPLAY change writes only its own field over what is in the file
 /// now: a hand-edit made while the window runs is kept.
 #[test]
