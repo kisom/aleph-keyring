@@ -66,8 +66,8 @@ manager, whatever §7 said.
     The copy is offered with the MIME hint `x-kde-passwordManagerHint:
     secret` (clipboard-history tools skip it) and cleared after 30 s if
     the clipboard still holds it.
-  - `reauth.rs`: the reveal window's clock: confirmed within the last
-    5 minutes, and not since a lock.
+  - `reauth.rs`: the reveal window's clock: confirmed within
+    the `reveal_hold` setting (default 5 minutes), and not since a lock.
 - **The launcher entry:** `packaging/aleph-gui.desktop` (Name `aleph`,
   GenericName `Keyring`, `Exec=aleph-gui`, `Icon=aleph`, Categories
   `Utility;Security;`), installed to `/usr/share/applications/`, with
@@ -90,7 +90,7 @@ manager, whatever §7 said.
 └──────────┴──────────────────────┴─────────────────────────────┘
 ```
 
-- **Sidebar:** `SECRETS` only in 5b; Settings (5c) and Admin (5d) appear
+- **Sidebar:** `SECRETS` and `SETTINGS` (5c); Admin (5d) appears
   when built. App id `aleph`, resizable, remembers nothing between runs.
 - **List:** collections as folders, each with its items, sorted by
   label; the default collection first and marked. The search box filters
@@ -105,7 +105,8 @@ manager, whatever §7 said.
 
 ## What each action does
 
-- **Show:** if not confirmed in the last 5 minutes (or since a lock),
+- **Show:** if not confirmed within the `reveal_hold` setting (default 5
+  minutes; or since a lock),
   the re-authentication runs first, drawn inside the manager with the
   prompter's screens, and says what it is: "confirm it is you (any
   program running as you can read secrets; this only guards against a
@@ -184,6 +185,6 @@ manager, whatever §7 said.
   only through `org.freedesktop.secrets`.
 - Attributes are read-only in the manager; new items take the
   attributes typed.
-- A reveal confirmation holds for 5 minutes (not since a lock); 5c may
-  make the length a setting.
+- A reveal confirmation holds for the `reveal_hold` setting (default 5 minutes;
+  not since a lock).
 - Import and export stay out of the manager.

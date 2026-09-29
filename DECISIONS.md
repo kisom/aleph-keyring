@@ -7,6 +7,28 @@ first. The spec (`docs/superpowers/specs/2026-09-26-aleph-design.md`)
 is updated to match wherever a decision changes it. Decisions the owner
 made directly are marked as such.
 
+## 2026-09-28: Plan 5c (the manager's settings), design
+
+### I1. The manager's settings: scope and approach
+
+The settings spec (`docs/superpowers/specs/2026-09-28-aleph-settings-design.md`)
+records these:
+
+- **One Save, one confirmation, through `SetConfigs`.** The VAULT
+  settings are saved together through a new admin method, and the screen
+  says so above Save.
+- **DISPLAY applies at once,** with no Save and no confirmation.
+- **`prompt.program` is not in the manager.**
+- **The reveal hold is a setting:** Every time, 1, 5, 15, 30, or 60
+  minutes (default 5, at most 60).
+- **Idle lock and prompt timeout are presets plus custom minutes,** checked
+  as typed.
+- **A successful settings save also starts the reveal window.**
+- **Saving VAULT unlocks a locked vault first:** alephd's
+  re-authentication refuses a locked one, so Save (marked `VAULT SEALED ::
+  SAVE WILL UNLOCK FIRST` while sealed) asks alephd to unlock, then
+  confirms: two proofs. A dismissed unlock saves nothing.
+
 ## 2026-09-28: Plan 5b (the manager), design
 
 ### H9. The pre-execution review of the Plan 5b document: fixes adopted

@@ -835,7 +835,7 @@ Verified against a stock Omarchy install on 2026-09-26.
   whether MK is `mlock`ed, TPM usability, keyslots with stale marks),
   `Lock`, `Unlock`, `Create`, `EnrollTpm`, `EnrollFido2`,
   `RemoveKeyslot`, `RotateMaster`, `ReissueRecoveryKey`, `RetryKeyslot`,
-  `GetConfig`, `SetConfig`, `Backup`, `Recover`, `RestoreBackup`,
+  `GetConfig`, `SetConfig`, `SetConfigs`, `Backup`, `Recover`, `RestoreBackup`,
   `RestoreFromBak`, `AcceptRollback`, `ImportGnomeKeyring`,
   `RemovedSinceImport`, `ExportToGnomeKeyring`, `ReleaseSecretService`,
   `ThawWrites`, `Reauth` (proves an enrolled method and changes nothing:
@@ -852,7 +852,7 @@ Verified against a stock Omarchy install on 2026-09-26.
 - **Fresh re-authentication through the prompter** is required for every
   method that changes keyslots, configuration, or data custody:
   `Enroll*`, `RemoveKeyslot`, `RotateMaster`, `ReissueRecoveryKey`,
-  `SetConfig`, `Backup`, `Restore`, and `Export*`. Re-authentication means
+  `SetConfig`, `SetConfigs`, `Backup`, `Restore`, and `Export*`. Re-authentication means
   proving an enrolled method: a FIDO2 touch, or the login password
   (checked with PAM, then through a TPM unseal or the login-password
   slot).
@@ -1072,7 +1072,8 @@ alephctl restore [--from-bak | --accept-rollback] [<path>]
   animations).
 - The GUI's settings are in `~/.config/aleph/gui.toml`: `theme = "auto"`
   (Omarchy's where there is one, else Aleph neon) or `"neon"`, and
-  `scanlines = true|false`.
+  `scanlines = true|false`, and `reveal_hold` (seconds; default 300; at
+  most 3600). The manager writes this file (its SETTINGS screen).
 - Section headers may use Gibson vocabulary. In the prompter, in both
   themes (DECISIONS.md H6): a tagline over the title (`ALEPH // UNLOCK
   VAULT`, `IDENTITY CHECK`, `NEW CONSTRUCT`, `RECOVERY PROTOCOL`), the

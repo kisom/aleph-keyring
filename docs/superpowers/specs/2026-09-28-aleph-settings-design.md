@@ -1,7 +1,7 @@
 # aleph manager: settings (Plan 5c) — design
 
 - **Date:** 2026-09-28
-- **Status:** Draft, awaiting the owner's review
+- **Status:** Approved; implemented by docs/superpowers/plans/2026-09-28-aleph-settings.md
 - **Extends:** `docs/superpowers/specs/2026-09-28-aleph-manager-design.md`
   (the manager spec) and `docs/superpowers/specs/2026-09-26-aleph-design.md`
   §7 (the main spec). Where this document is more specific, it wins; the

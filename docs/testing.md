@@ -262,6 +262,45 @@ installed with it), on the account aleph serves:
    alephd). (Stopping alephd shows `LINK DOWN` only briefly: the manager's
    own calls start it again, through D-Bus activation.)
 
+### The manager's settings (Plan 5c)
+
+After `make && make install`, on the account aleph serves. Write down
+`alephctl config get lock.idle_timeout` and `prompt.timeout` first; put
+them back at the end.
+
+1. Open the manager, then SETTINGS: the four VAULT values match
+   `alephctl config get lock.on_suspend`, `lock.on_screen_lock`,
+   `lock.idle_timeout`, `prompt.timeout`.
+2. Idle lock: 5 min and prompt timeout: 15 min, then SAVE: one
+   confirmation (login password or key touch), then `SETTINGS SAVED`;
+   `alephctl config get` shows 300 and 900. Nothing was restarted.
+3. Idle lock 5 min: leave the keyring untouched for 5 minutes
+   (`alephctl status` shows `locked` afterwards). Set it back to Off.
+4. Change three settings at once: one confirmation only.
+5. Custom… for the prompt timeout: `0`, `1441`, `abc` each show
+   `whole minutes, 1 to 1440` at once and Save stays off; `20` saves as
+   1200 s.
+6. Turn Lock on suspend off: the hibernation warning shows; turn it on
+   again before leaving.
+7. Cancel the confirmation (Cancel, or Escape): nothing changes
+   (`alephctl config get`), the edits stay on screen.
+8. `alephctl lock`, then SETTINGS: the values show and DISPLAY works; beside
+   the buttons `VAULT SEALED :: SAVE WILL UNLOCK FIRST`. Edit something and
+   SAVE: alephd's unlock window opens; after it, the confirmation opens
+   (a second proof) and then `SETTINGS SAVED`. Repeat, and dismiss the
+   unlock: `nothing was saved`, the edits stay.
+9. `alephctl config set lock.idle_timeout 60` while the form is open with
+   another value edited: SAVE sends only the edited key (the idle lock stays 60).
+10. DISPLAY: Theme Neon/Auto and Scanlines switch at once and
+    `~/.config/aleph/gui.toml` follows; "Every time" asks at every SHOW
+    (even right after a confirmation); a SAVE in VAULT starts the 5-minute
+    reveal window (SHOW right after: no second confirmation).
+11. Hand-edit gui.toml to `scanline = false`: DISPLAY shows the file's error
+    and RESET TO DEFAULTS; nothing is written until it is reset or fixed.
+12. Stop alephd (`systemctl --user stop alephd.service alephd.socket`, then
+    start them): while it is down VAULT says LINK DOWN; it reads again
+    when the link returns.
+
 ## Emergency manual revert
 
 If login or the lock screen misbehaves after `sudo alephctl system apply`,

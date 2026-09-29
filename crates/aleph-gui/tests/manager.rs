@@ -1449,6 +1449,58 @@ fn snapshots() {
             Vault::Unreachable("org.freedesktop.secrets has no owner".into()),
         );
         shot(&mut h, "unreachable");
+        // SETTINGS: the form, a bad entry, locked, the confirmation, a broken file.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut h, store, _) = window_with(theme, vault(), SIZE, {
+            let file = dir.path().join("gui.toml");
+            move |m| m.with_settings_file(Some(file), None)
+        });
+        open_settings(&mut h, &store, "900", "300", "false");
+        shot(&mut h, "settings");
+        pick(&mut h, "Prompt timeout", "Custom…");
+        type_into(&mut h, "Prompt timeout minutes", "1441");
+        shot(&mut h, "settings_custom");
+        // Back to a preset: the bad entry would keep Save off.
+        pick(&mut h, "Prompt timeout", "5 min");
+        pick(&mut h, "Idle lock", "30 min");
+        h.get_by_label("SAVE").click();
+        frames(&mut h);
+        let (fd, _) = saved_map(only(store.take()));
+        let alephd = std::thread::spawn(move || {
+            let mut chan = Channel::from_fd(fd, Duration::from_secs(10)).unwrap();
+            chan.send(&ToPrompter::Begin {
+                purpose: Purpose::Reauth,
+                operation: "Set lock.idle_timeout = 1800".into(),
+                caller: None,
+            })
+            .unwrap();
+            chan.send(&ToPrompter::Ask {
+                methods: vec![Method::Password],
+                error: None,
+                retry_after: None,
+            })
+            .unwrap();
+            chan
+        });
+        let chan = alephd.join().unwrap();
+        settle(&mut h);
+        shot(&mut h, "settings_confirm");
+        drop(chan);
+        let (mut h, store, _) = window(theme, Vault::Locked);
+        open_settings(&mut h, &store, "0", "300", "true");
+        shot(&mut h, "settings_locked");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("gui.toml");
+        let (mut h, _) = display_window(
+            theme,
+            file,
+            Some(
+                "gui.toml: unknown field `scanline`, expected one of `theme`, `scanlines`, `reveal_hold` (using the defaults)",
+            ),
+        );
+        h.get_by_label("SETTINGS").click();
+        frames(&mut h);
+        shot(&mut h, "settings_broken");
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
