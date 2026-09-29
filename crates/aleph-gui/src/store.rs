@@ -31,6 +31,14 @@ const ADMIN_NAME: &str = "io.aleph.Keyring";
 const ADMIN_PATH: &str = "/io/aleph/Admin";
 const ADMIN: &str = "io.aleph.Admin1";
 
+/// The settings the manager's VAULT section shows (alephd's keys).
+pub const SETTINGS_KEYS: [&str; 4] = [
+    "lock.on_suspend",
+    "lock.on_screen_lock",
+    "lock.idle_timeout",
+    "prompt.timeout",
+];
+
 /// How often the lock state is checked, besides the signals alephd sends
 /// (one missed, or alephd restarting, is caught within this).
 pub const POLL: Duration = Duration::from_secs(2);
@@ -97,12 +105,21 @@ pub enum Request {
     /// Re-authenticate (the reveal guard): alephd converses on this end
     /// of a socketpair; the window answers on the other.
     Reauth(OwnedFd),
+    /// Read the four VAULT settings from alephd (`StoreEvent::Config`).
+    Config,
+    /// Change settings: alephd checks them, then converses on this end of
+    /// a socketpair (one confirmation for all); the window answers on the
+    /// other. Only the keys that changed are sent.
+    SetConfigs(OwnedFd, BTreeMap<String, String>),
 }
 
 impl Request {
     /// Whether it may change what the lists show (a listing follows it).
     pub fn changes(&self) -> bool {
-        !matches!(self, Self::Secret(_) | Self::Reauth(_))
+        !matches!(
+            self,
+            Self::Secret(_) | Self::Reauth(_) | Self::Config | Self::SetConfigs(..)
+        )
     }
 
     /// What it was, for `Done` and the log (never a secret or a label).
@@ -117,6 +134,8 @@ impl Request {
             Self::CreateCollection(_) => "create the folder",
             Self::DeleteCollection(_) => "delete the folder",
             Self::Reauth(_) => "confirm",
+            Self::Config => "read the settings",
+            Self::SetConfigs(..) => "save the settings",
         }
     }
 }
@@ -135,6 +154,9 @@ pub enum StoreEvent {
         path: String,
         error: String,
     },
+    /// The four VAULT settings (`Request::Config`), or why they could not
+    /// be read (a `Done` follows either way).
+    Config(Result<BTreeMap<String, String>, String>),
     /// A request finished; `error` if it failed (a dismissed prompt is
     /// not an error: `dismissed`).
     Done {
@@ -490,6 +512,20 @@ impl Client {
         }
     }
 
+    /// alephd's admin interface.
+    async fn admin(&self) -> Result<zbus::Proxy<'static>, String> {
+        zbus::proxy::Builder::<zbus::Proxy>::new(&self.conn)
+            .destination(ADMIN_NAME)
+            .map_err(err)?
+            .path(ADMIN_PATH)
+            .map_err(err)?
+            .interface(ADMIN)
+            .map_err(err)?
+            .build()
+            .await
+            .map_err(err)
+    }
+
     /// Carry out one request: `(dismissed, secret event)`. A request that
     /// uses the session is tried once more on a new one if it fails
     /// (alephd may have restarted and forgotten ours).
@@ -587,18 +623,26 @@ impl Client {
                 Ok((self.prompt(&prompt).await?, None))
             }
             Request::Reauth(fd) => {
-                let admin = zbus::proxy::Builder::<zbus::Proxy>::new(&self.conn)
-                    .destination(ADMIN_NAME)
-                    .map_err(err)?
-                    .path(ADMIN_PATH)
-                    .map_err(err)?
-                    .interface(ADMIN)
-                    .map_err(err)?
-                    .build()
+                self.admin()
+                    .await?
+                    .call::<_, _, ()>("Reauth", &(zbus::zvariant::OwnedFd::from(fd),))
                     .await
                     .map_err(err)?;
-                admin
-                    .call::<_, _, ()>("Reauth", &(zbus::zvariant::OwnedFd::from(fd),))
+                Ok((false, None))
+            }
+            Request::Config => {
+                let admin = self.admin().await?;
+                let mut values = BTreeMap::new();
+                for key in SETTINGS_KEYS {
+                    let v: String = admin.call("GetConfig", &(key,)).await.map_err(err)?;
+                    values.insert(key.to_string(), v);
+                }
+                Ok((false, Some(StoreEvent::Config(Ok(values)))))
+            }
+            Request::SetConfigs(fd, values) => {
+                self.admin()
+                    .await?
+                    .call::<_, _, ()>("SetConfigs", &(zbus::zvariant::OwnedFd::from(fd), values))
                     .await
                     .map_err(err)?;
                 Ok((false, None))
@@ -662,6 +706,7 @@ async fn run(
                 tokio::spawn(async move {
                     let name = r.name();
                     let changes = r.changes();
+                    let reading = matches!(&r, Request::Config);
                     let fetching = match &r {
                         Request::Secret(p) => Some(p.clone()),
                         _ => None,
@@ -679,6 +724,9 @@ async fn run(
                             eprintln!("aleph-gui: cannot {name}: {e}");
                             if let Some(path) = fetching {
                                 emit.send(StoreEvent::SecretFailed { path, error: e.clone() });
+                            }
+                            if reading {
+                                emit.send(StoreEvent::Config(Err(e.clone())));
                             }
                             emit.send(StoreEvent::Done { request: name, error: Some(e), dismissed: false });
                         }

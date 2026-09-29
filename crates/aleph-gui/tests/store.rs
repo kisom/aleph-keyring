@@ -3,6 +3,7 @@
 //! the session bus.
 
 use std::collections::BTreeMap;
+use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use aleph_daemon::testing::{FromPrompter, Interactive, PW, daemon, password};
@@ -191,6 +192,104 @@ async fn reauth_converses_on_the_windows_socket() {
         ),
         "{sent:?}"
     );
+}
+
+/// The four VAULT settings are read; a save runs on the window's socket
+/// with one confirmation and changes alephd's configuration and file.
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_are_read_and_saved_through_alephd() {
+    let d = daemon(true, vec![]).await;
+    let mut store = Probe::new(&d.bus.address);
+    store.unlocked(|c| !c.is_empty()).await;
+    let read = |store: &mut Probe| {
+        store.request(Request::Config);
+    };
+    read(&mut store);
+    let values = store
+        .until(|e| match e {
+            StoreEvent::Config(Ok(v)) => Some(v.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(values.len(), 4, "{values:?}");
+    assert_eq!(values["lock.idle_timeout"], "0");
+    assert_eq!(values["prompt.timeout"], "300");
+    assert_eq!(values["lock.on_suspend"], "true");
+    assert_eq!(store.done("read the settings").await, (None, false));
+
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let prompter = Interactive::new(vec![password(PW)]);
+    prompter.respond(ours);
+    store.request(Request::SetConfigs(
+        theirs.into(),
+        BTreeMap::from([
+            ("lock.idle_timeout".to_string(), "900".to_string()),
+            ("lock.on_suspend".to_string(), "false".to_string()),
+        ]),
+    ));
+    assert_eq!(store.done("save the settings").await.0, None);
+    let sent = tokio::task::spawn_blocking(move || prompter.sent())
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            sent.last(),
+            Some(aleph_daemon::testing::ToPrompter::Done {
+                ok: true,
+                message: None
+            })
+        ),
+        "{sent:?}"
+    );
+    read(&mut store);
+    let values = store
+        .until(|e| match e {
+            StoreEvent::Config(Ok(v)) => Some(v.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(values["lock.idle_timeout"], "900");
+    assert_eq!(values["lock.on_suspend"], "false");
+    assert_eq!(values["prompt.timeout"], "300");
+    let saved = aleph_daemon::config::Config::load(&d.env.paths.config_file).unwrap();
+    assert_eq!(saved.lock.idle_timeout, 900);
+}
+
+/// A bad value is refused by alephd before it asks anything: the call's
+/// `Done` carries the reason, and nothing changed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_settings_save_says_why() {
+    let d = daemon(true, vec![]).await;
+    let mut store = Probe::new(&d.bus.address);
+    store.unlocked(|c| !c.is_empty()).await;
+    let (_ours, theirs) = UnixStream::pair().unwrap();
+    store.request(Request::SetConfigs(
+        theirs.into(),
+        BTreeMap::from([("prompt.timeout".to_string(), "0".to_string())]),
+    ));
+    let (error, dismissed) = store.done("save the settings").await;
+    assert!(error.unwrap().contains("prompt.timeout"), "refused");
+    assert!(!dismissed);
+    assert!(!d.env.paths.config_file.exists());
+}
+
+/// Without alephd the read fails with a reason (and the window retries).
+#[tokio::test(flavor = "multi_thread")]
+async fn without_alephd_reading_the_settings_fails() {
+    let bus = aleph_daemon::testing::bus();
+    let mut store = Probe::new(&bus.address);
+    store.request(Request::Config);
+    store
+        .until(|e| matches!(e, StoreEvent::Config(Err(_))).then_some(()))
+        .await;
+    assert!(store.done("read the settings").await.0.is_some());
+}
+
+#[test]
+fn settings_requests_are_not_followed_by_a_listing() {
+    assert!(!Request::Config.changes());
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    assert!(!Request::SetConfigs(ours.into(), BTreeMap::new()).changes());
 }
 
 /// After alephd forgets every session (as a restart does), a secret is

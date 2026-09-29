@@ -296,6 +296,8 @@ impl<S: Store, B: Backend> Manager<S, B> {
                             Some(format!("'{}' was deleted elsewhere", shown(&label, NAME)));
                     }
                 }
+                // (The SETTINGS screen takes it.)
+                StoreEvent::Config(_) => {}
                 StoreEvent::SecretFailed { path, .. } => {
                     // (Only if it is the one asked for last; the error is
                     // in the `Done` that follows.)
