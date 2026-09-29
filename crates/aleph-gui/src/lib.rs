@@ -14,6 +14,7 @@ pub mod screens;
 pub mod settings;
 pub mod settings_page;
 pub mod store;
+pub mod task;
 pub mod theme;
 
 /// How both windows open. Without vsync: Mesa's Wayland swap waits for the

@@ -19,6 +19,8 @@ use crate::settings_page::{
     self, DisplayAction, DisplayView, Form, Values, VaultAction, VaultView,
 };
 use crate::store::{Collection, Item, Request, Store, StoreEvent, Vault};
+pub use crate::task::Want;
+use crate::task::{Job, Running};
 use crate::theme::{self, Palette};
 
 /// The window's first size.
@@ -41,14 +43,6 @@ const SAVES: &[&str] = &[
 pub enum Selection {
     Item(String),
     Collection(String),
-}
-
-/// What a fetched secret is for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Want {
-    Show,
-    Copy,
-    Edit,
 }
 
 /// Which screen the window shows.
@@ -119,8 +113,6 @@ pub struct Manager<S: Store, B: Backend> {
     /// the detail's), and that width when last drawn.
     list_share: f32,
     list_room: f32,
-    /// What runs once the reveal guard confirms.
-    pending: Option<(String, Want)>,
     /// The reveal guard's conversation, drawn in the detail pane.
     confirm: Option<PromptApp>,
     /// Keys ignored as the confirmation appears (the tests set it to 0).
@@ -144,11 +136,11 @@ pub struct Manager<S: Store, B: Backend> {
     page: Page,
     /// The VAULT section's values: kept across screens, so edits stay.
     values: Values,
-    /// The confirmation on screen is for a settings save, not a reveal.
-    saving_settings: bool,
+    /// What the confirmation on screen is for.
+    running: Option<Running>,
     /// SAVE was pressed while the vault was locked: it asked alephd to
-    /// unlock, and saves (with the edits as they are then) once it is open.
-    save_after_unlock: bool,
+    /// unlock, and starts (with the edits as they are then) once it is open.
+    waiting: Option<Job>,
     /// After an interrupted save: the values to read again, under the
     /// edits ([`Form::rebase`]).
     rebase_on_config: Rebase,
@@ -221,7 +213,6 @@ impl<S: Store, B: Backend> Manager<S, B> {
             awaiting: None,
             list_share: 0.5,
             list_room: 0.0,
-            pending: None,
             confirm: None,
             confirm_guard: crate::app::INPUT_GUARD,
             saving: 0,
@@ -236,8 +227,8 @@ impl<S: Store, B: Backend> Manager<S, B> {
             watch: None,
             page: Page::Secrets,
             values: Values::Unknown,
-            saving_settings: false,
-            save_after_unlock: false,
+            running: None,
+            waiting: None,
             rebase_on_config: Rebase::No,
             exit_armed: false,
             exit_requested: false,
@@ -418,18 +409,41 @@ impl<S: Store, B: Backend> Manager<S, B> {
         let Some(theirs) = self.open_confirm(ctx) else {
             return;
         };
-        self.pending = Some((path, want));
+        self.running = Some(Running::Reveal { path, want });
         self.store.request(Request::Reauth(theirs.into()));
     }
 
-    /// Save the changed VAULT settings: one confirmation for all of them.
-    fn start_save(&mut self, ctx: &egui::Context, changes: BTreeMap<String, String>) {
+    /// Start `job`'s confirmation in the window and send its request: alephd
+    /// converses on the other end of the socketpair.
+    fn start_job(&mut self, ctx: &egui::Context, job: Job) {
         let Some(theirs) = self.open_confirm(ctx) else {
             return;
         };
-        self.saving_settings = true;
-        self.store
-            .request(Request::SetConfigs(theirs.into(), changes));
+        let request = match &job {
+            Job::Settings => Request::SetConfigs(
+                theirs.into(),
+                self.form().map(Form::changes).unwrap_or_default(),
+            ),
+        };
+        self.running = Some(Running::Job(job));
+        self.store.request(request);
+    }
+
+    /// Run `job`: at once, or (the vault sealed, which alephd's
+    /// re-authentication refuses) after asking alephd to unlock. Nothing
+    /// starts while another job runs or waits.
+    fn begin(&mut self, ctx: &egui::Context, job: Job) {
+        if self.running.is_some() || self.waiting.is_some() {
+            return;
+        }
+        match self.vault {
+            Vault::Locked => {
+                self.waiting = Some(job);
+                self.store.request(Request::Unlock);
+            }
+            Vault::Unlocked(_) => self.start_job(ctx, job),
+            _ => {}
+        }
     }
 
     /// End the confirmation, if one runs (alephd holds its conversation
@@ -460,19 +474,23 @@ impl<S: Store, B: Backend> Manager<S, B> {
         }
         if self.confirm.is_some() {
             self.end_confirm();
-            self.saving_settings = false;
+            self.running = None;
         }
         self.exit_armed = false;
         self.exit_requested = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
-    /// A settings save was cut short (a lock, alephd gone, the window left,
-    /// the confirmation closed with no answer): alephd may have saved
-    /// already, so its values are read again, under the edits.
-    fn save_interrupted(&mut self) {
-        if matches!(self.values, Values::Ready(_)) {
-            self.rebase_on_config = Rebase::Due;
+    /// A save was cut short (a lock, alephd gone, the window left, the
+    /// confirmation closed with no answer): alephd may have gone ahead, so
+    /// what it holds is read again, under the edits.
+    fn save_interrupted(&mut self, job: &Job) {
+        match job {
+            Job::Settings => {
+                if matches!(self.values, Values::Ready(_)) {
+                    self.rebase_on_config = Rebase::Due;
+                }
+            }
         }
     }
 
@@ -482,15 +500,16 @@ impl<S: Store, B: Backend> Manager<S, B> {
         self.reauth.forget();
         self.shown = None;
         self.awaiting = None;
-        self.pending = None;
         self.end_confirm();
-        if std::mem::take(&mut self.saving_settings) {
+        // (A reveal's confirmation just ends; a job's says it may have gone
+        // through.)
+        if let Some(Running::Job(job)) = self.running.take() {
             let why = match now {
                 Vault::Locked => "the vault locked",
                 _ => "alephd went away",
             };
-            self.status = Some(format!("{why}: the save may not have gone through"));
-            self.save_interrupted();
+            self.status = Some(format!("{why}: {}", job.may_not_have_gone_through()));
+            self.save_interrupted(&job);
         }
         if let Mode::Edit {
             secret, original, ..
@@ -523,11 +542,10 @@ impl<S: Store, B: Backend> Manager<S, B> {
                         // (Its answer may never come: asked again when back.)
                         self.rebase_on_config = Rebase::Due;
                     }
-                    if !up && self.save_after_unlock {
+                    if !up && let Some(job) = self.waiting.take() {
                         // (No `Done` comes for an unlock that alephd went away
-                        // in: the waiting save is dropped here.)
-                        self.save_after_unlock = false;
-                        self.status = Some("alephd went away: nothing was saved".into());
+                        // in: the waiting job is dropped here.)
+                        self.status = Some(format!("alephd went away: {}", job.nothing()));
                     }
                     if up && !was_up {
                         // (The link is back: read again, unless there are
@@ -651,16 +669,16 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     dismissed,
                 } => {
                     if request == "unlock"
-                        && self.save_after_unlock
+                        && self.waiting.is_some()
                         && (error.is_some() || dismissed)
+                        && let Some(job) = self.waiting.take()
                     {
-                        // (A save waiting for the unlock is dropped; the edits stay.
-                        // A successful unlock keeps it: `resume_save` runs when the
-                        // vault event shows it open.)
-                        self.save_after_unlock = false;
+                        // (A job waiting for the unlock is dropped; the edits
+                        // stay. A successful unlock keeps it: `resume_job` runs
+                        // when the vault event shows it open.)
                         self.status = Some(match &error {
-                            Some(e) => format!("cannot unlock: {e}; nothing was saved"),
-                            None => "the unlock was dismissed: nothing was saved".into(),
+                            Some(e) => format!("cannot unlock: {e}; {}", job.nothing()),
+                            None => format!("the unlock was dismissed: {}", job.nothing()),
                         });
                         continue;
                     }
@@ -668,12 +686,19 @@ impl<S: Store, B: Backend> Manager<S, B> {
                         // (The VAULT section shows why, with RETRY.)
                         continue;
                     }
-                    if request == "save the settings" {
+                    if let Some(Running::Job(job)) = &self.running
+                        && request == job.request_name()
+                    {
                         if let Some(e) = error {
                             self.end_confirm();
-                            self.saving_settings = false;
-                            self.status = Some(format!("cannot save the settings: {e}"));
+                            self.running = None;
+                            self.status = Some(format!("cannot {request}: {e}"));
                         }
+                        continue;
+                    }
+                    if request == Job::Settings.request_name() {
+                        // (Late: its confirmation already ended, and said
+                        // why.)
                         continue;
                     }
                     let save = SAVES.contains(&request) && self.saving > 0;
@@ -714,12 +739,14 @@ impl<S: Store, B: Backend> Manager<S, B> {
         }) {
             self.shown = None;
             self.end_confirm();
-            self.pending = None;
-            if std::mem::take(&mut self.saving_settings) {
-                self.status =
-                    Some("the window lost focus: the settings may not have been saved".into());
-                self.save_interrupted();
+            if let Some(Running::Job(job)) = self.running.take() {
+                self.status = Some(format!(
+                    "the window lost focus: {}",
+                    job.may_not_have_been_done()
+                ));
+                self.save_interrupted(&job);
             }
+            self.running = None;
             if matches!(self.awaiting, Some((_, Want::Show))) {
                 self.awaiting = None;
             }
@@ -729,7 +756,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
             // (A cancel or a save takes the warning away.)
             self.disarm_exit();
         }
-        self.resume_save(&ui.ctx().clone());
+        self.resume_job(&ui.ctx().clone());
         self.ask_config();
         let p = self.palette.clone();
         let mut go = None;
@@ -834,14 +861,14 @@ impl<S: Store, B: Backend> Manager<S, B> {
         }
     }
 
-    /// A save that waited for the unlock (SAVE pressed while sealed): now
+    /// A job that waited for the unlock (SAVE pressed while sealed): now
     /// that the vault is open, confirm and save what is in the form. Not
     /// if the form went (another screen, nothing left to save).
     /// Not while the window lacks the keyboard (alephd's unlock prompt may
     /// still have it): the confirmation would hold alephd's conversation
     /// lock, unseen. It waits (SAVE still says so) and tries again.
-    fn resume_save(&mut self, ctx: &egui::Context) {
-        if !self.save_after_unlock || !matches!(self.vault, Vault::Unlocked(_)) {
+    fn resume_job(&mut self, ctx: &egui::Context) {
+        if self.waiting.is_none() || !matches!(self.vault, Vault::Unlocked(_)) {
             return;
         }
         if !ctx.input(|i| i.focused) {
@@ -849,18 +876,21 @@ impl<S: Store, B: Backend> Manager<S, B> {
             ctx.request_repaint_after(Duration::from_millis(250));
             return;
         }
-        self.save_after_unlock = false;
-        let changes = match &self.values {
-            Values::Ready(f) if self.page == Page::Settings && f.edited() && f.valid() => {
-                f.changes()
-            }
-            _ => {
-                // (Not silently: the edits stay, for another SAVE.)
-                self.status = Some("the vault unlocked: the settings were not saved".into());
-                return;
-            }
+        let Some(job) = self.waiting.take() else {
+            return;
         };
-        self.start_save(ctx, changes);
+        let ready = match &job {
+            Job::Settings => matches!(
+                &self.values,
+                Values::Ready(f) if self.page == Page::Settings && f.edited() && f.valid()
+            ),
+        };
+        if !ready {
+            // (Not silently: the edits stay, for another SAVE.)
+            self.status = Some(format!("the vault unlocked: {}", job.unlock_missed()));
+            return;
+        }
+        self.start_job(ctx, job);
     }
 
     /// Ask alephd for the VAULT values when the screen needs them.
@@ -915,9 +945,9 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 let view = VaultView {
                     enabled: up,
                     sealed,
-                    unlocking: self.save_after_unlock,
-                    // (Still waiting once open: `resume_save` waits for focus.)
-                    unlocked_waiting_focus: self.save_after_unlock
+                    unlocking: matches!(self.waiting, Some(Job::Settings)),
+                    // (Still waiting once open: `resume_job` waits for focus.)
+                    unlocked_waiting_focus: matches!(self.waiting, Some(Job::Settings))
                         && matches!(self.vault, Vault::Unlocked(_)),
                 };
                 action = settings_page::vault_section(ui, p, form, &view);
@@ -944,17 +974,14 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 if let Values::Ready(form) = &mut self.values {
                     form.cancel();
                 }
-                self.save_after_unlock = false;
+                if matches!(self.waiting, Some(Job::Settings)) {
+                    self.waiting = None;
+                }
             }
             Some(VaultAction::Save) => {
-                if sealed {
-                    // (Confirming needs the vault open: unlock first, and
-                    // save when it is; `resume_save`.)
-                    self.save_after_unlock = true;
-                    self.store.request(Request::Unlock);
-                } else if let Values::Ready(form) = &self.values {
-                    let changes = form.changes();
-                    self.start_save(&ui.ctx().clone(), changes);
+                if matches!(self.values, Values::Ready(_)) {
+                    // (`begin`: unlock first if sealed, then confirm.)
+                    self.begin(&ui.ctx().clone(), Job::Settings);
                 }
             }
             None => {}
@@ -1128,7 +1155,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
         let Some(app) = self.confirm.as_mut() else {
             return;
         };
-        if self.pending.is_some() {
+        if matches!(self.running, Some(Running::Reveal { .. })) {
             // (What the guard is worth: spec §6.)
             ui.label(
                 RichText::new(
@@ -1147,33 +1174,39 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 _ => None,
             };
             self.end_confirm();
-            if std::mem::take(&mut self.saving_settings) {
-                match finished {
-                    None => {
-                        self.status = Some(
-                            "the confirmation ended early: the settings may not have been saved"
-                                .into(),
-                        );
-                        self.save_interrupted();
-                    }
-                    Some((true, _)) => {
-                        // (The same proof as a reveal's; and read again.)
-                        self.reauth.confirmed(now);
-                        self.status = Some("SETTINGS SAVED".into());
-                        self.values = Values::Unknown;
-                    }
-                    Some((false, message)) => {
-                        self.status = Some(match message {
-                            Some(m) => format!("not saved: {m}"),
-                            None => "cancelled: nothing was saved".into(),
-                        });
-                    }
+            match self.running.take() {
+                Some(Running::Job(job)) => self.job_finished(job, finished, now),
+                Some(Running::Reveal { path, want }) if finished.is_some_and(|(ok, _)| ok) => {
+                    self.reauth.confirmed(now);
+                    self.fetch(path, want);
                 }
-            } else if let Some((path, want)) = self.pending.take()
-                && finished.is_some_and(|(ok, _)| ok)
-            {
+                _ => {}
+            }
+        }
+    }
+
+    /// A job's confirmation closed: `finished` is what alephd ended it with
+    /// (`None`: closed with no `Done`, which may mean it went ahead).
+    fn job_finished(&mut self, job: Job, finished: Option<(bool, Option<String>)>, now: Instant) {
+        match (job, finished) {
+            (job, None) => {
+                self.status = Some(format!(
+                    "the confirmation ended early: {}",
+                    job.may_not_have_been_done()
+                ));
+                self.save_interrupted(&job);
+            }
+            (Job::Settings, Some((true, _))) => {
+                // (The same proof as a reveal's; and read again.)
                 self.reauth.confirmed(now);
-                self.fetch(path, want);
+                self.status = Some("SETTINGS SAVED".into());
+                self.values = Values::Unknown;
+            }
+            (job, Some((false, message))) => {
+                self.status = Some(match message {
+                    Some(m) => job.refused(&m),
+                    None => job.cancelled(),
+                });
             }
         }
     }
