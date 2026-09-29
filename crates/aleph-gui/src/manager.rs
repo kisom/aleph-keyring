@@ -473,9 +473,11 @@ impl<S: Store, B: Backend> Manager<S, B> {
 
     /// Run `job`: at once, or (the vault sealed, which alephd's
     /// re-authentication refuses) after asking alephd to unlock. Nothing
-    /// starts while another job runs or waits.
+    /// starts while another job runs or waits, or while alephd cannot be
+    /// reached (the status says so).
     fn begin(&mut self, ctx: &egui::Context, job: Job) {
         if self.running.is_some() || self.waiting.is_some() {
+            self.status = Some(format!("another operation is under way: {}", job.nothing()));
             return;
         }
         match self.vault {
@@ -484,7 +486,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 self.store.request(Request::Unlock);
             }
             Vault::Unlocked(_) => self.start_job(ctx, job),
-            _ => {}
+            _ => self.status = Some(format!("alephd cannot be reached: {}", job.nothing())),
         }
     }
 
@@ -756,10 +758,11 @@ impl<S: Store, B: Backend> Manager<S, B> {
                         continue;
                     }
                     if request == "retry the keyslot" {
-                        match error {
-                            Some(e) => self.status = Some(format!("cannot {request}: {e}")),
-                            None => self.admin = AdminState::Unknown,
+                        // (Refused or not, what STATUS says is read again.)
+                        if let Some(e) = error {
+                            self.status = Some(format!("cannot {request}: {e}"));
                         }
+                        self.admin = AdminState::Unknown;
                         continue;
                     }
                     if let Some(Running::Job(job)) = &self.running
@@ -1480,6 +1483,10 @@ impl<S: Store, B: Backend> Manager<S, B> {
             }
             (Job::Admin(op), Some((true, _))) => {
                 self.reauth.confirmed(now);
+                if matches!(op, AdminOp::AddFido2 { touch_only: true }) {
+                    // (The next key is not touch-alone unless asked again.)
+                    self.touch_alone = false;
+                }
                 self.status = Some(op.done_text());
                 self.admin = AdminState::Unknown;
             }

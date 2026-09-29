@@ -2045,6 +2045,89 @@ fn a_lock_or_unlock_reads_the_status_again() {
     assert!(matches!(only(store.take()), Request::Status));
 }
 
+/// A refused RETRY says why, and the status is read again.
+#[test]
+fn a_refused_retry_says_why_and_reads_the_status_again() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_admin(&mut h, &store, admin_status());
+    h.get_by_label("Retry keyslot login password").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::RetryKeyslot(_)));
+    store.send(done_event(
+        "retry the keyslot",
+        Some("the password is wrong"),
+    ));
+    frames(&mut h);
+    h.get_by_label_contains("cannot retry the keyslot: the password is wrong");
+    assert!(matches!(only(store.take()), Request::Status));
+}
+
+/// Yes while alephd cannot be reached says so (nothing is dropped
+/// silently).
+#[test]
+fn yes_while_alephd_is_unreachable_says_so() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_admin(&mut h, &store, admin_status());
+    h.get_by_label("NEW RECOVERY KEY").click();
+    frames(&mut h);
+    store.send(StoreEvent::Vault(Vault::Unreachable("gone".into())));
+    frames(&mut h);
+    store.take();
+    h.get_by_label("Yes").click();
+    frames(&mut h);
+    assert!(store.take().is_empty());
+    h.get_by_label("alephd cannot be reached: nothing was changed");
+}
+
+/// SAVE on SETTINGS while an ADMIN action waits for the unlock says why
+/// nothing happens.
+#[test]
+fn a_settings_save_while_an_admin_action_waits_says_so() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, Vault::Locked);
+    open_admin(&mut h, &store, admin_status());
+    h.get_by_label("ROTATE MASTER KEY").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Unlock));
+    open_settings(&mut h, &store, "0", "300", "true");
+    pick(&mut h, "Idle lock", "15 min");
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    assert!(store.take().is_empty());
+    h.get_by_label("another operation is under way: nothing was saved");
+}
+
+/// "touch alone" is cleared once a touch-alone key has been added.
+#[test]
+fn touch_alone_is_cleared_after_a_touch_alone_key_is_added() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_admin(&mut h, &store, admin_status());
+    h.get_by_label("touch alone").click();
+    frames(&mut h);
+    h.get_by_label("+ SECURITY KEY").click();
+    frames(&mut h);
+    let Request::AddFido2(fd, true) = only(store.take()) else {
+        panic!("no touch-alone enrolment");
+    };
+    let alephd = alephd_confirms(fd, "hunter2");
+    settle(&mut h);
+    type_into(&mut h, "Login password", "hunter2");
+    h.key_press(egui::Key::Enter);
+    frames(&mut h);
+    assert!(alephd.join().unwrap());
+    settle(&mut h);
+    h.get_by_label_contains("KEYSLOT ADDED");
+    assert!(matches!(only(store.take()), Request::Status));
+    store.send(StoreEvent::Status(Ok(admin_status())));
+    frames(&mut h);
+    assert!(
+        h.query_by_label("anyone holding the key can unlock")
+            .is_none()
+    );
+    h.get_by_label("+ SECURITY KEY").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::AddFido2(_, false)));
+}
+
 /// Every view, in both themes.
 #[test]
 fn snapshots() {
