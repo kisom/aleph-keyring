@@ -1,0 +1,45 @@
+# Maintainer: K. Isom <kyle@imap.cc>
+# The latest commit on GitHub (the AUR's aleph-keyring-git; `make pkgbuild-aur`
+# writes the published copy, with the shared functions inlined).
+pkgname=aleph-keyring-git
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='A Rust Secret Service keyring backed by a TPM and FIDO2 keys'
+arch=('x86_64')
+url='https://github.com/kisom/aleph-keyring'
+license=('Apache-2.0')
+# (openssl: alephd links libcrypto; wayland, libxkbcommon and libglvnd:
+# aleph-gui loads libwayland-client/-egl, libxkbcommon and libEGL with
+# dlopen; hicolor-icon-theme: the icons' directories.)
+depends=(tpm2-tss libfido2 pam dbus openssl hicolor-icon-theme wayland libxkbcommon libglvnd)
+makedepends=(rust clang pkgconf git)
+# (No -debug package: the release profile has no debug info to split.)
+options=('!debug')
+provides=('org.freedesktop.secrets' 'aleph-keyring')
+conflicts=('aleph-keyring' 'aleph-keyring-local')
+backup=('etc/pam.d/aleph-check')
+install=aleph-keyring.install
+source=("aleph-src::git+$url.git")
+sha256sums=('SKIP')   # a git source has no checksum
+
+# (aleph_build builds in "$srcdir/$_srcname": $srcdir is not set yet when
+# makepkg reads this top level, only inside the functions.)
+_srcname=aleph-src
+
+# <Cargo.toml version>.r<commit count>.g<short hash>
+pkgver() {
+  cd "$srcdir/$_srcname"
+  local v
+  v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+  printf '%s.r%s.g%s' "$v" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  . "$startdir/common.sh"
+  aleph_build
+}
+
+package() {
+  . "$startdir/common.sh"
+  aleph_package
+}

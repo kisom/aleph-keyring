@@ -1,0 +1,39 @@
+# Maintainer: K. Isom <kyle@imap.cc>
+# A tagged release (the AUR's aleph-keyring). `make pkgbuild-release TAG=vX.Y.Z`
+# sets pkgver and the tarball's checksum after the tag is pushed;
+# `make pkgbuild-aur` writes the published copy, with the shared functions
+# inlined.
+pkgname=aleph-keyring
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='A Rust Secret Service keyring backed by a TPM and FIDO2 keys'
+arch=('x86_64')
+url='https://github.com/kisom/aleph-keyring'
+license=('Apache-2.0')
+# (openssl: alephd links libcrypto; wayland, libxkbcommon and libglvnd:
+# aleph-gui loads libwayland-client/-egl, libxkbcommon and libEGL with
+# dlopen; hicolor-icon-theme: the icons' directories.)
+depends=(tpm2-tss libfido2 pam dbus openssl hicolor-icon-theme wayland libxkbcommon libglvnd)
+makedepends=(rust clang pkgconf)
+# (No -debug package: the release profile has no debug info to split.)
+options=('!debug')
+provides=('org.freedesktop.secrets')
+conflicts=('aleph-keyring-git' 'aleph-keyring-local')
+backup=('etc/pam.d/aleph-check')
+install=aleph-keyring.install
+source=("aleph-keyring-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')  # FILLED AT RELEASE by `make pkgbuild-release TAG=vX.Y.Z`
+
+# (aleph_build builds in "$srcdir/$_srcname", GitHub's tarball's top
+# directory: $srcdir is not set yet when makepkg reads this top level.)
+_srcname="aleph-keyring-$pkgver"
+
+build() {
+  . "$startdir/common.sh"
+  aleph_build
+}
+
+package() {
+  . "$startdir/common.sh"
+  aleph_package
+}

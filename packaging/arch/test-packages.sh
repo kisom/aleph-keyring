@@ -62,6 +62,9 @@ fi
 # tarball must carry, a tracked file deleted without staging the deletion
 # (the tarball must leave it out, and the build must not fail on it), and
 # the version must say so.
+# (Every packaging file used below comes from this copy, taken once, not
+# from the live mount.)
+arch=$work/tree/packaging/arch
 echo marker >"$work/tree/untracked-marker.txt"
 rm "$work/tree/README.md"
 chown -R builder: "$work"
@@ -133,44 +136,63 @@ fi
 # (A pkgver may not contain a hyphen, and makepkg refuses one: the build
 # succeeded, so it has none.)
 
-# --- metadata
-info=$(pacman -Qip "$pkg")
-echo "$info" | grep -q "^Name *: $pkgname\$" && pass "the package name" || fail "the package name"
-echo "$info" | grep -q '^Licenses *: Apache-2.0' && pass "the license" || fail "the license"
-for dep in $rundeps; do
-    echo "$info" | grep -q "^Depends On .*\\b$dep\\b" && pass "depends on $dep" || fail "depends on $dep"
-done
-echo "$info" | grep -q '^Provides .*org\.freedesktop\.secrets' && pass "provides org.freedesktop.secrets" \
-    || fail "provides org.freedesktop.secrets"
-echo "$info" | grep -q '^Provides .*\baleph-keyring\b' && pass "provides aleph-keyring" \
-    || fail "provides aleph-keyring"
-echo "$info" | grep -q '^Conflicts With .*aleph-keyring-git' && pass "conflicts with the -git package" \
-    || fail "conflicts with the -git package"
-echo "$info" | grep -Eq '^Conflicts With .*aleph-keyring( |$)' && pass "conflicts with the release package" \
-    || fail "conflicts with the release package"
-# (pacman -Qip lists no backup files, so .PKGINFO is read for that.)
-bsdtar -xOf "$pkg" .PKGINFO | grep -qx 'backup = etc/pam.d/aleph-check' \
-    && pass "etc/pam.d/aleph-check is a backup file" || fail "etc/pam.d/aleph-check is a backup file"
-echo "$info" | grep -q 'gnome-keyring' && fail "must not mention gnome-keyring" || pass "no gnome-keyring conflict"
+# --- metadata and files, for any of the three packages:
+#   check_variant NAME PACKAGE BUILD_DIRECTORY...
+# (Each BUILD_DIRECTORY is one no file in the package may name.)
+variants='aleph-keyring-local aleph-keyring-git aleph-keyring'
+check_variant() {
+    name=$1 p=$2
+    shift 2
+    info=$(pacman -Qip "$p")
+    echo "$info" | grep -q "^Name *: $name\$" && pass "$name: the package name" || fail "$name: the package name"
+    echo "$info" | grep -q '^Licenses *: Apache-2.0' && pass "$name: the license" || fail "$name: the license"
+    for dep in $rundeps; do
+        echo "$info" | grep -q "^Depends On .*\\b$dep\\b" && pass "$name: depends on $dep" \
+            || fail "$name: depends on $dep"
+    done
+    echo "$info" | grep -q '^Provides .*org\.freedesktop\.secrets' && pass "$name: provides org.freedesktop.secrets" \
+        || fail "$name: provides org.freedesktop.secrets"
+    # (The release package is aleph-keyring; the other two provide it.)
+    if [ "$name" != aleph-keyring ]; then
+        echo "$info" | grep -Eq '^Provides .*[: ]aleph-keyring( |$)' && pass "$name: provides aleph-keyring" \
+            || fail "$name: provides aleph-keyring"
+    fi
+    for other in $variants; do
+        [ "$other" != "$name" ] || continue
+        echo "$info" | grep -Eq "^Conflicts With .*[: ]$other( |\$)" && pass "$name: conflicts with $other" \
+            || fail "$name: conflicts with $other"
+    done
+    # (pacman -Qip lists no backup files, so .PKGINFO is read for that.)
+    bsdtar -xOf "$p" .PKGINFO | grep -qx 'backup = etc/pam.d/aleph-check' \
+        && pass "$name: etc/pam.d/aleph-check is a backup file" || fail "$name: etc/pam.d/aleph-check is a backup file"
+    echo "$info" | grep -q 'gnome-keyring' && fail "$name: must not mention gnome-keyring" \
+        || pass "$name: no gnome-keyring conflict"
 
-# --- files: exactly the expected list, and its modes
-rm -rf /tmp/extract && mkdir /tmp/extract
-bsdtar -xf "$pkg" -C /tmp/extract
-(cd /tmp/extract && find . -type f ! -name '.PKGINFO' ! -name '.BUILDINFO' ! -name '.MTREE' ! -name '.INSTALL' \
-    -printf '%m %P\n' | sort -k2) >/tmp/files.actual
-sed "s/%PKGNAME%/$pkgname/" "$src/packaging/arch/files.expected" | sort -k2 >/tmp/files.want
-if diff -u /tmp/files.want /tmp/files.actual >/tmp/files.diff; then pass "the file list and modes match files.expected"; else
-    cat /tmp/files.diff >&2
-    fail "the file list and modes match files.expected"
-fi
-# (The build directory must not leak into the binaries: generated code's
-# panic locations name OUT_DIR, under $srcdir; common.sh remaps it.)
-if grep -rl "$work/tree/target/pkg/local/src" /tmp/extract/usr >/tmp/srcdir.refs; then
-    cat /tmp/srcdir.refs >&2
-    fail "no file in the package names the build directory"
-else
-    pass "no file in the package names the build directory"
-fi
+    # Files: exactly the expected list, and its modes.
+    rm -rf /tmp/extract && mkdir /tmp/extract
+    bsdtar -xf "$p" -C /tmp/extract
+    (cd /tmp/extract && find . -type f ! -name '.PKGINFO' ! -name '.BUILDINFO' ! -name '.MTREE' ! -name '.INSTALL' \
+        -printf '%m %P\n' | sort -k2) >/tmp/files.actual
+    sed "s/%PKGNAME%/$name/" "$arch/files.expected" | sort -k2 >/tmp/files.want
+    if diff -u /tmp/files.want /tmp/files.actual >/tmp/files.diff; then
+        pass "$name: the file list and modes match files.expected"
+    else
+        cat /tmp/files.diff >&2
+        fail "$name: the file list and modes match files.expected"
+    fi
+    # (The build directories must not leak into the binaries: generated
+    # code's panic locations name OUT_DIR, under the target directory;
+    # common.sh remaps it.)
+    for dir in "$@"; do
+        if grep -rl "$dir" /tmp/extract/usr >/tmp/srcdir.refs; then
+            cat /tmp/srcdir.refs >&2
+            fail "$name: no file in the package names $dir"
+        else
+            pass "$name: no file in the package names $dir"
+        fi
+    done
+}
+check_variant "$pkgname" "$pkg" "$work/tree/target/pkg/local/src"
 
 # --- the hook, with the stub systemctl, through pacman
 # (The GUI's libraries go first, -dd: only the package's depends may bring
@@ -257,9 +279,204 @@ got=$(tr '\n' ';' </tmp/systemctl.calls)
 want='--global disable alephd.socket;disable --now aleph-tpmd.socket aleph-tpmd.service;daemon-reload;'
 [ "$got" = "$want" ] && pass "pre_remove and post_remove ran the spec's systemctl calls" || fail "removal calls: $got"
 
-# --- namcap on the PKGBUILD and the package: warnings only
-namcap "$work/tree/target/pkg/local/PKGBUILD" >/tmp/namcap.out 2>&1 || true
-namcap "$pkg" >>/tmp/namcap.out 2>&1 || true
+# --- the -git and release packages
+# Both build in one directory, $vdir, one after the other, so their $srcdir
+# is the same path; with one target directory outside it (common.sh's
+# ALEPH_CARGO_TARGET_DIR) cargo's flags are the same and the release build
+# reuses the dependencies the -git build compiled. The workspace's own
+# crates are cleaned between the two, so each compiles them from its own
+# source (checked below), and each package is checked on its own.
+vdir=$work/variant
+vtarget=$work/variant-target
+pkgs=$work/pkgs
+# ($vtarget is left for cargo to make, under /work, which is builder's:
+# cargo clean refuses a target directory without the CACHEDIR.TAG that
+# cargo writes when it makes one.)
+rm -rf "$vdir" "$vtarget" "$pkgs"
+mkdir -p "$vdir" "$pkgs/git" "$pkgs/release"
+chown -R builder: "$vdir" "$pkgs"
+# (makepkg in $vdir as builder; its output and cargo's go to the log.)
+makepkg_variant() {
+    t0=$(date +%s)
+    su builder -c "cd $vdir && CARGO_HOME=/work/cargo ALEPH_CARGO_TARGET_DIR=$vtarget makepkg -f --noconfirm --nocolor" \
+        >"$1" 2>&1
+    rc=$?
+    echo "makepkg in $vdir: $(($(date +%s) - t0))s, $(grep -c ' Compiling ' "$1") crates compiled"
+    return $rc
+}
+
+# The -git package builds a git repository: the copy of the tree with its
+# dirty state committed on a scratch branch, so the build sees what the
+# local package saw (the marker, and no README.md), as git+file://.
+as_builder 'git checkout -q -b pkg-test-git && git add -A && git -c user.name=pkg-test -c user.email=pkg-test@localhost commit -qm pkg-test-working-tree'
+head=$(git -C "$work/tree" rev-parse --short HEAD)
+cp "$arch/aleph-keyring-git/PKGBUILD" "$vdir/PKGBUILD"
+cp -L "$arch/common.sh" "$arch/aleph-keyring.install" "$vdir/"
+sed -i "s|^source=.*|source=(\"aleph-src::git+file://$work/tree\")|" "$vdir/PKGBUILD"
+chown -R builder: "$vdir"
+gitpkg=
+if makepkg_variant /tmp/git-build.out &&
+    gitpkg=$(ls "$vdir"/aleph-keyring-git-[0-9]*.pkg.tar.zst 2>/dev/null) && [ -f "$gitpkg" ]; then
+    pass "aleph-keyring-git: makepkg builds the package from git+file://"
+else
+    tail -n 60 /tmp/git-build.out >&2
+    fail "aleph-keyring-git: makepkg builds the package from git+file://"
+    gitpkg=
+fi
+if [ -n "$gitpkg" ]; then
+    case ${gitpkg##*/} in
+    aleph-keyring-git-0.1.0.r[0-9]*.g"$head"-1-x86_64.pkg.tar.zst)
+        pass "aleph-keyring-git: pkgver() is <version>.r<count>.g<hash> of the commit built ($head)" ;;
+    *) fail "aleph-keyring-git: pkgver() is <version>.r<count>.g<hash> of $head (package: $gitpkg)" ;;
+    esac
+    [ -f "$vdir/src/aleph-src/untracked-marker.txt" ] && [ ! -e "$vdir/src/aleph-src/README.md" ] \
+        && pass "aleph-keyring-git: the build's source is the committed working tree" \
+        || fail "aleph-keyring-git: the build's source is the committed working tree"
+    grep -Eq 'Compiling aleph-cli v[^ ]+ \(.*/src/aleph-src/crates/aleph-cli\)' /tmp/git-build.out \
+        && pass "aleph-keyring-git: cargo compiled the workspace from its own source" \
+        || fail "aleph-keyring-git: cargo compiled the workspace from its own source"
+    mv "$gitpkg" "$pkgs/git/" && gitpkg=$pkgs/git/${gitpkg##*/}
+    cp "$vdir/PKGBUILD" "$pkgs/git/PKGBUILD"
+    check_variant aleph-keyring-git "$gitpkg" "$vdir/src" "$vtarget"
+fi
+
+# The release package builds a `git archive` tarball of that commit, as
+# GitHub's tag tarball is. pkgbuild-release.sh (on a scratch copy of
+# packaging/arch, reading the tarball through a file:// URL) writes its
+# version and real checksum into the PKGBUILD, and makepkg must verify it;
+# only the source URL is pointed at the local file.
+relver=$(sed -n 's/^pkgver=//p' "$arch/aleph-keyring/PKGBUILD")
+reltar=$pkgs/release/aleph-keyring-$relver.tar.gz
+as_builder "git archive --prefix=aleph-keyring-$relver/ -o $reltar HEAD"
+relsum=$(sha256sum "$reltar" | cut -d' ' -f1)
+rm -rf "$work/arch"
+cp -a "$arch" "$work/arch"
+chown -R builder: "$work/arch"
+if su builder -c "ALEPH_ARCH_DIR=$work/arch ALEPH_RELEASE_TARBALL_URL=file://$reltar sh $work/arch/pkgbuild-release.sh v$relver" \
+    >/tmp/release-fill.out 2>&1; then
+    pass "pkgbuild-release fills in the release PKGBUILD"
+else
+    cat /tmp/release-fill.out >&2
+    fail "pkgbuild-release fills in the release PKGBUILD"
+fi
+# (cargo keys a workspace crate by its path relative to the workspace, and
+# git archive keeps the commit's times, older than the -git build's
+# outputs: without this the release build takes the -git build's binaries
+# as fresh and compiles nothing. The dependencies stay.)
+if [ -d "$vdir/src/aleph-src" ]; then
+    su builder -c "cd $vdir/src/aleph-src && CARGO_HOME=/work/cargo cargo clean --release --workspace --target-dir $vtarget" \
+        >/tmp/clean.out 2>&1 || { cat /tmp/clean.out >&2; fail "cargo clean of the workspace's crates between the builds"; }
+fi
+rm -rf "$vdir"
+mkdir -p "$vdir"
+cp "$work/arch/aleph-keyring/PKGBUILD" "$vdir/PKGBUILD"
+cp -L "$arch/common.sh" "$arch/aleph-keyring.install" "$reltar" "$vdir/"
+sed -i "s|^source=.*|source=(\"aleph-keyring-\$pkgver.tar.gz\")|" "$vdir/PKGBUILD"
+chown -R builder: "$vdir"
+grep -q "^sha256sums=('$relsum')" "$vdir/PKGBUILD" && pass "aleph-keyring: the PKGBUILD carries the tarball's checksum" \
+    || fail "aleph-keyring: the PKGBUILD carries the tarball's checksum"
+relpkg=
+if makepkg_variant /tmp/release-build.out &&
+    relpkg=$(ls "$vdir"/aleph-keyring-"$relver"-*.pkg.tar.zst 2>/dev/null) && [ -f "$relpkg" ]; then
+    pass "aleph-keyring: makepkg builds the release package from the tarball"
+else
+    tail -n 60 /tmp/release-build.out >&2
+    fail "aleph-keyring: makepkg builds the release package from the tarball"
+    relpkg=
+fi
+if [ -n "$relpkg" ]; then
+    # (Verified, not skipped: a SKIP checksum builds too.)
+    grep -q "aleph-keyring-$relver.tar.gz \.\.\. Passed" /tmp/release-build.out \
+        && pass "aleph-keyring: makepkg verified the tarball's checksum" \
+        || { grep -A3 'Validating source' /tmp/release-build.out >&2; fail "aleph-keyring: makepkg verified the tarball's checksum"; }
+    grep -Eq "Compiling aleph-cli v[^ ]+ \\(.*/src/aleph-keyring-$relver/crates/aleph-cli\\)" /tmp/release-build.out \
+        && pass "aleph-keyring: cargo compiled the workspace from its own source" \
+        || fail "aleph-keyring: cargo compiled the workspace from its own source"
+    mv "$relpkg" "$pkgs/release/" && relpkg=$pkgs/release/${relpkg##*/}
+    cp "$vdir/PKGBUILD" "$pkgs/release/PKGBUILD"
+    check_variant aleph-keyring "$relpkg" "$vdir/src" "$vtarget"
+fi
+
+# The AUR copies, from the filled-in scratch copy, with the real makepkg
+# writing each .SRCINFO (as builder: makepkg refuses root).
+if su builder -c "ALEPH_ARCH_DIR=$work/arch ALEPH_AUR_OUT=$work/aur sh $work/arch/pkgbuild-aur.sh" >/tmp/aur.out 2>&1; then
+    pass "pkgbuild-aur writes the AUR copies"
+else
+    cat /tmp/aur.out >&2
+    fail "pkgbuild-aur writes the AUR copies"
+fi
+for name in aleph-keyring aleph-keyring-git; do
+    grep -qx "pkgbase = $name" "$work/aur/$name/.SRCINFO" 2>/dev/null \
+        && grep -qx '	depends = libglvnd' "$work/aur/$name/.SRCINFO" \
+        && grep -qx '	install = aleph-keyring.install' "$work/aur/$name/.SRCINFO" \
+        && pass "$name: makepkg --printsrcinfo reads the flattened PKGBUILD" \
+        || { cat "$work/aur/$name/.SRCINFO" >&2 || true; fail "$name: makepkg --printsrcinfo reads the flattened PKGBUILD"; }
+done
+grep -qx "	sha256sums = $relsum" "$work/aur/aleph-keyring/.SRCINFO" 2>/dev/null \
+    && pass "aleph-keyring: the AUR .SRCINFO carries the release checksum" \
+    || fail "aleph-keyring: the AUR .SRCINFO carries the release checksum"
+
+# --- the three refuse to install together
+if [ -n "$gitpkg" ] && [ -n "$relpkg" ]; then
+    # (By exact name: pacman -Q aleph-keyring also finds a package that
+    # provides it.)
+    installed() { pacman -Qq | grep -Ex 'aleph-keyring(-git|-local)?' | tr '\n' ' '; }
+    if pacman -U --noconfirm "$pkg" "$gitpkg" "$relpkg" >/tmp/co.out 2>&1; then
+        fail "pacman -U of the three packages at once must fail"
+    else
+        pass "pacman -U of the three packages at once fails"
+    fi
+    [ -z "$(installed)" ] && pass "none is installed after the refused install" \
+        || fail "none is installed after the refused install: $(installed)"
+    pacman -U --noconfirm "$pkg" >/tmp/co.out 2>&1 || { cat /tmp/co.out >&2; fail "pacman -U installs the local package"; }
+    # (pacman asks whether to remove the conflicting package; --noconfirm
+    # answers no, so the install fails.)
+    for other in "$gitpkg" "$relpkg"; do
+        if pacman -U --noconfirm "$other" >/tmp/co.out 2>&1; then
+            fail "installing ${other##*/} over the local package must fail"
+        else
+            pass "installing ${other##*/} over the local package fails"
+        fi
+        [ "$(installed)" = "aleph-keyring-local " ] && pass "only the local package is installed after that" \
+            || fail "only the local package is installed after that: $(installed)"
+    done
+
+    # The variant switch under the guard (the spec's recorded limitation):
+    # with the PAM manifest in place, replace the local package with the
+    # -git one, letting pacman remove the conflict (--ask=4). What happens
+    # is recorded, not asserted.
+    mkdir -p /var/lib/aleph && : >/var/lib/aleph/manifest.json
+    pacman -U --noconfirm --ask=4 "$gitpkg" >/tmp/switch.out 2>&1 || true
+    case $(installed) in
+    "aleph-keyring-local ") echo "note - variant switch under the guard: blocked" ;;
+    "aleph-keyring-git ") echo "note - variant switch under the guard: allowed" ;;
+    *) echo "note - variant switch under the guard: unclear (installed: $(installed))"; cat /tmp/switch.out ;;
+    esac
+    sed -n '/remove-guard\|aleph is\|alephctl\|conflict/p' /tmp/switch.out | sed 's/^/    /'
+    rm -f /var/lib/aleph/manifest.json
+
+    # With the -git package installed, the release one is refused too.
+    pacman -Rdd --noconfirm $(installed) >/dev/null 2>&1 || true
+    pacman -U --noconfirm "$gitpkg" >/tmp/co.out 2>&1 || { cat /tmp/co.out >&2; fail "pacman -U installs the -git package"; }
+    if pacman -U --noconfirm "$relpkg" >/tmp/co.out 2>&1; then
+        fail "installing the release package over the -git package must fail"
+    else
+        pass "installing the release package over the -git package fails"
+    fi
+    [ "$(installed)" = "aleph-keyring-git " ] && pass "only the -git package is installed after that" \
+        || fail "only the -git package is installed after that: $(installed)"
+    pacman -R --noconfirm aleph-keyring-git >/tmp/co.out 2>&1 || { cat /tmp/co.out >&2; fail "pacman -R removes the -git package"; }
+else
+    fail "the co-install and variant-switch checks need the -git and release packages"
+fi
+
+# --- namcap on each PKGBUILD and each package: warnings only
+: >/tmp/namcap.out
+for f in "$work/tree/target/pkg/local/PKGBUILD" "$pkg" "$pkgs/git/PKGBUILD" "${gitpkg:-}" \
+    "$pkgs/release/PKGBUILD" "${relpkg:-}"; do
+    [ -n "$f" ] && [ -f "$f" ] || continue
+    namcap "$f" >>/tmp/namcap.out 2>&1 || true
+done
 [ -s /tmp/namcap.out ] && { echo "namcap (warnings only):"; cat /tmp/namcap.out; }
 
 if [ "$failures" -ne 0 ]; then

@@ -7,17 +7,25 @@
 
 aleph_build() {
   cd "$srcdir/$_srcname"
-  export CARGO_TARGET_DIR=target
-  # (Generated code's panic locations name OUT_DIR, under $srcdir: with
-  # options=('!debug') makepkg no longer remaps it, so this does, the way
-  # makepkg's debug option would.)
-  export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$srcdir=/usr/src/debug/$pkgname"
+  # (ALEPH_CARGO_TARGET_DIR, an absolute directory outside $srcdir, is for
+  # the package test, which builds two variants in one directory with one
+  # target directory; unset, cargo builds in target/ of the source tree.)
+  export CARGO_TARGET_DIR=${ALEPH_CARGO_TARGET_DIR:-target}
+  # (Generated code's panic locations name OUT_DIR, under the target
+  # directory: with options=('!debug') makepkg no longer remaps it, so this
+  # does, the way makepkg's debug option would. One destination for every
+  # variant, so that the flags, and so cargo's fingerprints, are the same.)
+  local remap="--remap-path-prefix=$srcdir=/usr/src/debug/aleph-keyring"
+  if [ -n "${ALEPH_CARGO_TARGET_DIR:-}" ]; then
+    remap="$remap --remap-path-prefix=$ALEPH_CARGO_TARGET_DIR=/usr/src/debug/aleph-keyring/target"
+  fi
+  export RUSTFLAGS="${RUSTFLAGS:-} $remap"
   cargo build --release --workspace --locked
 }
 
 aleph_package() {
   cd "$srcdir/$_srcname"
-  local r=target/release
+  local r=${ALEPH_CARGO_TARGET_DIR:-target}/release
 
   install -Dm755 "$r/alephctl" "$pkgdir/usr/bin/alephctl"
   install -Dm755 "$r/aleph-gui" "$pkgdir/usr/bin/aleph-gui"

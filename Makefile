@@ -21,7 +21,7 @@ export TSS2_LOG ?= all+NONE
 
 SUDO := $(if $(filter 0,$(shell id -u)),,sudo)
 
-.PHONY: all build test lint pkg-shell-test pkg pkg-test gate gate-hw hw-tpm hw-fido2 install uninstall restart clean
+.PHONY: all build test lint pkg-shell-test pkg pkg-test pkgbuild-release pkgbuild-aur gate gate-hw hw-tpm hw-fido2 install uninstall restart clean
 
 all: build
 
@@ -40,19 +40,25 @@ lint:
 	sh -n packaging/arch/tests/guard-test.sh
 	sh -n packaging/arch/tests/hook-test.sh
 	sh -n packaging/arch/tests/pkgver-test.sh
+	sh -n packaging/arch/tests/release-test.sh
 	sh -n packaging/arch/make-pkg.sh
 	sh -n packaging/arch/pkgver.sh
+	sh -n packaging/arch/pkgbuild-release.sh
+	sh -n packaging/arch/pkgbuild-aur.sh
 	sh -n packaging/arch/test-packages.sh
 	bash -n packaging/arch/common.sh
 	bash -n packaging/arch/local/PKGBUILD
+	bash -n packaging/arch/aleph-keyring-git/PKGBUILD
+	bash -n packaging/arch/aleph-keyring/PKGBUILD
 
-# Shell tests for the package's hook, removal guard and version: they run
-# on any host, with a stub systemctl and temporary directories and git
-# repositories.
+# Shell tests for the package's hook, removal guard, version and release
+# helpers: they run on any host, with a stub systemctl and makepkg, a local
+# tarball, and temporary directories and git repositories.
 pkg-shell-test:
 	sh packaging/arch/tests/guard-test.sh
 	sh packaging/arch/tests/hook-test.sh
 	sh packaging/arch/tests/pkgver-test.sh
+	sh packaging/arch/tests/release-test.sh
 
 # A package of the working tree, built as the user in target/pkg (install it
 # with `sudo pacman -U`; nothing is installed here).
@@ -71,6 +77,17 @@ pkg-test:
 	case "$$common" in "$$PWD"/*) ;; *) set -- "$$@" -v "$$common:$$common:ro" ;; esac; \
 	if [ -n "$${ALEPH_PKG_CACHE:-}" ]; then set -- "$$@" -v aleph-pkg-cargo:/work/cargo; fi; \
 	set -x; docker run --rm "$$@" archlinux:base-devel sh /src/packaging/arch/test-packages.sh
+
+# Fill in the release PKGBUILD for a pushed tag (downloads the tag's tarball
+# from GitHub for its checksum): make pkgbuild-release TAG=v0.1.0
+pkgbuild-release:
+	@test -n "$(TAG)" || { echo "usage: make pkgbuild-release TAG=vX.Y.Z" >&2; exit 2; }
+	sh packaging/arch/pkgbuild-release.sh $(TAG)
+
+# The AUR copies, flattened, in target/aur/ (needs makepkg for .SRCINFO;
+# refuses until pkgbuild-release has filled in the checksum).
+pkgbuild-aur:
+	sh packaging/arch/pkgbuild-aur.sh
 
 gate: lint test pkg-shell-test
 
