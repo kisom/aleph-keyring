@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use egui::{Button, RichText, TextEdit};
@@ -14,6 +15,7 @@ use crate::admin_page::{self, AdminAction, AdminState, AdminView, Ask, Link};
 use crate::app::PromptApp;
 use crate::clipboard::{Backend, Clipboard};
 use crate::conversation::{Screen, shown};
+use crate::filepicker::{FilePicker, Pick, Portal};
 use crate::reauth::Reauth;
 use crate::settings::Settings;
 use crate::settings_page::{
@@ -21,7 +23,7 @@ use crate::settings_page::{
 };
 use crate::store::{Collection, Item, Request, Store, StoreEvent, Vault};
 pub use crate::task::Want;
-use crate::task::{AdminOp, Job, Running};
+use crate::task::{AdminOp, BackupTarget, Job, Running};
 use crate::theme::{self, Palette};
 
 /// The window's first size.
@@ -157,6 +159,14 @@ pub struct Manager<S: Store, B: Backend> {
     ask: Option<Ask>,
     /// The "touch alone" checkbox for a new security key.
     touch_alone: bool,
+    /// Where the save dialog comes from (the tests use a fake).
+    picker: Box<dyn FilePicker>,
+    /// A save dialog that is open: its answer, polled each frame.
+    picking: Option<Receiver<Pick>>,
+    /// The typed-path field (no portal, or "type a path instead"), and why
+    /// the last path was refused.
+    backup_path: Option<String>,
+    backup_error: Option<String>,
 }
 
 /// What the status line says after the first EXIT with unsaved edits.
@@ -244,7 +254,17 @@ impl<S: Store, B: Backend> Manager<S, B> {
             admin: AdminState::Unknown,
             ask: None,
             touch_alone: false,
+            picker: Box::new(Portal),
+            picking: None,
+            backup_path: None,
+            backup_error: None,
         }
+    }
+
+    /// Use another save dialog (the tests' fake).
+    pub fn with_file_picker(mut self, picker: Box<dyn FilePicker>) -> Self {
+        self.picker = picker;
+        self
     }
 
     /// Where gui.toml is, and why it could not be read (if it could not):
@@ -436,7 +456,16 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 theirs.into(),
                 self.form().map(Form::changes).unwrap_or_default(),
             ),
-            Job::Admin(op) => op.request(theirs.into()),
+            Job::Admin(op) => match op.request(theirs.into()) {
+                Ok(r) => r,
+                Err(e) => {
+                    // (Nothing was sent: the job, and a backup's empty
+                    // file, go.)
+                    self.end_confirm();
+                    self.status = Some(e);
+                    return;
+                }
+            },
         };
         self.running = Some(Running::Job(job));
         self.store.request(request);
@@ -803,6 +832,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
             self.disarm_exit();
         }
         self.resume_job(&ui.ctx().clone());
+        self.poll_picker(&ui.ctx().clone());
         self.ask_config();
         self.ask_status();
         let p = self.palette.clone();
@@ -854,6 +884,11 @@ impl<S: Store, B: Backend> Manager<S, B> {
         if let Some(page) = go {
             if page != self.page {
                 self.disarm_exit();
+            }
+            if self.page == Page::Admin && page != Page::Admin {
+                // (Leaving ADMIN forgets the typed-path field.)
+                self.backup_path = None;
+                self.backup_error = None;
             }
             if page == Page::Settings && self.page != Page::Settings {
                 // (Opening the screen reads the values again, unless there
@@ -1003,6 +1038,14 @@ impl<S: Store, B: Backend> Manager<S, B> {
     /// KEEPING IT SAFE, and what their buttons do.
     fn admin_body(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let ctx = ui.ctx().clone();
+        if let Some(mut path) = self.backup_path.take() {
+            match admin_page::backup_field(ui, p, &mut path, self.backup_error.as_deref()) {
+                Some(admin_page::BackupField::Go) => self.backup_to(&ctx, path.trim(), true),
+                Some(admin_page::BackupField::Cancel) => self.backup_error = None,
+                None => self.backup_path = Some(path),
+            }
+            return;
+        }
         if let Some(ask) = self.ask.clone() {
             match admin_page::ask_section(ui, p, &ask) {
                 Some(true) => {
@@ -1037,8 +1080,109 @@ impl<S: Store, B: Backend> Manager<S, B> {
             Some(AdminAction::RotateMaster | AdminAction::RotateNow) => {
                 self.begin(&ctx, Job::Admin(AdminOp::RotateMaster))
             }
-            // (Task 6: the backup.)
-            Some(AdminAction::BackUp | AdminAction::TypePath) => {}
+            Some(AdminAction::BackUp) => self.pick_backup(&ctx),
+            Some(AdminAction::TypePath) => self.type_backup_path(),
+        }
+    }
+
+    /// Today's date (UTC), for the suggested file name.
+    fn today() -> String {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        date(secs)
+    }
+
+    /// The suggested backup path, for the typed-path field: in the home
+    /// directory (or the working one).
+    fn suggested_path(&self) -> String {
+        let name = admin_page::suggested_backup_name(&Self::today());
+        match &self.home {
+            Some(home) => home.join(name).display().to_string(),
+            None => name,
+        }
+    }
+
+    /// BACK UP…: ask the portal where to save it. The answer is polled each
+    /// frame (`poll_picker`), so the window never waits for the dialog.
+    fn pick_backup(&mut self, ctx: &egui::Context) {
+        if self.picking.is_some() || self.running.is_some() || self.waiting.is_some() {
+            return;
+        }
+        self.backup_error = None;
+        let suggested = admin_page::suggested_backup_name(&Self::today());
+        self.picking = Some(self.picker.start(suggested, self.home.clone()));
+        ctx.request_repaint();
+    }
+
+    /// "type a path instead": the typed-path field, prefilled.
+    fn type_backup_path(&mut self) {
+        if self.running.is_none() && self.waiting.is_none() {
+            self.backup_error = None;
+            self.backup_path = Some(self.suggested_path());
+        }
+    }
+
+    /// The dialog's answer, if it has come. One that comes after the ADMIN
+    /// page was left makes no file (and a chosen path says so).
+    fn poll_picker(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.picking else {
+            return;
+        };
+        let answer = match rx.try_recv() {
+            Ok(pick) => pick,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(100));
+                return;
+            }
+            // (The dialog's thread ended with no answer.)
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Pick::Unavailable,
+        };
+        self.picking = None;
+        let here = self.page == Page::Admin;
+        match answer {
+            Pick::Chosen(_) if !here => {
+                self.status = Some("not backed up: the ADMIN page was left".into());
+            }
+            Pick::Chosen(path) => self.backup_to(ctx, &path.display().to_string(), false),
+            Pick::Cancelled => {}
+            // (No portal to ask: the person types the path.)
+            Pick::Unavailable if here => self.backup_path = Some(self.suggested_path()),
+            Pick::Unavailable => {}
+        }
+    }
+
+    /// Make the backup's file at `path` and run the backup (unlocking first
+    /// if the vault is sealed). A path that cannot be used says why; a
+    /// `typed` one leaves the typed-path field open with it (one from the
+    /// dialog does not: BACK UP… asks again).
+    fn backup_to(&mut self, ctx: &egui::Context, path: &str, typed: bool) {
+        // (What `begin` would refuse, refused before a file is made, and
+        // said: it would drop the job silently.)
+        let refused = if self.running.is_some() || self.waiting.is_some() {
+            Some("not backed up: another operation is under way")
+        } else if !matches!(self.vault, Vault::Locked | Vault::Unlocked(_)) {
+            Some("not backed up: alephd cannot be reached")
+        } else {
+            None
+        };
+        if let Some(why) = refused {
+            self.status = Some(why.into());
+            return;
+        }
+        match BackupTarget::open(std::path::Path::new(path)) {
+            Ok(target) => {
+                self.backup_error = None;
+                self.backup_path = None;
+                self.begin(ctx, Job::Admin(AdminOp::Backup(target)));
+            }
+            Err(e) => {
+                self.status = Some(e.clone());
+                if typed {
+                    self.backup_error = Some(e);
+                    self.backup_path = Some(path.to_string());
+                }
+            }
         }
     }
 

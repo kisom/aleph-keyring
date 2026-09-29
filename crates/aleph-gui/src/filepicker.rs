@@ -26,6 +26,13 @@ pub trait FilePicker {
     fn start(&self, suggested: String, dir: Option<PathBuf>) -> Receiver<Pick>;
 }
 
+/// A shared picker (the tests keep a handle on their fake).
+impl<T: FilePicker + ?Sized> FilePicker for std::sync::Arc<T> {
+    fn start(&self, suggested: String, dir: Option<PathBuf>) -> Receiver<Pick> {
+        (**self).start(suggested, dir)
+    }
+}
+
 /// Whether the portal has an owner on the bus at `address` (the session
 /// bus if `None`). Any failure to ask is "no".
 pub async fn portal_present(address: Option<&str>) -> bool {

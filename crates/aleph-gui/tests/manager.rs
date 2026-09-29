@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use aleph_daemon::prompt::{Channel, FromPrompter, Method, Purpose, ToPrompter};
 use aleph_gui::clipboard::Backend;
+use aleph_gui::filepicker::{Fake as Picker, Pick};
 use aleph_gui::manager::{Manager, Page, SIZE};
 use aleph_gui::settings::{Settings, ThemeChoice};
 use aleph_gui::store::{
@@ -2406,4 +2407,499 @@ fn the_exit_warning_leaves_the_status_line_when_disarmed() {
     h.get_by_label("SETTINGS").click();
     frames(&mut h);
     h.get_by_label_contains("cannot lock: boom");
+}
+
+// ---- BACK UP… (Plan 5d, Task 6) ----
+
+/// A window whose save dialog is `picks` (a fake), on the ADMIN page.
+fn backup_window(picks: Vec<Pick>) -> (Window, Fake, std::sync::Arc<Picker>) {
+    backup_window_in(vault(), picks)
+}
+
+/// `backup_window`, with the vault as `v` (sealed, say).
+fn backup_window_in(v: Vault, picks: Vec<Pick>) -> (Window, Fake, std::sync::Arc<Picker>) {
+    let picker = std::sync::Arc::new(Picker::new(picks));
+    let handle = picker.clone();
+    let (mut h, store, _) = window_with(ThemeChoice::Neon, v, SIZE, move |m| {
+        m.with_file_picker(Box::new(handle))
+    });
+    open_admin(&mut h, &store, admin_status());
+    (h, store, picker)
+}
+
+fn backup_request(store: &Fake) -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    match only(store.take()) {
+        Request::Backup(fd, file) => (fd, file),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Play alephd for a backup: ask for the password and, if it is `pw`,
+/// write the backup into `file` before saying so (alephd writes and syncs
+/// the file before its `done`).
+fn alephd_backs_up(
+    fd: std::os::fd::OwnedFd,
+    file: std::os::fd::OwnedFd,
+    pw: &'static str,
+) -> std::thread::JoinHandle<bool> {
+    std::thread::spawn(move || {
+        let mut chan = Channel::from_fd(fd, Duration::from_secs(10)).unwrap();
+        chan.send(&ToPrompter::Begin {
+            purpose: Purpose::Reauth,
+            operation: "Back up the vault".into(),
+            caller: None,
+        })
+        .unwrap();
+        let reply = chan
+            .ask(&ToPrompter::Ask {
+                methods: vec![Method::Password],
+                error: None,
+                retry_after: None,
+            })
+            .unwrap();
+        let ok = matches!(reply, FromPrompter::Password { password } if password.expose() == pw);
+        if ok {
+            use std::io::Write;
+            (&std::fs::File::from(file)).write_all(b"backup").unwrap();
+        }
+        chan.done(ok, None);
+        ok
+    })
+}
+
+/// Clear the field called `label` and type `text` into it.
+fn retype(h: &mut Window, label: &str, text: &str) {
+    h.get_by_label(label).focus();
+    frames(h);
+    for _ in 0..200 {
+        h.key_press(egui::Key::Backspace);
+    }
+    frames(h);
+    type_into(h, label, text);
+}
+
+/// Choose `path` in the (fake) dialog and get the backup's request.
+fn start_backup(
+    path: &std::path::Path,
+) -> (Window, Fake, std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    let (mut h, store, _) = backup_window(vec![Pick::Chosen(path.to_path_buf())]);
+    h.get_by_label("BACK UP…").click();
+    settle(&mut h);
+    let (fd, file) = backup_request(&store);
+    assert!(path.exists());
+    (h, store, fd, file)
+}
+
+#[test]
+fn a_chosen_path_gets_a_private_new_file_and_a_confirmation() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, store, picker) = backup_window(vec![Pick::Chosen(path.clone())]);
+    h.get_by_label("BACK UP…").click();
+    settle(&mut h);
+    // The dialog was asked for a dated suggestion.
+    let asked = picker.asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1);
+    assert!(
+        asked[0].0.starts_with("aleph-backup-") && asked[0].0.ends_with(".aleph"),
+        "{asked:?}"
+    );
+    let (fd, file) = backup_request(&store);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // alephd writes into the file and confirms.
+    let alephd = alephd_backs_up(fd, file, "hunter2");
+    settle(&mut h);
+    type_into(&mut h, "Login password", "hunter2");
+    h.key_press(egui::Key::Enter);
+    frames(&mut h);
+    assert!(alephd.join().unwrap());
+    settle(&mut h);
+    h.get_by_label_contains(&format!(
+        "BACKED UP :: {} (it opens only with your recovery key)",
+        path.display()
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), b"backup");
+    assert!(matches!(only(store.take()), Request::Status));
+    // (And it stays once the window is gone.)
+    drop(h);
+    assert_eq!(std::fs::read(&path).unwrap(), b"backup");
+}
+
+/// (Review Focus 1.) A confirmation that ends with no answer leaves no
+/// empty file behind.
+#[test]
+fn a_cancelled_backup_removes_the_empty_file_it_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, store, _) = backup_window(vec![Pick::Chosen(path.clone())]);
+    h.get_by_label("BACK UP…").click();
+    settle(&mut h);
+    let (fd, file) = backup_request(&store);
+    assert!(path.exists());
+    drop(fd);
+    drop(file);
+    settle(&mut h);
+    h.get_by_label_contains("the operation may not have gone through");
+    assert!(
+        !path.exists(),
+        "an empty file the manager made stays behind"
+    );
+}
+
+/// (Review Focus 1.) The person's Cancel in the confirmation removes the
+/// empty file too.
+#[test]
+fn a_backup_cancelled_by_the_person_removes_the_empty_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, _store, fd, _file) = start_backup(&path);
+    let alephd = std::thread::spawn(move || {
+        let mut chan = Channel::from_fd(fd, Duration::from_secs(10)).unwrap();
+        chan.send(&ToPrompter::Begin {
+            purpose: Purpose::Reauth,
+            operation: "Back up the vault".into(),
+            caller: None,
+        })
+        .unwrap();
+        chan.ask(&ToPrompter::Ask {
+            methods: vec![Method::Password],
+            error: None,
+            retry_after: None,
+        })
+        .is_err()
+    });
+    settle(&mut h);
+    h.get_by_label("Login password");
+    h.key_press(egui::Key::Escape);
+    frames(&mut h);
+    assert!(alephd.join().unwrap(), "not cancelled");
+    settle(&mut h);
+    h.get_by_label_contains("cancelled: nothing was changed");
+    assert!(!path.exists());
+}
+
+/// (Review Focus 1.) A file with content is refused and left alone.
+#[test]
+fn an_existing_file_is_refused_and_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.aleph");
+    std::fs::write(&path, b"precious").unwrap();
+    let (mut h, store, _) = backup_window(vec![Pick::Chosen(path.clone())]);
+    h.get_by_label("BACK UP…").click();
+    settle(&mut h);
+    assert!(store.take().is_empty(), "nothing asked of alephd");
+    h.get_by_label_contains("choose a new name");
+    assert_eq!(std::fs::read(&path).unwrap(), b"precious");
+    drop(h);
+    assert_eq!(std::fs::read(&path).unwrap(), b"precious");
+}
+
+/// (Review Focus 1.) An empty file that was already there is used, and
+/// stays when the backup does not happen.
+#[test]
+fn an_empty_file_already_there_is_used_and_not_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("empty.aleph");
+    std::fs::write(&path, b"").unwrap();
+    let (mut h, _store, fd, file) = start_backup(&path);
+    drop(fd);
+    drop(file);
+    settle(&mut h);
+    h.get_by_label_contains("the operation may not have gone through");
+    assert!(path.exists(), "not the manager's to remove");
+}
+
+#[test]
+fn a_closed_dialog_does_nothing() {
+    let (mut h, store, _) = backup_window(vec![Pick::Cancelled]);
+    h.get_by_label("BACK UP…").click();
+    settle(&mut h);
+    assert!(store.take().is_empty());
+    assert!(h.query_by_label("Backup path").is_none());
+}
+
+/// (Review Focus 2.) No portal: the typed-path field, prefilled, and
+/// working.
+#[test]
+fn without_a_portal_the_path_is_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("typed.aleph");
+    let (mut h, store, _) = backup_window(vec![Pick::Unavailable]);
+    h.get_by_label("BACK UP…").click();
+    settle(&mut h);
+    assert!(store.take().is_empty());
+    // (Prefilled with the dated name in the home directory.)
+    let home = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/home");
+    let prefilled = h.get_by_label("Backup path").value().unwrap_or_default();
+    assert!(
+        prefilled.starts_with(&format!("{}/aleph-backup-", home.display()))
+            && prefilled.ends_with(".aleph"),
+        "{prefilled}"
+    );
+    retype(&mut h, "Backup path", path.to_str().unwrap());
+    h.get_by_label("BACK UP").click();
+    settle(&mut h);
+    let (_fd, _file) = backup_request(&store);
+    assert!(path.exists());
+    assert!(h.query_by_label("Backup path").is_none());
+}
+
+/// (Review Focus 2.) The typed path refuses a file with content, says why,
+/// and stays open for another name.
+#[test]
+fn the_typed_path_refuses_an_existing_file_and_stays_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.aleph");
+    std::fs::write(&path, b"precious").unwrap();
+    let (mut h, store, _) = backup_window(vec![]);
+    h.get_by_label("type a path instead").click();
+    frames(&mut h);
+    retype(&mut h, "Backup path", path.to_str().unwrap());
+    h.get_by_label("BACK UP").click();
+    frames(&mut h);
+    assert!(store.take().is_empty());
+    h.get_by_label("Backup path");
+    // (In the status line and under the field.)
+    assert_eq!(
+        h.query_all_by_label_contains("choose a new name").count(),
+        2,
+        "the reason shows"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"precious");
+    // Another name works.
+    let new = dir.path().join("new.aleph");
+    retype(&mut h, "Backup path", new.to_str().unwrap());
+    h.get_by_label("BACK UP").click();
+    settle(&mut h);
+    let (_fd, _file) = backup_request(&store);
+    assert!(new.exists());
+    assert_eq!(std::fs::read(&path).unwrap(), b"precious");
+}
+
+#[test]
+fn type_a_path_instead_opens_the_field_and_cancel_closes_it() {
+    let (mut h, store, picker) = backup_window(vec![]);
+    h.get_by_label("type a path instead").click();
+    frames(&mut h);
+    h.get_by_label("Backup path");
+    assert!(picker.asked.lock().unwrap().is_empty(), "no dialog");
+    h.get_by_label("CANCEL").click();
+    frames(&mut h);
+    assert!(h.query_by_label("Backup path").is_none());
+    assert!(store.take().is_empty());
+}
+
+/// Leaving the ADMIN page forgets the typed-path field.
+#[test]
+fn leaving_the_page_forgets_the_typed_path() {
+    let (mut h, store, _) = backup_window(vec![]);
+    h.get_by_label("type a path instead").click();
+    frames(&mut h);
+    h.get_by_label("Backup path");
+    h.get_by_label("SECRETS").click();
+    frames(&mut h);
+    open_admin(&mut h, &store, admin_status());
+    assert!(h.query_by_label("Backup path").is_none());
+    h.get_by_label("BACK UP…");
+}
+
+/// A path chosen after the ADMIN page was left is not used: no file, and
+/// it says so.
+#[test]
+fn a_path_chosen_after_leaving_the_page_is_not_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (tx, rx) = std::sync::mpsc::channel();
+    struct Slow(std::sync::Mutex<Option<std::sync::mpsc::Receiver<Pick>>>);
+    impl aleph_gui::filepicker::FilePicker for Slow {
+        fn start(
+            &self,
+            _: String,
+            _: Option<std::path::PathBuf>,
+        ) -> std::sync::mpsc::Receiver<Pick> {
+            self.0.lock().unwrap().take().unwrap()
+        }
+    }
+    let slow = Slow(std::sync::Mutex::new(Some(rx)));
+    let (mut h, store, _) = window_with(ThemeChoice::Neon, vault(), SIZE, move |m| {
+        m.with_file_picker(Box::new(slow))
+    });
+    open_admin(&mut h, &store, admin_status());
+    h.get_by_label("BACK UP…").click();
+    frames(&mut h);
+    h.get_by_label("SECRETS").click();
+    frames(&mut h);
+    tx.send(Pick::Chosen(path.clone())).unwrap();
+    settle(&mut h);
+    assert!(store.take().is_empty());
+    assert!(!path.exists());
+    h.get_by_label_contains("not backed up");
+}
+
+/// (Review Focus 2.) alephd refuses a path inside its own directory: the
+/// reason shows, and the empty file goes.
+#[test]
+fn a_refused_backup_says_why_and_removes_the_empty_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("inside.aleph");
+    let (mut h, store, _fd, file) = start_backup(&path);
+    drop(file);
+    store.send(done_event(
+        "back up",
+        Some("a backup cannot go inside /home/u/.local/share/aleph"),
+    ));
+    settle(&mut h);
+    h.get_by_label_contains("cannot back up: a backup cannot go inside");
+    assert!(!path.exists());
+}
+
+/// A lock during the confirmation: it may have gone through, but the file
+/// is still empty, so it goes.
+#[test]
+fn a_lock_during_a_backup_removes_the_empty_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, store, _fd, _file) = start_backup(&path);
+    store.send(StoreEvent::Vault(Vault::Locked));
+    settle(&mut h);
+    h.get_by_label_contains("the vault locked: the operation may not have gone through");
+    assert!(!path.exists());
+}
+
+/// alephd going away during the confirmation removes the empty file.
+#[test]
+fn alephd_going_away_during_a_backup_removes_the_empty_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, store, _fd, _file) = start_backup(&path);
+    store.send(StoreEvent::Vault(Vault::Unreachable("gone".into())));
+    settle(&mut h);
+    h.get_by_label_contains("alephd went away");
+    assert!(!path.exists());
+}
+
+/// Leaving the window during the confirmation removes the empty file.
+#[test]
+fn leaving_the_window_during_a_backup_removes_the_empty_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, _store, _fd, _file) = start_backup(&path);
+    h.event(egui::Event::WindowFocused(false));
+    settle(&mut h);
+    h.get_by_label_contains("the window lost focus");
+    assert!(!path.exists());
+}
+
+/// EXIT during the confirmation removes the empty file.
+#[test]
+fn exit_during_a_backup_removes_the_empty_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, _store, _fd, _file) = start_backup(&path);
+    h.get_by_label("EXIT").click();
+    settle(&mut h);
+    assert!(h.state().exit_requested());
+    assert!(!path.exists());
+}
+
+/// A sealed vault: the path is chosen and the file made first, then alephd
+/// unlocks, then the confirmation.
+#[test]
+fn a_sealed_vault_unlocks_first_for_a_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, store, _) = backup_window_in(Vault::Locked, vec![Pick::Chosen(path.clone())]);
+    h.get_by_label("BACK UP…").click();
+    settle(&mut h);
+    assert!(matches!(only(store.take()), Request::Unlock));
+    assert!(path.exists(), "the file is made before the unlock");
+    store.send(done_event("unlock", None));
+    store.send(StoreEvent::Vault(vault()));
+    settle(&mut h);
+    assert!(
+        store
+            .take()
+            .iter()
+            .any(|r| matches!(r, Request::Backup(..)))
+    );
+    assert!(path.exists());
+}
+
+/// A dismissed unlock removes the file it had made.
+#[test]
+fn a_dismissed_unlock_removes_the_backup_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, store, _) = backup_window_in(Vault::Locked, vec![Pick::Chosen(path.clone())]);
+    h.get_by_label("BACK UP…").click();
+    settle(&mut h);
+    assert!(matches!(only(store.take()), Request::Unlock));
+    store.send(StoreEvent::Done {
+        request: "unlock",
+        error: None,
+        dismissed: true,
+    });
+    settle(&mut h);
+    h.get_by_label_contains("the unlock was dismissed: nothing was changed");
+    assert!(!path.exists());
+}
+
+/// A failed unlock removes the file it had made.
+#[test]
+fn a_failed_unlock_removes_the_backup_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, store, _) = backup_window_in(Vault::Locked, vec![Pick::Chosen(path.clone())]);
+    h.get_by_label("BACK UP…").click();
+    settle(&mut h);
+    assert!(matches!(only(store.take()), Request::Unlock));
+    store.send(done_event("unlock", Some("the TPM is busy")));
+    settle(&mut h);
+    h.get_by_label_contains("cannot unlock: the TPM is busy");
+    assert!(!path.exists());
+}
+
+/// alephd going away while the backup waits for the unlock removes the
+/// file.
+#[test]
+fn alephd_going_away_during_the_unlock_removes_the_backup_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, store, _) = backup_window_in(Vault::Locked, vec![Pick::Chosen(path.clone())]);
+    h.get_by_label("BACK UP…").click();
+    settle(&mut h);
+    assert!(matches!(only(store.take()), Request::Unlock));
+    store.send(StoreEvent::Vault(Vault::Unreachable("gone".into())));
+    settle(&mut h);
+    h.get_by_label_contains("alephd went away: nothing was changed");
+    assert!(!path.exists());
+}
+
+/// The page left while the backup waits for the unlock: once open, it is
+/// not run, says so, and its file goes.
+#[test]
+fn a_backup_unlocked_after_leaving_the_page_is_not_run_and_its_file_goes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mine.aleph");
+    let (mut h, store, _) = backup_window_in(Vault::Locked, vec![Pick::Chosen(path.clone())]);
+    h.get_by_label("BACK UP…").click();
+    settle(&mut h);
+    assert!(matches!(only(store.take()), Request::Unlock));
+    h.get_by_label("SECRETS").click();
+    frames(&mut h);
+    store.send(done_event("unlock", None));
+    store.send(StoreEvent::Vault(vault()));
+    settle(&mut h);
+    assert!(
+        !store
+            .take()
+            .iter()
+            .any(|r| matches!(r, Request::Backup(..)))
+    );
+    h.get_by_label_contains("the vault unlocked: the operation was not run");
+    assert!(!path.exists());
 }
