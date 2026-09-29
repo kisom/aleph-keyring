@@ -101,9 +101,12 @@ the AUR copies are flattened):
   `enable`s, and a message: "restart alephd to pick up the new binary:
   systemctl --user restart alephd.service" (a running `alephd` keeps the old
   binary).
-- **`post_remove`:** `systemctl --global disable alephd.socket`;
-  `systemctl disable --now aleph-tpmd.socket aleph-tpmd.service`;
-  `systemctl daemon-reload`; prints that the vault in
+- **`pre_remove`:** `systemctl --global disable alephd.socket`;
+  `systemctl disable --now aleph-tpmd.socket aleph-tpmd.service`. These run
+  before pacman deletes the files (and only if the removal guard did not
+  abort), because by `post_remove` the unit files are gone and `systemctl
+  disable` could fail or leave dangling `wants` symlinks.
+- **`post_remove`:** `systemctl daemon-reload`; prints that the vault in
   `~/.local/share/aleph` is left in place. Failures of `systemctl` are
   reported and never fail the transaction.
 - Every `systemctl` call is `|| true`-safe outside a booted systemd, and the
@@ -159,7 +162,7 @@ dependencies; then:
    version runs `post_upgrade` and prints the restart message.
 5. **Guard:** with a fake `/var/lib/aleph/manifest.json`, `pacman -R` fails
    and the package stays installed; likewise with a fake activation file
-   for a test user; with both gone `-R` succeeds and `post_remove`'s calls
+   for a test user; with both gone `-R` succeeds and `pre_remove`'s and `post_remove`'s calls
    are the spec's; the variant switch is exercised and its outcome recorded.
 6. **`namcap`** on each PKGBUILD and each built package, if `namcap` is
    installed: its findings are printed as warnings and never fail the run.

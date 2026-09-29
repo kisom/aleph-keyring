@@ -22,18 +22,32 @@ if [ -e "$state_dir/manifest.json" ]; then
     refuse=1
 fi
 
-# (Command substitution, not a pipeline into `while`: the loop runs in a
-# subshell, and only what it prints comes back.)
-served=$($passwd_cmd 2>/dev/null | while IFS=: read -r user _ _ _ _ home _; do
+# (Run once, so a failure is seen; then the users go through a `while` inside
+# a command substitution: the loop runs in a subshell, and only what it
+# prints comes back.)
+if ! users=$($passwd_cmd 2>/dev/null); then
+    echo "aleph: could not list the users: $passwd_cmd failed; not checking their Secret Service files" >&2
+    users=
+fi
+
+served=$(printf '%s\n' "$users" | while IFS=: read -r user _ _ _ _ home _; do
     [ -n "$home" ] || continue
     file="$home/.local/share/dbus-1/services/org.freedesktop.secrets.service"
+    [ -e "$file" ] || continue
+    # (Only a regular file is read: a FIFO or /dev/zero there would block
+    # root forever inside the transaction.)
+    [ -f "$file" ] || continue
+    if [ ! -r "$file" ]; then
+        echo "aleph: cannot read $file: not checking it" >&2
+        continue
+    fi
     if grep -qs /usr/lib/aleph/alephd "$file" 2>/dev/null; then
         echo "$user"
     fi
 done)
 
 if [ -n "$served" ]; then
-    for user in $served; do
+    printf '%s\n' "$served" | while IFS= read -r user; do
         echo "aleph: $user still has aleph serving the Secret Service:" >&2
     done
     echo "  as that user, run 'alephctl setup --revert' first" >&2

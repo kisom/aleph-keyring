@@ -9,7 +9,7 @@ _aleph_systemctl() {
         echo "aleph: systemctl is not available: skipped 'systemctl $*'" >&2
         return 0
     fi
-    systemctl "$@" || echo "aleph: 'systemctl $*' failed: run it yourself" >&2
+    systemctl "$@" || echo "aleph: 'systemctl $*' failed (an enable may still have taken effect): check it yourself" >&2
     return 0
 }
 
@@ -31,9 +31,14 @@ post_upgrade() {
     echo "aleph: restart alephd to pick up the new binary: systemctl --user restart alephd.service"
 }
 
-post_remove() {
+# (The disables run in pre_remove, while the unit files are still there:
+# by post_remove pacman has deleted them.)
+pre_remove() {
     _aleph_systemctl --global disable alephd.socket
     _aleph_systemctl disable --now aleph-tpmd.socket aleph-tpmd.service
+}
+
+post_remove() {
     _aleph_systemctl daemon-reload
     echo "aleph: removed. The vault in ~/.local/share/aleph is left in place."
 }

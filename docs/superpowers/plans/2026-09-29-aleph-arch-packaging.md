@@ -46,7 +46,7 @@ Each line has a test in the task named after it.
 ## File Structure
 
 - Create `packaging/arch/common.sh`: `aleph_build`, `aleph_package` (sourced by each PKGBUILD).
-- Create `packaging/arch/aleph-keyring.install`: the hook (`post_install`, `post_upgrade`, `post_remove`).
+- Create `packaging/arch/aleph-keyring.install`: the hook (`post_install`, `post_upgrade`, `pre_remove`, `post_remove`).
 - Create `packaging/arch/remove-guard`: the checker (installed as `/usr/lib/aleph/remove-guard`).
 - Create `packaging/arch/aleph-remove-guard.hook`: the alpm hook (installed to `/usr/share/libalpm/hooks/`).
 - Create `packaging/arch/local/PKGBUILD`, `packaging/arch/aleph-keyring-git/PKGBUILD`, `packaging/arch/aleph-keyring/PKGBUILD` (and a symlink `aleph-keyring.install` in each directory, plus `common.sh`).
@@ -69,7 +69,7 @@ Each line has a test in the task named after it.
 - Consumes: nothing from earlier tasks.
 - Produces:
   - `remove-guard` (POSIX sh): exits 0 (allow) or 1 (refuse, with a message on stderr). Reads `ALEPH_STATE_DIR` (default `/var/lib/aleph`) and `ALEPH_PASSWD_CMD` (default `getent passwd`), for the tests.
-  - `aleph-keyring.install`: functions `post_install`, `post_upgrade`, `post_remove`, using `systemctl` from the `PATH` and printing to stdout/stderr; never returning non-zero.
+  - `aleph-keyring.install`: functions `post_install`, `post_upgrade`, `pre_remove`, `post_remove`, using `systemctl` from the `PATH` and printing to stdout/stderr; never returning non-zero.
   - `aleph-remove-guard.hook`: the alpm hook.
   - `make pkg-shell-test`: runs both shell tests.
 
@@ -310,9 +310,13 @@ grep -q "restart alephd to pick up the new binary: systemctl --user restart alep
     && pass "post_upgrade says to restart alephd" \
     || fail "post_upgrade prints the restart message"
 
+run pre_remove
+[ "$(calls)" = "--global disable alephd.socket;disable --now aleph-tpmd.socket aleph-tpmd.service;" ] \
+    && pass "pre_remove disables both sockets" \
+    || fail "pre_remove calls: $(calls)"
+
 run post_remove
-[ "$(calls)" = "--global disable alephd.socket;disable --now aleph-tpmd.socket aleph-tpmd.service;daemon-reload;" ] \
-    && pass "post_remove disables both sockets and reloads" \
+[ "$(calls)" = "daemon-reload;" ] && pass "post_remove reloads" \
     || fail "post_remove calls: $(calls)"
 grep -q ".local/share/aleph" "$tmp/out" && pass "post_remove says the vault is left in place" \
     || fail "post_remove mentions the vault"
@@ -320,7 +324,7 @@ grep -q ".local/share/aleph" "$tmp/out" && pass "post_remove says the vault is l
 # (Review Focus 2.) A systemctl that fails never fails the scriptlet, and
 # each skipped step is named.
 stub_systemctl 1
-for fn in post_install post_upgrade post_remove; do
+for fn in post_install post_upgrade pre_remove post_remove; do
     if run "$fn"; then
         pass "$fn returns success when systemctl fails"
     else
@@ -333,13 +337,13 @@ grep -q "aleph-tpmd.socket" "$tmp/err" && pass "a failed enable names the socket
 
 # No systemctl at all (a chroot): success, and one message says so.
 rm -f "$bin/systemctl"
-for fn in post_install post_upgrade post_remove; do
+for fn in post_install post_upgrade pre_remove post_remove; do
     if PATH="$bin:/usr/bin:/bin" sh -c ". '$hook'; $fn" >"$tmp/out" 2>"$tmp/err"; then
         pass "$fn returns success with no systemctl"
     else
         fail "$fn failed the transaction with no systemctl"
     fi
-    grep -qi "systemctl" "$tmp/err" "$tmp/out" && pass "$fn says systemctl was not available" \
+    grep -q 'systemctl is not available' "$tmp/err" && pass "$fn says systemctl was not available" \
         || fail "$fn is silent when systemctl is missing"
 done
 
@@ -372,7 +376,7 @@ _aleph_systemctl() {
         echo "aleph: systemctl is not available: skipped 'systemctl $*'" >&2
         return 0
     fi
-    systemctl "$@" || echo "aleph: 'systemctl $*' failed: run it yourself" >&2
+    systemctl "$@" || echo "aleph: 'systemctl $*' failed (an enable may still have taken effect): check it yourself" >&2
     return 0
 }
 
@@ -394,9 +398,14 @@ post_upgrade() {
     echo "aleph: restart alephd to pick up the new binary: systemctl --user restart alephd.service"
 }
 
-post_remove() {
+# (The disables run in pre_remove, while the unit files are still there:
+# by post_remove pacman has deleted them.)
+pre_remove() {
     _aleph_systemctl --global disable alephd.socket
     _aleph_systemctl disable --now aleph-tpmd.socket aleph-tpmd.service
+}
+
+post_remove() {
     _aleph_systemctl daemon-reload
     echo "aleph: removed. The vault in ~/.local/share/aleph is left in place."
 }
@@ -756,7 +765,7 @@ pacman -R --noconfirm aleph-keyring-local >/tmp/remove3.out 2>&1 && pass "pacman
     || { cat /tmp/remove3.out >&2; fail "pacman -R succeeds with nothing wired in"; }
 got=$(tr '\n' ';' </tmp/systemctl.calls)
 want='--global disable alephd.socket;disable --now aleph-tpmd.socket aleph-tpmd.service;daemon-reload;'
-[ "$got" = "$want" ] && pass "post_remove ran the spec's systemctl calls" || fail "post_remove calls: $got"
+[ "$got" = "$want" ] && pass "pre_remove and post_remove ran the spec's systemctl calls" || fail "removal calls: $got"
 
 # --- namcap: warnings only
 pacman -Qip "$pkg" >/dev/null && namcap "$pkg" >/tmp/namcap.out 2>&1 || true
@@ -1276,7 +1285,7 @@ git commit -m 'docs: install section, manual checks and decisions for the Arch p
 - Three packages (local via `make pkg`, `-git`, release), sources, `pkgver` rules, placeholder checksum + `make pkgbuild-release`: Tasks 2–3.
 - Common metadata (depends, makedepends, provides, conflicts, backup, no gnome-keyring conflict), `build()` (locked release build), no `check()` suite, `package()` = `install.sh`'s layout plus guard and licenses: Task 2 (`common.sh`, `files.expected`, the test compares them).
 - Shared body in `common.sh`, AUR flattening (`make pkgbuild-aur`), `.install` symlinks: Tasks 2–3.
-- The install hook (`post_install`, `post_upgrade`, `post_remove`, systemctl failures never fail, messages): Task 1 (test with a stub `systemctl`, including no systemctl).
+- The install hook (`post_install`, `post_upgrade`, `pre_remove`, `post_remove`, systemctl failures never fail, messages): Task 1 (test with a stub `systemctl`, including no systemctl).
 - The removal guard as an alpm `PreTransaction` hook with `AbortOnFail` + the checker (manifest, activation file for any user, messages naming both commands): Task 1 (script and its tests) and Task 2 (through pacman).
 - The recorded variant-switch limitation: Task 3 (a note printed by the test), Task 5 (documented).
 - The package test (build all three, metadata, files and modes, hook calls, guard, co-install refusal, namcap warnings): Tasks 2–3.

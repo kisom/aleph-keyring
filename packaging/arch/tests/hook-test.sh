@@ -51,9 +51,14 @@ grep -q "restart alephd to pick up the new binary: systemctl --user restart alep
     && pass "post_upgrade says to restart alephd" \
     || fail "post_upgrade prints the restart message"
 
+run pre_remove || true
+[ "$(calls)" = "--global disable alephd.socket;disable --now aleph-tpmd.socket aleph-tpmd.service;" ] \
+    && pass "pre_remove disables both sockets" \
+    || fail "pre_remove calls: $(calls)"
+
 run post_remove || true
-[ "$(calls)" = "--global disable alephd.socket;disable --now aleph-tpmd.socket aleph-tpmd.service;daemon-reload;" ] \
-    && pass "post_remove disables both sockets and reloads" \
+[ "$(calls)" = "daemon-reload;" ] \
+    && pass "post_remove reloads" \
     || fail "post_remove calls: $(calls)"
 grep -q ".local/share/aleph" "$tmp/out" && pass "post_remove says the vault is left in place" \
     || fail "post_remove mentions the vault"
@@ -61,7 +66,7 @@ grep -q ".local/share/aleph" "$tmp/out" && pass "post_remove says the vault is l
 # (Review Focus 2.) A systemctl that fails never fails the scriptlet, and
 # each skipped step is named.
 stub_systemctl 1
-for fn in post_install post_upgrade post_remove; do
+for fn in post_install post_upgrade pre_remove post_remove; do
     if run "$fn"; then
         pass "$fn returns success when systemctl fails"
     else
@@ -69,7 +74,7 @@ for fn in post_install post_upgrade post_remove; do
     fi
 done
 run post_install || true
-grep -q "aleph-tpmd.socket" "$tmp/err" && pass "a failed enable names the socket" \
+grep -q "aleph-tpmd.socket.*failed (an enable may still have taken effect): check it yourself" "$tmp/err" && pass "a failed enable names the socket and says it may have worked" \
     || fail "a failed enable is reported (stderr: $(cat "$tmp/err"))"
 
 # No systemctl at all (a chroot): success, and one message says so. The PATH
@@ -84,13 +89,13 @@ done
 if PATH="$nobin" sh -c 'command -v systemctl' >/dev/null 2>&1; then
     fail "the no-systemctl PATH still reaches a systemctl"
 fi
-for fn in post_install post_upgrade post_remove; do
+for fn in post_install post_upgrade pre_remove post_remove; do
     if PATH="$nobin" sh -c ". '$hook'; $fn" >"$tmp/out" 2>"$tmp/err"; then
         pass "$fn returns success with no systemctl"
     else
         fail "$fn failed the transaction with no systemctl"
     fi
-    grep -qi "systemctl" "$tmp/err" "$tmp/out" && pass "$fn says systemctl was not available" \
+    grep -q 'systemctl is not available' "$tmp/err" && pass "$fn says systemctl was not available" \
         || fail "$fn is silent when systemctl is missing"
 done
 

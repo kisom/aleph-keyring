@@ -22,7 +22,7 @@ world() {
 
 run() {
     ALEPH_STATE_DIR="$tmp/state" ALEPH_PASSWD_CMD="cat $tmp/passwd" \
-        sh "$guard" >"$tmp/out" 2>"$tmp/err"
+        timeout 5 sh "$guard" >"$tmp/out" 2>"$tmp/err"
 }
 
 expect_allow() {
@@ -77,6 +77,8 @@ chmod 000 "$f"
 if [ "$(id -u)" -ne 0 ]; then
     # An unreadable file cannot be read as aleph's: allow, but never crash.
     expect_allow "an unreadable activation file is not taken for aleph's"
+    grep -q "org.freedesktop.secrets.service" "$tmp/err" \
+        || fail "an unreadable activation file is warned about, naming it"
 fi
 chmod 644 "$f"
 
@@ -85,10 +87,34 @@ world
 expect_allow "no users at all allows"
 
 world
-if ALEPH_STATE_DIR="$tmp/state" ALEPH_PASSWD_CMD="false" sh "$guard" >/dev/null 2>&1; then
+if ALEPH_STATE_DIR="$tmp/state" ALEPH_PASSWD_CMD="false" sh "$guard" >"$tmp/out" 2>"$tmp/err"; then
     pass "a passwd command that fails does not refuse by itself"
 else
     fail "a passwd command that fails does not refuse by itself"
+fi
+grep -q "could not list the users" "$tmp/err" \
+    || fail "a passwd command that fails is warned about (stderr: $(cat "$tmp/err"))"
+
+# A user name with a space is printed intact, one line per user.
+world
+mkdir -p "$tmp/homes/eve/.local/share/dbus-1/services"
+printf 'eve smith:x:1004:1004::%s/homes/eve:/bin/sh\n' "$tmp" >"$tmp/passwd"
+printf "Exec=/usr/lib/aleph/alephd\n" \
+    >"$tmp/homes/eve/.local/share/dbus-1/services/org.freedesktop.secrets.service"
+expect_refuse "a user whose name has a space refuses"
+grep -q "aleph: eve smith still has aleph serving" "$tmp/err" \
+    || fail "the refusal prints the name intact (stderr: $(cat "$tmp/err"))"
+
+# A FIFO (or a symlink to one) at the activation path must not hang root.
+if command -v mkfifo >/dev/null 2>&1; then
+    world
+    mkfifo "$tmp/homes/alice/.local/share/dbus-1/services/org.freedesktop.secrets.service"
+    expect_allow "a FIFO at the activation path is not read (no hang)"
+    world
+    mkfifo "$tmp/fifo"
+    ln -s "$tmp/fifo" "$tmp/homes/alice/.local/share/dbus-1/services/org.freedesktop.secrets.service"
+    expect_allow "a symlink to a FIFO at the activation path is not read (no hang)"
+    rm -f "$tmp/fifo"
 fi
 
 if [ "$failures" -ne 0 ]; then
