@@ -253,6 +253,7 @@ pub fn admin_section(
             if slot.stale {
                 ui.label(RichText::new("STALE").color(p.warning));
             }
+            // Deliberately ignores `view.waiting`: RETRY needs no unlock.
             if b.retry && named_button(ui, "RETRY", format!("Retry keyslot {}", slot.label), up) {
                 action = Some(AdminAction::Retry(slot.id.clone()));
             }
@@ -332,7 +333,11 @@ pub fn ask_section(ui: &mut egui::Ui, p: &Palette, ask: &Ask) -> Option<bool> {
     let mut answer = None;
     ui.horizontal(|ui| {
         let no = ui.button("No");
-        no.request_focus();
+        // Only while nothing has focus: a request every frame would pull
+        // focus back from Yes when Tab moves it there.
+        if ui.memory(|m| m.focused().is_none()) {
+            no.request_focus();
+        }
         if no.clicked() {
             answer = Some(false);
         }
