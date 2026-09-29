@@ -5,6 +5,7 @@
 pub mod app;
 pub mod clipboard;
 pub mod conversation;
+pub mod filepicker;
 pub mod link;
 pub mod manager;
 pub mod pretty;
