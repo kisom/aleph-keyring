@@ -1,8 +1,8 @@
 #!/bin/sh
 # Generate the AUR copies (`make pkgbuild-aur`): one directory per published
-# package under target/aur/, each holding a PKGBUILD with the shared build
-# and package functions inlined (an AUR repository holds only the files in
-# its own directory), the install file as a real file, and the .SRCINFO
+# package under target/aur/, each holding a PKGBUILD with common.sh inlined
+# (an AUR repository holds only the files in its own directory), the
+# install file as a real file, and the .SRCINFO
 # that `makepkg --printsrcinfo` writes. Refuses the release package while
 # its checksum is still the placeholder. The local package is never
 # published. Nothing here contacts the AUR: publishing is the owner's.
@@ -13,7 +13,8 @@ arch=${ALEPH_ARCH_DIR:-$(cd "$(dirname "$0")" && pwd)}
 out=${ALEPH_AUR_OUT:-$arch/../../target/aur}
 makepkg=${ALEPH_MAKEPKG:-makepkg}
 
-if grep -q "^sha256sums=('SKIP')" "$arch/aleph-keyring/PKGBUILD"; then
+# (SKIP anywhere in the array, quoted or not.)
+if grep -Eq "^sha256sums=\(([^)]*[ '\"])?SKIP['\") ]" "$arch/aleph-keyring/PKGBUILD"; then
     echo "pkgbuild-aur: the release package's checksum is still SKIP: run" >&2
     echo "  make pkgbuild-release TAG=vX.Y.Z  (after pushing the tag) first" >&2
     exit 1
@@ -33,7 +34,7 @@ for name in aleph-keyring aleph-keyring-git; do
     {
         grep -v '^  \. "\$startdir/common.sh"$' "$arch/$name/PKGBUILD"
         echo
-        echo "# --- Shared by the aleph packages (packaging/arch/ in the repository)."
+        echo "# --- common.sh, shared by the aleph packages (packaging/arch/ in the repository)."
         echo
         cat "$arch/common.sh"
     } >"$dir/PKGBUILD"

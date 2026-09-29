@@ -30,22 +30,29 @@ SH
 chmod +x "$tmp/makepkg"
 export ALEPH_MAKEPKG="$tmp/makepkg" STUB_LOG="$tmp/makepkg.log"
 
+# The scratch copy's release checksum line, whatever the repository holds
+# (a filled-in PKGBUILD is committed after a release).
+set_sums() {
+    sed "s|^sha256sums=.*|$1|" "$tmp/arch/aleph-keyring/PKGBUILD" >"$tmp/PKGBUILD.new"
+    cat "$tmp/PKGBUILD.new" >"$tmp/arch/aleph-keyring/PKGBUILD"
+}
+
 # (Review Focus 4.) The AUR generator refuses the release package while its
-# checksum is a placeholder.
-if grep -q "^sha256sums=('SKIP')" "$tmp/arch/aleph-keyring/PKGBUILD"; then
+# checksum is a placeholder, in any spelling, and writes nothing.
+real=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+for line in "sha256sums=(SKIP)" "sha256sums=(\"SKIP\")" "sha256sums=('SKIP')" \
+    "sha256sums=('$real' 'SKIP')" "sha256sums=('SKIP')  # FILLED AT RELEASE by make pkgbuild-release TAG=vX.Y.Z"; do
+    set_sums "$line"
+    rm -rf "$tmp/aur"
     if ALEPH_ARCH_DIR="$tmp/arch" ALEPH_AUR_OUT="$tmp/aur" \
         sh "$tmp/arch/pkgbuild-aur.sh" >"$tmp/out" 2>"$tmp/err"; then
-        fail "pkgbuild-aur refuses the release package while its checksum is SKIP"
+        fail "pkgbuild-aur refuses the release package with $line"
     else
-        grep -qi "checksum" "$tmp/err" && pass "pkgbuild-aur refuses a SKIP checksum and says why" \
-            || fail "the refusal explains the checksum"
+        grep -qi "checksum" "$tmp/err" && pass "pkgbuild-aur refuses $line and says why" \
+            || fail "pkgbuild-aur's refusal of $line explains the checksum"
     fi
-    [ ! -e "$tmp/aur" ] && pass "a refused run writes nothing" || fail "a refused run writes nothing"
-else
-    fail "the release PKGBUILD in the repository starts with the placeholder checksum"
-fi
-grep -q 'FILLED AT RELEASE' "$tmp/arch/aleph-keyring/PKGBUILD" \
-    && pass "the placeholder is marked FILLED AT RELEASE" || fail "the placeholder is marked FILLED AT RELEASE"
+    [ ! -e "$tmp/aur" ] && pass "a refused run writes nothing ($line)" || fail "a refused run writes nothing ($line)"
+done
 
 # pkgbuild-release refuses a malformed tag and leaves the file alone.
 cp "$tmp/arch/aleph-keyring/PKGBUILD" "$tmp/PKGBUILD.before"
@@ -90,7 +97,8 @@ ALEPH_ARCH_DIR="$tmp/arch" ALEPH_AUR_OUT="$tmp/aur" sh "$tmp/arch/pkgbuild-aur.s
 for name in aleph-keyring aleph-keyring-git; do
     f="$tmp/aur/$name/PKGBUILD"
     [ -f "$f" ] && pass "$name has a flattened PKGBUILD" || fail "$name has a flattened PKGBUILD"
-    grep -q 'common.sh' "$f" && fail "$name's PKGBUILD no longer sources common.sh" || pass "$name inlines common.sh"
+    grep -Eq '(^|[;&|[:space:]])(\.|source)[[:space:]]+"?\$\{?startdir' "$f" \
+        && fail "$name's PKGBUILD no longer sources a file from \$startdir" || pass "$name sources nothing from \$startdir"
     grep -q '^aleph_build()' "$f" && grep -q '^aleph_package()' "$f" && pass "$name carries the shared functions" \
         || fail "$name carries the shared functions"
     head -n 1 "$f" | grep -q '^# Maintainer: ' && pass "$name's PKGBUILD starts with the maintainer line" \

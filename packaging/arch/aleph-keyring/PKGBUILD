@@ -1,8 +1,7 @@
 # Maintainer: K. Isom <kyle@imap.cc>
 # A tagged release (the AUR's aleph-keyring). `make pkgbuild-release TAG=vX.Y.Z`
 # sets pkgver and the tarball's checksum after the tag is pushed;
-# `make pkgbuild-aur` writes the published copy, with the shared functions
-# inlined.
+# `make pkgbuild-aur` writes the published copy, with common.sh inlined.
 pkgname=aleph-keyring
 pkgver=0.1.0
 pkgrel=1
@@ -24,7 +23,7 @@ install=aleph-keyring.install
 source=("aleph-keyring-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')  # FILLED AT RELEASE by `make pkgbuild-release TAG=vX.Y.Z`
 
-# (aleph_build builds in "$srcdir/$_srcname", GitHub's tarball's top
+# (common.sh builds in "$srcdir/$_srcname", GitHub's tarball's top
 # directory: $srcdir is not set yet when makepkg reads this top level.)
 _srcname="aleph-keyring-$pkgver"
 

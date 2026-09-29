@@ -416,6 +416,24 @@ grep -qx "	sha256sums = $relsum" "$work/aur/aleph-keyring/.SRCINFO" 2>/dev/null 
     && pass "aleph-keyring: the AUR .SRCINFO carries the release checksum" \
     || fail "aleph-keyring: the AUR .SRCINFO carries the release checksum"
 
+# What the variant switch did, from pacman's output and what is installed
+# after it: switch_outcome OUTPUT INSTALLED prints `allowed` (the -git
+# package replaced the local one), `blocked` (the removal guard refused it:
+# its message is in the output and the local package stays), or
+# `failed: <pacman's first error line>` for anything else.
+# >>> switch_outcome
+switch_outcome() {
+    if [ "$2" = "aleph-keyring-git " ]; then
+        echo allowed
+    elif [ "$2" = "aleph-keyring-local " ] && grep -q 'aleph: the PAM changes are still in place' "$1"; then
+        echo blocked
+    else
+        e=$(grep -m 1 '^error:' "$1" || head -n 1 "$1")
+        echo "failed: ${e:-(no output)}"
+    fi
+}
+# <<< switch_outcome
+
 # --- the three refuse to install together
 if [ -n "$gitpkg" ] && [ -n "$relpkg" ]; then
     # (By exact name: pacman -Q aleph-keyring also finds a package that
@@ -447,12 +465,8 @@ if [ -n "$gitpkg" ] && [ -n "$relpkg" ]; then
     # is recorded, not asserted.
     mkdir -p /var/lib/aleph && : >/var/lib/aleph/manifest.json
     pacman -U --noconfirm --ask=4 "$gitpkg" >/tmp/switch.out 2>&1 || true
-    case $(installed) in
-    "aleph-keyring-local ") echo "note - variant switch under the guard: blocked" ;;
-    "aleph-keyring-git ") echo "note - variant switch under the guard: allowed" ;;
-    *) echo "note - variant switch under the guard: unclear (installed: $(installed))"; cat /tmp/switch.out ;;
-    esac
-    sed -n '/remove-guard\|aleph is\|alephctl\|conflict/p' /tmp/switch.out | sed 's/^/    /'
+    echo "note - variant switch under the guard: $(switch_outcome /tmp/switch.out "$(installed)")"
+    sed -n '/remove-guard\|aleph:\|alephctl\|conflict\|^error:/p' /tmp/switch.out | sed 's/^/    /'
     rm -f /var/lib/aleph/manifest.json
 
     # With the -git package installed, the release one is refused too.
@@ -471,13 +485,24 @@ else
 fi
 
 # --- namcap on each PKGBUILD and each package: warnings only
+# (The repository-style PKGBUILDs, as built here, source common.sh from
+# $startdir; the flattened AUR copies are the files actually published.)
 : >/tmp/namcap.out
-for f in "$work/tree/target/pkg/local/PKGBUILD" "$pkg" "$pkgs/git/PKGBUILD" "${gitpkg:-}" \
-    "$pkgs/release/PKGBUILD" "${relpkg:-}"; do
-    [ -n "$f" ] && [ -f "$f" ] || continue
-    namcap "$f" >>/tmp/namcap.out 2>&1 || true
-done
-[ -s /tmp/namcap.out ] && { echo "namcap (warnings only):"; cat /tmp/namcap.out; }
+namcap_one() { # LABEL FILE
+    [ -n "$2" ] && [ -f "$2" ] || return 0
+    printf '== %s: %s\n' "$1" "$2" >>/tmp/namcap.out
+    namcap "$2" >>/tmp/namcap.out 2>&1 || true
+}
+namcap_one "repository PKGBUILD (local)" "$work/tree/target/pkg/local/PKGBUILD"
+namcap_one "package (local)" "$pkg"
+namcap_one "repository PKGBUILD (-git)" "$pkgs/git/PKGBUILD"
+namcap_one "package (-git)" "${gitpkg:-}"
+namcap_one "repository PKGBUILD (release)" "$pkgs/release/PKGBUILD"
+namcap_one "package (release)" "${relpkg:-}"
+namcap_one "AUR PKGBUILD (published, -git)" "$work/aur/aleph-keyring-git/PKGBUILD"
+namcap_one "AUR PKGBUILD (published, release)" "$work/aur/aleph-keyring/PKGBUILD"
+echo "namcap (warnings only):"
+cat /tmp/namcap.out
 
 if [ "$failures" -ne 0 ]; then
     printf '%s failure(s)\n' "$failures" >&2
