@@ -56,7 +56,9 @@ settable with `alephctl config set`.
       `StoreEvent::Config` (the values, or the error).
     - `SetConfigs(OwnedFd, BTreeMap<String, String>)`: calls `SetConfigs`
       with one end of a socketpair; the window answers on the other, as
-      for `Reauth`. It ends with the usual `Done`.
+      for `Reauth`. The store's `Done` reports the call (accepted or
+      refused); the outcome of the confirmation and the save arrives on
+      the socket, as `Done` for the window's confirmation.
   - `settings_page.rs` (new): the SETTINGS screen's state (the form, the
     presets, input checking) and drawing, so `manager.rs` does not grow
     much.
@@ -90,8 +92,12 @@ settable with `alephctl config set`.
 ```
 
 - **Sidebar:** `SECRETS` and `SETTINGS` (Admin, 5d, comes later).
-  SETTINGS works while the vault is locked (`GetConfig` and the
-  confirmation both do).
+  SETTINGS opens while the vault is locked: the values show (`GetConfig`
+  needs no unlock) and DISPLAY works. Saving VAULT does not: alephd's
+  re-authentication refuses a locked vault, so Save is disabled then,
+  with the line "Unlock the vault to save: confirming it is you needs
+  it open." (Found while planning: an earlier draft said the
+  confirmation works locked; it does not.)
 
 ### VAULT
 
@@ -122,6 +128,11 @@ settable with `alephctl config set`.
 - **Unsaved edits are kept** when the owner goes to SECRETS and back;
   they end with Save, Cancel, or closing the window.
 - While a save or a read is running, the VAULT controls are disabled.
+- `SetConfigs` closes its conversation without a message (a note would
+  hold the confirmation on screen for 6 s); the window says
+  `SETTINGS SAVED` itself. A save that fails after the confirmation
+  (the file cannot be written) closes with alephd's message, which the
+  window puts in the error line.
 - With alephd not reachable (`LINK DOWN`), VAULT shows the status and is
   disabled; it is read again when the link returns.
 
@@ -168,7 +179,8 @@ settable with `alephctl config set`.
 - **alephd, `SetConfigs` through a scripted prompter:** accepted (all
   values written, one save, the live configuration changed with no
   restart); refused at the confirmation (nothing written); one bad value
-  (refused before any question, nothing written); an empty map (refused).
+  (refused before any question, nothing written); an empty map (refused);
+  a locked vault (refused, nothing written).
 - **The store against a real alephd** on a private bus: `Config` reads
   the values; `SetConfigs` changes them and the file.
 - **Unit tests:** presets and custom values in both directions (a preset,
