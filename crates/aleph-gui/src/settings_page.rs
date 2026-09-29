@@ -285,7 +285,12 @@ impl Form {
 pub enum Values {
     /// Not asked for yet (or nothing worth keeping when the link went).
     Unknown,
-    Loading,
+    /// Asked for; `stale` once the link went while the answer was on its
+    /// way (that answer, which still comes, is then not shown: it is asked
+    /// for again).
+    Loading {
+        stale: bool,
+    },
     Failed(String),
     Ready(Form),
 }
@@ -297,7 +302,7 @@ impl Values {
         match self {
             Self::Failed(_) => true,
             Self::Ready(f) => !f.edited(),
-            Self::Unknown | Self::Loading => false,
+            Self::Unknown | Self::Loading { .. } => false,
         }
     }
 }
@@ -708,7 +713,8 @@ mod tests {
         f.on_suspend = false;
         assert!(!Values::Ready(f).is_stale());
         assert!(!Values::Unknown.is_stale());
-        assert!(!Values::Loading.is_stale());
+        assert!(!Values::Loading { stale: false }.is_stale());
+        assert!(!Values::Loading { stale: true }.is_stale());
     }
 
     #[test]

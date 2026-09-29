@@ -621,8 +621,11 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     let was_unlocked = matches!(self.vault, Vault::Unlocked(_));
                     self.vault = v;
                     let up = matches!(self.vault, Vault::Locked | Vault::Unlocked(_));
-                    if !up && matches!(self.values, Values::Loading) {
-                        self.values = Values::Unknown;
+                    if !up && let Values::Loading { stale } = &mut self.values {
+                        // (Its answer still comes, an error most likely:
+                        // taken for no read's, it asks again. Forgotten, it
+                        // would be taken for the next read's.)
+                        *stale = true;
                     }
                     if !up && self.rebase_on_config == Rebase::Asked {
                         // (Its answer may never come: asked again when back.)
@@ -640,11 +643,12 @@ impl<S: Store, B: Backend> Manager<S, B> {
                             self.values = Values::Unknown;
                         }
                     }
-                    // (The link went: what it was reading may never come; the
+                    // (The link went: the answer on its way still comes (every
+                    // read is answered), but is not shown: it asks again; the
                     // link came back, or the vault locked or unlocked: what
                     // STATUS says has changed.)
                     if !up && matches!(self.admin, AdminState::Loading { .. }) {
-                        self.admin = AdminState::Unknown;
+                        self.admin.invalidate();
                     }
                     let opened = matches!(self.vault, Vault::Unlocked(_));
                     if up && !was_up || opened != was_unlocked {
@@ -695,12 +699,15 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     }
                 }
                 StoreEvent::Config(result) => {
-                    // (Only the answer being waited for.)
-                    if matches!(self.values, Values::Loading) {
+                    // (Only the answer being waited for; one from before the
+                    // link went is not shown, but asked for again.)
+                    if matches!(self.values, Values::Loading { stale: false }) {
                         self.values = match result.and_then(|v| Form::from_values(&v)) {
                             Ok(form) => Values::Ready(form),
                             Err(e) => Values::Failed(e),
                         };
+                    } else if matches!(self.values, Values::Loading { stale: true }) {
+                        self.values = Values::Unknown;
                     } else if self.rebase_on_config == Rebase::Asked {
                         // (After an interrupted save: what is in force now
                         // is the baseline; the edits stay.)
@@ -1041,7 +1048,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
     fn ask_config(&mut self) {
         let up = matches!(self.vault, Vault::Locked | Vault::Unlocked(_));
         if self.page == Page::Settings && up && matches!(self.values, Values::Unknown) {
-            self.values = Values::Loading;
+            self.values = Values::Loading { stale: false };
             // (A fresh read: nothing left to rebase.)
             self.rebase_on_config = Rebase::No;
             self.store.request(Request::Config);
@@ -1289,7 +1296,7 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     self.values = Values::Unknown;
                 }
             }
-            Values::Unknown | Values::Loading => {
+            Values::Unknown | Values::Loading { .. } => {
                 if up {
                     ui.label("LOADING…");
                 } else if let Vault::Unreachable(why) = &self.vault {

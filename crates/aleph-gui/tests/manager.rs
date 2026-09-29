@@ -1216,6 +1216,35 @@ fn with_alephd_down_the_settings_wait_for_the_link() {
     assert!(matches!(only(store.take()), Request::Config));
 }
 
+/// The link lost while the settings are on their way, and back: the late
+/// answer of the read from before is not taken for the next one's; they
+/// are read again, and that answer shows.
+#[test]
+fn a_settings_answer_from_before_the_link_went_is_read_again() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("SETTINGS").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Config));
+    store.send(StoreEvent::Vault(Vault::Unreachable("gone".into())));
+    frames(&mut h);
+    store.send(StoreEvent::Vault(Vault::Locked));
+    frames(&mut h);
+    // The old request's answer.
+    store.send(StoreEvent::Config(Err("no reply from alephd".into())));
+    frames(&mut h);
+    assert!(h.query_by_label_contains("no reply from alephd").is_none());
+    assert!(h.query_by_label("RETRY").is_none());
+    let requests = store.take();
+    assert!(
+        requests.iter().any(|r| matches!(r, Request::Config)),
+        "{requests:?}"
+    );
+    store.send(config("900", "300", "true"));
+    frames(&mut h);
+    h.get_by_label("Idle lock: 15 min");
+    assert!(store.take().is_empty(), "asked again after it came");
+}
+
 #[test]
 fn a_failed_read_says_why_and_can_be_retried() {
     let (mut h, store, _) = window(ThemeChoice::Neon, vault());
@@ -2018,6 +2047,35 @@ fn with_alephd_down_the_page_waits_for_the_link() {
     store.send(StoreEvent::Vault(Vault::Locked));
     frames(&mut h);
     assert!(matches!(only(store.take()), Request::Status));
+}
+
+/// The link lost while STATUS is on its way, and back: the late answer of
+/// the read from before (an error, say) is not taken for the next one's;
+/// it is read again, and that answer shows.
+#[test]
+fn a_status_answer_from_before_the_link_went_is_read_again() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("ADMIN").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Status));
+    store.send(StoreEvent::Vault(Vault::Unreachable("gone".into())));
+    frames(&mut h);
+    store.send(StoreEvent::Vault(Vault::Locked));
+    frames(&mut h);
+    // The old request's answer.
+    store.send(StoreEvent::Status(Err("no reply from alephd".into())));
+    frames(&mut h);
+    assert!(h.query_by_label_contains("no reply from alephd").is_none());
+    assert!(h.query_by_label("RETRY").is_none());
+    let requests = store.take();
+    assert!(
+        requests.iter().any(|r| matches!(r, Request::Status)),
+        "{requests:?}"
+    );
+    store.send(StoreEvent::Status(Ok(admin_status())));
+    frames(&mut h);
+    h.get_by_label("vault  unlocked · secret service  alephd");
+    assert!(store.take().is_empty(), "asked again after it came");
 }
 
 #[test]
