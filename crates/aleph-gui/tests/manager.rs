@@ -105,15 +105,41 @@ fn window(theme: ThemeChoice, v: Vault) -> (Window, Fake, Clip) {
 }
 
 fn window_sized(theme: ThemeChoice, v: Vault, size: [f32; 2]) -> (Window, Fake, Clip) {
-    let store = Fake::default();
-    let clip = Clip::default();
-    let home = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/home");
+    window_with(theme, v, size, |m| m)
+}
+
+/// A window whose manager `configure` may change before it first draws.
+fn window_with(
+    theme: ThemeChoice,
+    v: Vault,
+    size: [f32; 2],
+    configure: impl FnOnce(Manager<Fake, Clip>) -> Manager<Fake, Clip>,
+) -> (Window, Fake, Clip) {
     let settings = Settings {
         theme,
         scanlines: true,
         ..Settings::default()
     };
-    let mut m = Manager::new(store.clone(), clip.clone(), settings, Some(home), true);
+    window_full(settings, v, size, configure)
+}
+
+/// `window_with`, from whole settings (a reveal hold, say).
+fn window_full(
+    settings: Settings,
+    v: Vault,
+    size: [f32; 2],
+    configure: impl FnOnce(Manager<Fake, Clip>) -> Manager<Fake, Clip>,
+) -> (Window, Fake, Clip) {
+    let store = Fake::default();
+    let clip = Clip::default();
+    let home = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/home");
+    let mut m = configure(Manager::new(
+        store.clone(),
+        clip.clone(),
+        settings,
+        Some(home),
+        true,
+    ));
     m.confirm_guard = Duration::ZERO;
     let palette = m.palette.clone();
     store.send(StoreEvent::Vault(v));
@@ -861,6 +887,361 @@ fn the_list_divider_drags() {
         (wide - expected).abs() < 20.0,
         "the list ends at {wide}, not {expected}"
     );
+}
+
+// --- SETTINGS ---
+
+fn config(idle: &str, prompt: &str, suspend: &str) -> StoreEvent {
+    StoreEvent::Config(Ok(BTreeMap::from([
+        ("lock.on_suspend".to_string(), suspend.to_string()),
+        ("lock.on_screen_lock".to_string(), "true".to_string()),
+        ("lock.idle_timeout".to_string(), idle.to_string()),
+        ("prompt.timeout".to_string(), prompt.to_string()),
+    ])))
+}
+
+/// Open SETTINGS, answer the read with the given values.
+fn open_settings(h: &mut Window, store: &Fake, idle: &str, prompt: &str, suspend: &str) {
+    h.get_by_label("SETTINGS").click();
+    frames(h);
+    assert!(matches!(only(store.take()), Request::Config));
+    store.send(config(idle, prompt, suspend));
+    frames(h);
+}
+
+/// Pick `option` in the list called `control` (its label ends with the
+/// selected value: `Idle lock: 15 min`).
+fn pick(h: &mut Window, control: &str, option: &str) {
+    h.get_by_label_contains(&format!("{control}:")).click();
+    frames(h);
+    h.get_by_label(option).click();
+    frames(h);
+}
+
+fn press(h: &mut Window, label: &str, key: egui::Key, times: usize) {
+    h.get_by_label(label).focus();
+    frames(h);
+    for _ in 0..times {
+        h.key_press(key);
+        frames(h);
+    }
+}
+
+fn saved_map(fd_and_map: Request) -> (std::os::fd::OwnedFd, BTreeMap<String, String>) {
+    match fd_and_map {
+        Request::SetConfigs(fd, map) => (fd, map),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn settings_are_asked_for_once_and_shown() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("SETTINGS").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Config));
+    h.get_by_label("LOADING…");
+    frames(&mut h);
+    // (Not asked again while it is on its way.)
+    assert!(store.take().is_empty());
+    store.send(config("900", "300", "true"));
+    frames(&mut h);
+    h.get_by_label("Lock on suspend");
+    h.get_by_label("Lock on screen lock");
+    h.get_by_label("Idle lock: 15 min");
+    h.get_by_label("Prompt timeout: 5 min");
+    h.get_by_label_contains("Saving asks you to confirm it is you, once");
+    // (Unlocked: nothing to say about a seal.)
+    assert!(
+        h.query_by_label("VAULT SEALED :: SAVE WILL UNLOCK FIRST")
+            .is_none()
+    );
+    assert_eq!(h.state().page(), aleph_gui::manager::Page::Settings);
+}
+
+/// One SAVE, one confirmation, only the changed keys (Review Focus 5:
+/// and one request: the page shows the confirmation, not the button).
+#[test]
+fn an_edit_is_saved_with_one_confirmation_and_only_the_changed_keys() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_settings(&mut h, &store, "0", "300", "true");
+    pick(&mut h, "Idle lock", "15 min");
+    pick(&mut h, "Prompt timeout", "30 min");
+    h.get_by_label("Lock on screen lock").click();
+    frames(&mut h);
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    let (fd, map) = saved_map(only(store.take()));
+    assert_eq!(
+        map,
+        BTreeMap::from([
+            ("lock.idle_timeout".to_string(), "900".to_string()),
+            ("lock.on_screen_lock".to_string(), "false".to_string()),
+            ("prompt.timeout".to_string(), "1800".to_string()),
+        ])
+    );
+    // The confirmation is in the window; the form is not (no second Save).
+    assert!(h.query_by_label("SAVE").is_none());
+    let alephd = alephd_confirms(fd, "hunter2");
+    settle(&mut h);
+    type_into(&mut h, "Login password", "hunter2");
+    h.key_press(egui::Key::Enter);
+    frames(&mut h);
+    assert!(alephd.join().unwrap());
+    settle(&mut h);
+    h.get_by_label_contains("SETTINGS SAVED");
+    // Read again, and the reveal window opened: it is the same proof.
+    assert!(matches!(only(store.take()), Request::Config));
+    assert!(
+        !h.state()
+            .reauth
+            .needed(Instant::now(), Duration::from_secs(300))
+    );
+    store.send(config("900", "1800", "true"));
+    frames(&mut h);
+    assert!(!h.state().form().unwrap().edited());
+}
+
+#[test]
+fn cancel_puts_the_read_values_back() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_settings(&mut h, &store, "0", "300", "true");
+    pick(&mut h, "Idle lock", "15 min");
+    assert!(h.state().form().unwrap().edited());
+    h.get_by_label("CANCEL").click();
+    frames(&mut h);
+    assert!(!h.state().form().unwrap().edited());
+    h.get_by_label("Idle lock: Off");
+    assert!(store.take().is_empty());
+}
+
+#[test]
+fn a_bad_custom_value_shows_why_and_cannot_be_saved() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_settings(&mut h, &store, "0", "300", "true");
+    pick(&mut h, "Prompt timeout", "Custom…");
+    // Chosen, still empty: nothing said yet, and nothing to save.
+    assert!(h.query_by_label("whole minutes, 1 to 1440").is_none());
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    assert!(store.take().is_empty());
+    type_into(&mut h, "Prompt timeout minutes", "1441");
+    h.get_by_label("whole minutes, 1 to 1440");
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    assert!(store.take().is_empty());
+    // Fixed as typed: the message goes and SAVE works.
+    press(&mut h, "Prompt timeout minutes", egui::Key::Backspace, 4);
+    type_into(&mut h, "Prompt timeout minutes", "20");
+    assert!(h.query_by_label("whole minutes, 1 to 1440").is_none());
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    let (_fd, map) = saved_map(only(store.take()));
+    assert_eq!(
+        map,
+        BTreeMap::from([("prompt.timeout".to_string(), "1200".to_string())])
+    );
+}
+
+#[test]
+fn a_value_that_is_not_a_preset_is_shown_and_kept() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_settings(&mut h, &store, "7200", "90", "true");
+    h.get_by_label("Idle lock: Custom (120 min)");
+    h.get_by_label("Prompt timeout: Custom (90 s)");
+    // Nothing edited: Save has nothing to send.
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    assert!(store.take().is_empty());
+}
+
+#[test]
+fn the_suspend_warning_shows_while_it_is_off() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_settings(&mut h, &store, "0", "300", "true");
+    assert!(h.query_by_label_contains("hibernation image").is_none());
+    h.get_by_label("Lock on suspend").click();
+    frames(&mut h);
+    h.get_by_label_contains(
+        "the master key can reach a hibernation image unless swap is encrypted",
+    );
+    h.get_by_label("Lock on suspend").click();
+    frames(&mut h);
+    assert!(h.query_by_label_contains("hibernation image").is_none());
+}
+
+#[test]
+fn unsaved_edits_are_kept_across_screens() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_settings(&mut h, &store, "0", "300", "true");
+    pick(&mut h, "Idle lock", "15 min");
+    h.get_by_label("SECRETS").click();
+    frames(&mut h);
+    h.get_by_label("GitHub token");
+    h.get_by_label("SETTINGS").click();
+    frames(&mut h);
+    assert!(store.take().is_empty(), "read again");
+    h.get_by_label("Idle lock: 15 min");
+    assert!(h.state().form().unwrap().edited());
+}
+
+/// A locked vault: the values show, Save says it will unlock first, asks
+/// alephd to unlock, and confirms and saves once the vault is open.
+#[test]
+fn a_locked_vault_says_save_unlocks_first_and_then_saves() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, Vault::Locked);
+    open_settings(&mut h, &store, "0", "300", "true");
+    pick(&mut h, "Idle lock", "15 min");
+    h.get_by_label("VAULT SEALED :: SAVE WILL UNLOCK FIRST");
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    // Only the unlock, so far: no confirmation until the vault is open.
+    assert!(matches!(only(store.take()), Request::Unlock));
+    h.get_by_label("waiting for the unlock…");
+    store.send(StoreEvent::Done {
+        request: "unlock",
+        error: None,
+        dismissed: false,
+    });
+    frames(&mut h);
+    assert!(store.take().is_empty(), "the vault is not open yet");
+    store.send(StoreEvent::Vault(vault()));
+    frames(&mut h);
+    let (_fd, map) = saved_map(only(store.take()));
+    assert_eq!(
+        map,
+        BTreeMap::from([("lock.idle_timeout".to_string(), "900".to_string())])
+    );
+}
+
+/// A dismissed (or failed) unlock saves nothing and leaves the edits; a
+/// vault unlocked later, by anything else, does not resume the save.
+#[test]
+fn a_dismissed_unlock_saves_nothing() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, Vault::Locked);
+    open_settings(&mut h, &store, "0", "300", "true");
+    pick(&mut h, "Idle lock", "15 min");
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Unlock));
+    store.send(StoreEvent::Done {
+        request: "unlock",
+        error: None,
+        dismissed: true,
+    });
+    frames(&mut h);
+    h.get_by_label_contains("nothing was saved");
+    h.get_by_label("Idle lock: 15 min");
+    store.send(StoreEvent::Vault(vault()));
+    frames(&mut h);
+    assert!(store.take().is_empty(), "nothing asked for the save");
+    // (And the note is gone with the seal.)
+    assert!(
+        h.query_by_label("VAULT SEALED :: SAVE WILL UNLOCK FIRST")
+            .is_none()
+    );
+}
+
+/// SETTINGS left while the unlock runs: the save is not made, and the
+/// window says so (nothing is dropped silently).
+#[test]
+fn a_save_waiting_for_the_unlock_says_so_when_it_is_not_made() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, Vault::Locked);
+    open_settings(&mut h, &store, "0", "300", "true");
+    pick(&mut h, "Idle lock", "15 min");
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Unlock));
+    h.get_by_label("SECRETS").click();
+    frames(&mut h);
+    store.send(StoreEvent::Vault(vault()));
+    frames(&mut h);
+    assert!(store.take().is_empty(), "saved from another screen");
+    h.get_by_label_contains("the settings were not saved");
+    assert!(h.state().form().unwrap().edited());
+}
+
+#[test]
+fn with_alephd_down_the_settings_wait_for_the_link() {
+    let (mut h, store, _) = window(
+        ThemeChoice::Neon,
+        Vault::Unreachable("org.freedesktop.secrets has no owner".into()),
+    );
+    h.get_by_label("SETTINGS").click();
+    frames(&mut h);
+    assert!(store.take().is_empty(), "nothing to ask");
+    h.get_by_label("LINK DOWN");
+    store.send(StoreEvent::Vault(Vault::Locked));
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Config));
+}
+
+#[test]
+fn a_failed_read_says_why_and_can_be_retried() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    h.get_by_label("SETTINGS").click();
+    frames(&mut h);
+    store.take();
+    store.send(StoreEvent::Config(Err("no reply from alephd".into())));
+    frames(&mut h);
+    h.get_by_label_contains("no reply from alephd");
+    h.get_by_label("RETRY").click();
+    frames(&mut h);
+    assert!(matches!(only(store.take()), Request::Config));
+}
+
+/// A save alephd refuses (before it asks) keeps the edits and says why.
+#[test]
+fn a_refused_save_keeps_the_edits_and_says_why() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_settings(&mut h, &store, "0", "300", "true");
+    pick(&mut h, "Idle lock", "15 min");
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    let (_fd, _) = saved_map(only(store.take()));
+    store.send(StoreEvent::Done {
+        request: "save the settings",
+        error: Some("prompt.timeout must be 1 to 86400 seconds, not \"0\"".into()),
+        dismissed: false,
+    });
+    frames(&mut h);
+    h.get_by_label_contains("cannot save the settings");
+    h.get_by_label("Idle lock: 15 min");
+    assert!(h.state().form().unwrap().edited());
+}
+
+/// (Review Focus 5.) A confirmation that is cancelled saves nothing and
+/// leaves the edits.
+#[test]
+fn a_cancelled_confirmation_saves_nothing() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_settings(&mut h, &store, "0", "300", "true");
+    pick(&mut h, "Idle lock", "15 min");
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    let (fd, _) = saved_map(only(store.take()));
+    drop(fd);
+    settle(&mut h);
+    h.get_by_label_contains("nothing was saved");
+    assert!(store.take().is_empty(), "no re-read: nothing changed");
+    h.get_by_label("Idle lock: 15 min");
+}
+
+/// (Review Focus 5.) The vault locking under a confirmation ends it and
+/// says nothing was saved.
+#[test]
+fn a_lock_during_the_confirmation_saves_nothing() {
+    let (mut h, store, _) = window(ThemeChoice::Neon, vault());
+    open_settings(&mut h, &store, "0", "300", "true");
+    pick(&mut h, "Idle lock", "15 min");
+    h.get_by_label("SAVE").click();
+    frames(&mut h);
+    let (_fd, _) = saved_map(only(store.take()));
+    store.send(StoreEvent::Vault(Vault::Locked));
+    settle(&mut h);
+    h.get_by_label_contains("nothing was saved");
+    h.get_by_label("Idle lock: 15 min");
+    assert!(h.state().form().unwrap().edited());
 }
 
 /// Every view, in both themes.

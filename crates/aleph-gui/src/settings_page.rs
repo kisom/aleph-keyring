@@ -5,6 +5,10 @@
 
 use std::collections::BTreeMap;
 
+use egui::{RichText, TextEdit};
+
+use crate::theme::Palette;
+
 pub const SUSPEND: &str = "lock.on_suspend";
 pub const SCREEN_LOCK: &str = "lock.on_screen_lock";
 pub const IDLE: &str = "lock.idle_timeout";
@@ -251,6 +255,133 @@ pub enum Values {
     Loading,
     Failed(String),
     Ready(Form),
+}
+
+/// A section's header line.
+pub fn header(ui: &mut egui::Ui, p: &Palette, text: &str) {
+    ui.label(RichText::new(text).strong().color(p.accent));
+    ui.add_space(6.0);
+}
+
+/// What the VAULT section is allowed to do now.
+pub struct VaultView {
+    /// The controls work (alephd can be reached).
+    pub enabled: bool,
+    /// The vault is locked: Save will unlock it first (and says so).
+    pub sealed: bool,
+    /// An unlock asked for by Save is under way: Save waits for it.
+    pub unlocking: bool,
+}
+
+/// What the person asked of the VAULT section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VaultAction {
+    Save,
+    Cancel,
+}
+
+/// A drop-down list whose accessible name is `name: selected` (so a
+/// screen reader, and the tests, hear what is chosen).
+fn named_combo(ui: &mut egui::Ui, name: &str, selected: &str, body: impl FnOnce(&mut egui::Ui)) {
+    let r = egui::ComboBox::from_id_salt(name)
+        .selected_text(selected)
+        .show_ui(ui, body);
+    let label = format!("{name}: {selected}");
+    ui.ctx()
+        .accesskit_node_builder(r.response.id, move |n| n.set_label(label));
+}
+
+/// One duration row: the list, and the minutes field beside it while
+/// "Custom…" is chosen, with its message under.
+fn timeout_row(ui: &mut egui::Ui, p: &Palette, name: &str, t: &mut Timeout) {
+    ui.horizontal(|ui| {
+        ui.label(name);
+        let selected = match &t.choice {
+            Choice::Preset(s) => describe(t.kind, *s),
+            Choice::Kept => describe(t.kind, t.read()),
+            Choice::Custom => "Custom…".to_string(),
+        };
+        let kind = t.kind;
+        let kept = t.kept_text();
+        named_combo(ui, name, &selected, |ui| {
+            for &s in kind.presets() {
+                ui.selectable_value(&mut t.choice, Choice::Preset(s), describe(kind, s));
+            }
+            if let Some(text) = kept {
+                ui.selectable_value(&mut t.choice, Choice::Kept, text);
+            }
+            if kind.custom_minutes()
+                && ui
+                    .selectable_label(t.choice == Choice::Custom, "Custom…")
+                    .clicked()
+            {
+                t.choose_custom();
+            }
+        });
+        if t.choice == Choice::Custom {
+            let r = ui.add(
+                TextEdit::singleline(&mut t.typed)
+                    .hint_text("minutes")
+                    .desired_width(70.0),
+            );
+            let field = format!("{name} minutes");
+            ui.ctx()
+                .accesskit_node_builder(r.id, move |n| n.set_label(field));
+            ui.label("min");
+        }
+    });
+    if let Some(e) = t.error() {
+        ui.label(RichText::new(e).small().color(p.warning));
+    }
+}
+
+/// The VAULT section's form. `Save` and `Cancel` are returned, never done
+/// here.
+pub fn vault_section(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    form: &mut Form,
+    view: &VaultView,
+) -> Option<VaultAction> {
+    ui.add_enabled_ui(view.enabled, |ui| {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut form.on_suspend, "Lock on suspend");
+            ui.label(
+                RichText::new("(also covers hibernate)")
+                    .small()
+                    .color(p.muted),
+            );
+        });
+        ui.checkbox(&mut form.on_screen_lock, "Lock on screen lock");
+        timeout_row(ui, p, "Idle lock", &mut form.idle);
+        timeout_row(ui, p, "Prompt timeout", &mut form.prompt);
+    });
+    if !form.on_suspend {
+        ui.label(RichText::new(SUSPEND_WARNING).color(p.warning));
+    }
+    ui.add_space(8.0);
+    ui.label(RichText::new(SAVE_NOTE).small().color(p.muted));
+    if view.sealed {
+        // (Beside the buttons, and not small: what Save will do first.)
+        ui.label(RichText::new(LOCKED_NOTE).strong().color(p.warning));
+    }
+    let mut action = None;
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(view.enabled && form.edited(), egui::Button::new("CANCEL"))
+            .clicked()
+        {
+            action = Some(VaultAction::Cancel);
+        }
+        let ready = view.enabled && !view.unlocking && form.edited() && form.valid();
+        if ui.add_enabled(ready, egui::Button::new("SAVE")).clicked() {
+            action = Some(VaultAction::Save);
+        }
+        if view.unlocking {
+            ui.label("waiting for the unlock…");
+        }
+    });
+    action
 }
 
 #[cfg(test)]

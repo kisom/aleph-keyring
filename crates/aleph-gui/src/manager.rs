@@ -15,6 +15,7 @@ use crate::clipboard::{Backend, Clipboard};
 use crate::conversation::{Screen, shown};
 use crate::reauth::Reauth;
 use crate::settings::Settings;
+use crate::settings_page::{self, Form, Values, VaultAction, VaultView};
 use crate::store::{Collection, Item, Request, Store, StoreEvent, Vault};
 use crate::theme::{self, Palette};
 
@@ -46,6 +47,13 @@ pub enum Want {
     Show,
     Copy,
     Edit,
+}
+
+/// Which screen the window shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Page {
+    Secrets,
+    Settings,
 }
 
 /// A secret on screen.
@@ -123,6 +131,14 @@ pub struct Manager<S: Store, B: Backend> {
     still: bool,
     pub palette: Palette,
     watch: Option<theme::Watch>,
+    page: Page,
+    /// The VAULT section's values: kept across screens, so edits stay.
+    values: Values,
+    /// The confirmation on screen is for a settings save, not a reveal.
+    saving_settings: bool,
+    /// SAVE was pressed while the vault was locked: it asked alephd to
+    /// unlock, and saves (with the edits as they are then) once it is open.
+    save_after_unlock: bool,
 }
 
 impl<S: Store, B: Backend> Manager<S, B> {
@@ -156,6 +172,22 @@ impl<S: Store, B: Backend> Manager<S, B> {
             still,
             palette,
             watch: None,
+            page: Page::Secrets,
+            values: Values::Unknown,
+            saving_settings: false,
+            save_after_unlock: false,
+        }
+    }
+
+    pub fn page(&self) -> Page {
+        self.page
+    }
+
+    /// The VAULT form, once read.
+    pub fn form(&self) -> Option<&Form> {
+        match &self.values {
+            Values::Ready(f) => Some(f),
+            _ => None,
         }
     }
 
@@ -199,21 +231,23 @@ impl<S: Store, B: Backend> Manager<S, B> {
         self.awaiting = Some((path, want));
     }
 
-    fn start_confirm(&mut self, ctx: &egui::Context, path: String, want: Want) {
+    /// Open the confirmation in this window: the prompter's end of a new
+    /// socketpair (for alephd), or `None` (with the reason in the status).
+    fn open_confirm(&mut self, ctx: &egui::Context) -> Option<UnixStream> {
         let Ok((ours, theirs)) = UnixStream::pair() else {
             self.status = Some("cannot start the confirmation".into());
-            return;
+            return None;
         };
         let Ok(reader) = ours.try_clone() else {
             self.status = Some("cannot start the confirmation".into());
-            return;
+            return None;
         };
         // (Each message from alephd wakes the window: with animations off
         // nothing else draws the next frame.)
         let wake = ctx.clone();
         let Ok(events) = crate::link::spawn_reader(reader, move || wake.request_repaint()) else {
             self.status = Some("cannot start the confirmation".into());
-            return;
+            return None;
         };
         let mut app = PromptApp::new(
             ours,
@@ -225,8 +259,25 @@ impl<S: Store, B: Backend> Manager<S, B> {
         app.embedded = true;
         app.input_guard = self.confirm_guard;
         self.confirm = Some(app);
+        Some(theirs)
+    }
+
+    fn start_confirm(&mut self, ctx: &egui::Context, path: String, want: Want) {
+        let Some(theirs) = self.open_confirm(ctx) else {
+            return;
+        };
         self.pending = Some((path, want));
         self.store.request(Request::Reauth(theirs.into()));
+    }
+
+    /// Save the changed VAULT settings: one confirmation for all of them.
+    fn start_save(&mut self, ctx: &egui::Context, changes: BTreeMap<String, String>) {
+        let Some(theirs) = self.open_confirm(ctx) else {
+            return;
+        };
+        self.saving_settings = true;
+        self.store
+            .request(Request::SetConfigs(theirs.into(), changes));
     }
 
     /// End the confirmation, if one runs (alephd holds its conversation
@@ -244,6 +295,9 @@ impl<S: Store, B: Backend> Manager<S, B> {
         self.awaiting = None;
         self.pending = None;
         self.end_confirm();
+        if std::mem::take(&mut self.saving_settings) {
+            self.status = Some("the vault locked: nothing was saved".into());
+        }
         if let Mode::Edit {
             secret, original, ..
         } = &mut self.mode
@@ -265,7 +319,24 @@ impl<S: Store, B: Backend> Manager<S, B> {
                     {
                         self.sealed();
                     }
+                    let was_up = matches!(self.vault, Vault::Locked | Vault::Unlocked(_));
                     self.vault = v;
+                    let up = matches!(self.vault, Vault::Locked | Vault::Unlocked(_));
+                    if !up && matches!(self.values, Values::Loading) {
+                        self.values = Values::Unknown;
+                    }
+                    if up && !was_up {
+                        // (The link is back: read again, unless there are
+                        // edits, which stay.)
+                        let again = match &self.values {
+                            Values::Failed(_) => true,
+                            Values::Ready(f) => !f.edited(),
+                            _ => false,
+                        };
+                        if again {
+                            self.values = Values::Unknown;
+                        }
+                    }
                     // (The selection goes if its item or folder went.)
                     let gone = match &self.selected {
                         Some(Selection::Item(p)) => self.item(p).is_none(),
@@ -296,8 +367,15 @@ impl<S: Store, B: Backend> Manager<S, B> {
                             Some(format!("'{}' was deleted elsewhere", shown(&label, NAME)));
                     }
                 }
-                // (The SETTINGS screen takes it.)
-                StoreEvent::Config(_) => {}
+                StoreEvent::Config(result) => {
+                    // (Only the answer being waited for.)
+                    if matches!(self.values, Values::Loading) {
+                        self.values = match result.and_then(|v| Form::from_values(&v)) {
+                            Ok(form) => Values::Ready(form),
+                            Err(e) => Values::Failed(e),
+                        };
+                    }
+                }
                 StoreEvent::SecretFailed { path, .. } => {
                     // (Only if it is the one asked for last; the error is
                     // in the `Done` that follows.)
@@ -357,7 +435,37 @@ impl<S: Store, B: Backend> Manager<S, B> {
                         }
                     }
                 }
-                StoreEvent::Done { request, error, .. } => {
+                StoreEvent::Done {
+                    request,
+                    error,
+                    dismissed,
+                } => {
+                    if request == "unlock"
+                        && self.save_after_unlock
+                        && (error.is_some() || dismissed)
+                    {
+                        // (A save waiting for the unlock is dropped; the edits stay.
+                        // A successful unlock keeps it: `resume_save` runs when the
+                        // vault event shows it open.)
+                        self.save_after_unlock = false;
+                        self.status = Some(match &error {
+                            Some(e) => format!("cannot unlock: {e}; nothing was saved"),
+                            None => "the unlock was dismissed: nothing was saved".into(),
+                        });
+                        continue;
+                    }
+                    if request == "read the settings" {
+                        // (The VAULT section shows why, with RETRY.)
+                        continue;
+                    }
+                    if request == "save the settings" {
+                        if let Some(e) = error {
+                            self.end_confirm();
+                            self.saving_settings = false;
+                            self.status = Some(format!("cannot save the settings: {e}"));
+                        }
+                        continue;
+                    }
                     let save = SAVES.contains(&request) && self.saving > 0;
                     match error {
                         Some(e) => {
@@ -397,12 +505,18 @@ impl<S: Store, B: Backend> Manager<S, B> {
             self.shown = None;
             self.end_confirm();
             self.pending = None;
+            if std::mem::take(&mut self.saving_settings) {
+                self.status = Some("the window lost focus: nothing was saved".into());
+            }
             if matches!(self.awaiting, Some((_, Want::Show))) {
                 self.awaiting = None;
             }
         }
         self.take_events();
+        self.resume_save(&ui.ctx().clone());
+        self.ask_config();
         let p = self.palette.clone();
+        let mut go = None;
         egui::Panel::left("aleph-nav")
             .exact_size(130.0)
             .resizable(false)
@@ -411,13 +525,38 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 ui.label(RichText::new("ALEPH").strong().color(p.accent));
                 ui.label(RichText::new("// VAULT").small().color(p.accent));
                 ui.add_space(16.0);
-                ui.label(RichText::new("SECRETS").strong());
+                // (Not while a confirmation runs: it is drawn in the page.)
+                ui.add_enabled_ui(self.confirm.is_none(), |ui| {
+                    for (page, name) in [(Page::Secrets, "SECRETS"), (Page::Settings, "SETTINGS")] {
+                        let picked = self.page == page;
+                        if ui
+                            .add(Button::selectable(picked, RichText::new(name).strong()))
+                            .clicked()
+                        {
+                            go = Some(page);
+                        }
+                    }
+                });
             });
+        if let Some(page) = go {
+            self.page = page;
+        }
+        match self.page {
+            Page::Secrets => self.secrets(ui, &p, now),
+            Page::Settings => self.settings_screen(ui, &p, now),
+        }
+        if self.settings.scanlines && !self.still {
+            theme::paint_scanlines(ui.ctx(), &p);
+        }
+    }
+
+    /// The secrets screen: the vault's state, or its folders and items.
+    fn secrets(&mut self, ui: &mut egui::Ui, p: &Palette, now: Instant) {
         match self.vault.clone() {
-            Vault::Unlocked(collections) => self.unlocked(ui, &p, &collections, now),
+            Vault::Unlocked(collections) => self.unlocked(ui, p, &collections, now),
             other => {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    self.status_line(ui, &p);
+                    self.status_line(ui, p);
                     ui.add_space(40.0);
                     ui.vertical_centered(|ui| match other {
                         Vault::Connecting => {
@@ -448,8 +587,104 @@ impl<S: Store, B: Backend> Manager<S, B> {
                 });
             }
         }
-        if self.settings.scanlines && !self.still {
-            theme::paint_scanlines(ui.ctx(), &p);
+    }
+
+    /// A save that waited for the unlock (SAVE pressed while sealed): now
+    /// that the vault is open, confirm and save what is in the form. Not
+    /// if the form went (another screen, nothing left to save).
+    fn resume_save(&mut self, ctx: &egui::Context) {
+        if !self.save_after_unlock || !matches!(self.vault, Vault::Unlocked(_)) {
+            return;
+        }
+        self.save_after_unlock = false;
+        let changes = match &self.values {
+            Values::Ready(f) if self.page == Page::Settings && f.edited() && f.valid() => {
+                f.changes()
+            }
+            _ => {
+                // (Not silently: the edits stay, for another SAVE.)
+                self.status = Some("the vault unlocked: the settings were not saved".into());
+                return;
+            }
+        };
+        self.start_save(ctx, changes);
+    }
+
+    /// Ask alephd for the VAULT values when the screen needs them.
+    fn ask_config(&mut self) {
+        let up = matches!(self.vault, Vault::Locked | Vault::Unlocked(_));
+        if self.page == Page::Settings && up && matches!(self.values, Values::Unknown) {
+            self.values = Values::Loading;
+            self.store.request(Request::Config);
+        }
+    }
+
+    fn settings_screen(&mut self, ui: &mut egui::Ui, p: &Palette, now: Instant) {
+        egui::CentralPanel::default().show(ui, |ui| {
+            self.status_line(ui, p);
+            if self.confirm.is_some() {
+                self.confirming(ui, now);
+                return;
+            }
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                self.vault_settings(ui, p);
+            });
+        });
+    }
+
+    fn vault_settings(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        settings_page::header(ui, p, "VAULT  // alephd");
+        let up = matches!(self.vault, Vault::Locked | Vault::Unlocked(_));
+        let sealed = matches!(self.vault, Vault::Locked);
+        let mut action = None;
+        match &mut self.values {
+            Values::Ready(form) => {
+                if !up {
+                    ui.label(RichText::new("LINK DOWN: alephd cannot be reached").color(p.error));
+                }
+                let view = VaultView {
+                    enabled: up,
+                    sealed,
+                    unlocking: self.save_after_unlock,
+                };
+                action = settings_page::vault_section(ui, p, form, &view);
+            }
+            Values::Failed(why) => {
+                ui.label(RichText::new(shown(why, 200)).color(p.error));
+                if ui.button("RETRY").clicked() {
+                    self.values = Values::Unknown;
+                }
+            }
+            Values::Unknown | Values::Loading => {
+                if up {
+                    ui.label("LOADING…");
+                } else if let Vault::Unreachable(why) = &self.vault {
+                    ui.label(RichText::new("LINK DOWN").strong().color(p.error));
+                    ui.label(shown(why, 200));
+                } else {
+                    ui.label("CONNECTING…");
+                }
+            }
+        }
+        match action {
+            Some(VaultAction::Cancel) => {
+                if let Values::Ready(form) = &mut self.values {
+                    form.cancel();
+                }
+                self.save_after_unlock = false;
+            }
+            Some(VaultAction::Save) => {
+                if sealed {
+                    // (Confirming needs the vault open: unlock first, and
+                    // save when it is; `resume_save`.)
+                    self.save_after_unlock = true;
+                    self.store.request(Request::Unlock);
+                } else if let Values::Ready(form) = &self.values {
+                    let changes = form.changes();
+                    self.start_save(&ui.ctx().clone(), changes);
+                }
+            }
+            None => {}
         }
     }
 
@@ -620,22 +855,36 @@ impl<S: Store, B: Backend> Manager<S, B> {
         let Some(app) = self.confirm.as_mut() else {
             return;
         };
-        // (What the guard is worth: spec §6.)
-        ui.label(
-            RichText::new(
-                "Any program running as you can read secrets; this only guards against a glance.",
-            )
-            .small()
-            .color(self.palette.foreground.gamma_multiply(0.7)),
-        );
+        if self.pending.is_some() {
+            // (What the guard is worth: spec §6.)
+            ui.label(
+                RichText::new(
+                    "Any program running as you can read secrets; this only guards against a glance.",
+                )
+                .small()
+                .color(self.palette.foreground.gamma_multiply(0.7)),
+            );
+        }
         app.frame(ui);
         if app.closed {
-            let ok = matches!(
-                app.ui.conversation.screen,
-                Screen::Finished { ok: true, .. }
-            );
+            let (ok, message) = match &app.ui.conversation.screen {
+                Screen::Finished { ok, message } => (*ok, message.clone()),
+                _ => (false, None),
+            };
             self.end_confirm();
-            if let Some((path, want)) = self.pending.take()
+            if std::mem::take(&mut self.saving_settings) {
+                if ok {
+                    // (The same proof as a reveal's; and read again.)
+                    self.reauth.confirmed(now);
+                    self.status = Some("SETTINGS SAVED".into());
+                    self.values = Values::Unknown;
+                } else {
+                    self.status = Some(match message {
+                        Some(m) => format!("not saved: {m}"),
+                        None => "cancelled: nothing was saved".into(),
+                    });
+                }
+            } else if let Some((path, want)) = self.pending.take()
                 && ok
             {
                 self.reauth.confirmed(now);
