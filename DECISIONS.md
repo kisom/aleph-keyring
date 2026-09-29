@@ -553,6 +553,14 @@ hook yet.
 - Until then the idle timeout and sleep lock the vault. Rejected: a PATH
   wrapper shadowing the package's script (fragile), and leaving it
   unwired.
+- **Update, 2026-09-29:** the hook does not go in `omarchy-system-lock`.
+  Suspend and hibernate (the System menu, `systemctl suspend`, the lid)
+  lock through `omarchy-system-sleep-lock`, which calls the shell directly
+  and never runs `omarchy-system-lock`, so a hook there skips a menu
+  suspend. The proposal (omacom/omarchy PR #13513, open) runs
+  `omarchy-hook lock`, detached, from `beginLock()` in the shell's lock
+  service, which every new lock passes through once. See
+  docs/omarchy-lock-hook.md. Not yet tested on a live session.
 
 ## 2026-09-27: Plan 4b split into custody (4b) and setup (4c)
 

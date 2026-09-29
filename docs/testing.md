@@ -187,8 +187,8 @@ keyring. The client is `alephctl` (`aleph` on PATH is TeX's).
      screen, then unlock it (unlocked, no prompt); `passwd` (the TPM
      slot's id changes); suspend and resume (locked). With Omarchy's lock,
      the vault locks with the screen only once Omarchy runs
-     `omarchy-hook lock` (DECISIONS.md G1); until then idle and sleep lock
-     it.
+     `omarchy-hook lock` (DECISIONS.md G1, omacom/omarchy PR #13513; it
+     covers suspend too); until then idle and sleep lock it.
    - `alephctl setup` again changes nothing.
    - If the root step was skipped: log out and in, and check that no
      `gnome-keyring-daemon` runs (`pgrep -a gnome-keyring`) and that
