@@ -19,24 +19,20 @@ fn main() -> ExitCode {
     }
 }
 
-/// The settings, reduced motion, and home, for either window.
-fn look() -> (settings::Settings, bool, Option<std::path::PathBuf>) {
-    let (settings, warning) = match settings::config_home() {
-        Some(dir) => settings::Settings::load(&settings::path(&dir)),
-        None => (settings::Settings::default(), None),
-    };
-    if let Some(w) = warning {
-        eprintln!("aleph-gui: {w}");
-    }
-    (settings, settings::reduced_motion(), settings::home())
-}
-
 fn manage() -> ExitCode {
     // It shows and copies secrets: no core dumps, no ptrace by other
     // processes of the user.
     // SAFETY: prctl with these arguments only sets a process flag.
     unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
-    let (settings, still, home) = look();
+    let file = settings::config_home().map(|dir| settings::path(&dir));
+    let (settings, broken) = match &file {
+        Some(f) => settings::Settings::load(f),
+        None => (settings::Settings::default(), None),
+    };
+    if let Some(w) = &broken {
+        eprintln!("aleph-gui: {w}");
+    }
+    let (still, home) = (settings::reduced_motion(), settings::home());
     let viewport = egui::ViewportBuilder::default()
         .with_app_id("aleph")
         .with_title("aleph")
@@ -49,7 +45,8 @@ fn manage() -> ExitCode {
             let ctx = cc.egui_ctx.clone();
             let store = store::DbusStore::start(None, move || ctx.request_repaint());
             let mut app =
-                manager::Manager::new(store, clipboard::Wayland::default(), settings, home, still);
+                manager::Manager::new(store, clipboard::Wayland::default(), settings, home, still)
+                    .with_settings_file(file, broken);
             aleph_gui::theme::apply(&cc.egui_ctx, &app.palette);
             if still {
                 cc.egui_ctx.all_styles_mut(|s| s.animation_time = 0.0);

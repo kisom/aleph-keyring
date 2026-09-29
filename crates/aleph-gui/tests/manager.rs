@@ -1244,6 +1244,123 @@ fn a_lock_during_the_confirmation_saves_nothing() {
     assert!(h.state().form().unwrap().edited());
 }
 
+/// A window whose gui.toml is `dir/aleph/gui.toml`.
+fn display_window(
+    theme: ThemeChoice,
+    file: std::path::PathBuf,
+    broken: Option<&str>,
+) -> (Window, Fake) {
+    let broken = broken.map(String::from);
+    let (h, store, _) = window_with(theme, vault(), SIZE, move |m| {
+        m.with_settings_file(Some(file), broken)
+    });
+    (h, store)
+}
+
+fn gui_toml(file: &std::path::Path) -> Settings {
+    Settings::load(file).0
+}
+
+/// DISPLAY needs no confirmation and no Save: each change is written at
+/// once and takes effect at once.
+#[test]
+fn display_changes_are_written_and_apply_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("aleph/gui.toml");
+    let (mut h, store) = display_window(ThemeChoice::Auto, file.clone(), None);
+    h.get_by_label("SETTINGS").click();
+    frames(&mut h);
+    store.take();
+    let before = h.state().palette.clone();
+    h.get_by_label("Neon").click();
+    frames(&mut h);
+    assert_eq!(h.state().settings().theme, ThemeChoice::Neon);
+    assert_ne!(h.state().palette.accent, before.accent, "re-themed at once");
+    assert_eq!(gui_toml(&file).theme, ThemeChoice::Neon);
+    h.get_by_label("Scanlines").click();
+    frames(&mut h);
+    assert!(!h.state().settings().scanlines);
+    assert!(!gui_toml(&file).scanlines);
+    h.get_by_label("Reveal confirmation lasts: 5 min");
+    pick(&mut h, "Reveal confirmation lasts", "Every time");
+    assert_eq!(gui_toml(&file).reveal_hold, 0);
+    // "Every time": even a confirmation just given does not hold.
+    h.state_mut().reauth.confirmed(Instant::now());
+    h.get_by_label("SECRETS").click();
+    frames(&mut h);
+    h.get_by_label("GitHub token").click();
+    frames(&mut h);
+    h.get_by_label("SHOW").click();
+    frames(&mut h);
+    // (The only request is the confirmation SHOW now asks for: nothing
+    // DISPLAY did asked alephd for anything.)
+    assert!(matches!(only(store.take()), Request::Reauth(_)));
+}
+
+/// (Review Focus 4.) A hold in the file that is not a preset is shown as it
+/// is and stays until another is picked.
+#[test]
+fn a_reveal_hold_that_is_not_a_preset_is_shown_and_kept() {
+    let settings = Settings {
+        theme: ThemeChoice::Neon,
+        reveal_hold: 45,
+        ..Settings::default()
+    };
+    let (mut h, _store, _) = window_full(settings, vault(), SIZE, |m| m);
+    h.get_by_label("SETTINGS").click();
+    frames(&mut h);
+    h.get_by_label("Reveal confirmation lasts: Custom (45 s)");
+    pick(&mut h, "Reveal confirmation lasts", "15 min");
+    h.get_by_label("Reveal confirmation lasts: 15 min");
+    assert_eq!(h.state().settings().reveal_hold, 900);
+}
+
+#[test]
+fn a_broken_gui_toml_is_shown_and_never_overwritten_until_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("gui.toml");
+    std::fs::write(&file, "scanline = false\n# mine\n").unwrap();
+    let broken = format!(
+        "{}: unknown field `scanline` (using the defaults)",
+        file.display()
+    );
+    let (mut h, _store) = display_window(ThemeChoice::Neon, file.clone(), Some(&broken));
+    h.get_by_label("SETTINGS").click();
+    frames(&mut h);
+    h.get_by_label_contains("unknown field `scanline`");
+    // The controls are disabled: a click changes nothing.
+    h.get_by_label("Auto").click();
+    h.get_by_label("Scanlines").click();
+    frames(&mut h);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "scanline = false\n# mine\n"
+    );
+    h.get_by_label("RESET TO DEFAULTS").click();
+    frames(&mut h);
+    assert_eq!(Settings::load(&file), (Settings::default(), None));
+    assert!(h.query_by_label_contains("unknown field").is_none());
+    // Working now.
+    h.get_by_label("Scanlines").click();
+    frames(&mut h);
+    assert!(!gui_toml(&file).scanlines);
+}
+
+/// A file that cannot be written says so, and the change holds for this run.
+#[test]
+fn a_failed_write_says_so_and_the_change_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, b"a file, not a directory").unwrap();
+    let (mut h, _store) = display_window(ThemeChoice::Auto, blocker.join("gui.toml"), None);
+    h.get_by_label("SETTINGS").click();
+    frames(&mut h);
+    h.get_by_label("Neon").click();
+    frames(&mut h);
+    h.get_by_label_contains("not saved");
+    assert_eq!(h.state().settings().theme, ThemeChoice::Neon);
+}
+
 /// Every view, in both themes.
 #[test]
 fn snapshots() {

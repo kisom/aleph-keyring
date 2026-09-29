@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 
 use egui::{RichText, TextEdit};
 
+use crate::settings::{Settings, ThemeChoice};
 use crate::theme::Palette;
 
 pub const SUSPEND: &str = "lock.on_suspend";
@@ -380,6 +381,83 @@ pub fn vault_section(
         if view.unlocking {
             ui.label("waiting for the unlock…");
         }
+    });
+    action
+}
+
+/// What the DISPLAY section is allowed to do now.
+pub struct DisplayView {
+    /// gui.toml did not read as settings: its error (the controls wait).
+    pub broken: Option<String>,
+    /// Reduced motion is asked for, so scanlines are off whatever is set.
+    pub still: bool,
+}
+
+/// What the person changed in the DISPLAY section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisplayAction {
+    Theme(ThemeChoice),
+    Scanlines(bool),
+    Reveal(u64),
+    Reset,
+}
+
+pub fn display_section(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    s: &Settings,
+    view: &DisplayView,
+) -> Option<DisplayAction> {
+    let mut action = None;
+    header(ui, p, "DISPLAY  // gui · changes apply now");
+    if let Some(why) = &view.broken {
+        ui.label(RichText::new(crate::conversation::shown(why, 300)).color(p.error));
+        if ui.button("RESET TO DEFAULTS").clicked() {
+            action = Some(DisplayAction::Reset);
+        }
+    }
+    ui.add_enabled_ui(view.broken.is_none(), |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Theme");
+            for (choice, name) in [(ThemeChoice::Auto, "Auto"), (ThemeChoice::Neon, "Neon")] {
+                if ui.radio(s.theme == choice, name).clicked() && s.theme != choice {
+                    action = Some(DisplayAction::Theme(choice));
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            let mut on = s.scanlines;
+            if ui.checkbox(&mut on, "Scanlines").changed() {
+                action = Some(DisplayAction::Scanlines(on));
+            }
+            if view.still {
+                ui.label(
+                    RichText::new("(off: reduced motion is asked for)")
+                        .small()
+                        .color(p.muted),
+                );
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Reveal confirmation lasts");
+            let mut hold = s.reveal_hold;
+            let selected = describe(Kind::Reveal, hold);
+            named_combo(ui, "Reveal confirmation lasts", &selected, |ui| {
+                for &secs in REVEAL_PRESETS {
+                    ui.selectable_value(&mut hold, secs, describe(Kind::Reveal, secs));
+                }
+                if !REVEAL_PRESETS.contains(&s.reveal_hold) {
+                    ui.selectable_value(
+                        &mut hold,
+                        s.reveal_hold,
+                        describe(Kind::Reveal, s.reveal_hold),
+                    );
+                }
+            });
+            if hold != s.reveal_hold {
+                action = Some(DisplayAction::Reveal(hold));
+            }
+        });
     });
     action
 }

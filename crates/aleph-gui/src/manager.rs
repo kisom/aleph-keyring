@@ -15,7 +15,9 @@ use crate::clipboard::{Backend, Clipboard};
 use crate::conversation::{Screen, shown};
 use crate::reauth::Reauth;
 use crate::settings::Settings;
-use crate::settings_page::{self, Form, Values, VaultAction, VaultView};
+use crate::settings_page::{
+    self, DisplayAction, DisplayView, Form, Values, VaultAction, VaultView,
+};
 use crate::store::{Collection, Item, Request, Store, StoreEvent, Vault};
 use crate::theme::{self, Palette};
 
@@ -127,6 +129,8 @@ pub struct Manager<S: Store, B: Backend> {
     /// (and stays, with the error, if one fails).
     pub saving: usize,
     settings: Settings,
+    settings_file: Option<PathBuf>,
+    display_broken: Option<String>,
     home: Option<PathBuf>,
     still: bool,
     pub palette: Palette,
@@ -168,6 +172,8 @@ impl<S: Store, B: Backend> Manager<S, B> {
             confirm_guard: crate::app::INPUT_GUARD,
             saving: 0,
             settings,
+            settings_file: None,
+            display_broken: None,
             home,
             still,
             palette,
@@ -176,6 +182,53 @@ impl<S: Store, B: Backend> Manager<S, B> {
             values: Values::Unknown,
             saving_settings: false,
             save_after_unlock: false,
+        }
+    }
+
+    /// Where gui.toml is, and why it could not be read (if it could not):
+    /// DISPLAY writes there, and waits for a reset when it is broken.
+    pub fn with_settings_file(mut self, file: Option<PathBuf>, broken: Option<String>) -> Self {
+        self.settings_file = file;
+        self.display_broken = broken;
+        self
+    }
+
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    /// A DISPLAY change: in effect now, and written to gui.toml. A write
+    /// that fails is said so; the change holds for this run.
+    fn apply_display(&mut self, ctx: &egui::Context, action: DisplayAction) {
+        match action {
+            DisplayAction::Theme(t) => self.settings.theme = t,
+            DisplayAction::Scanlines(on) => self.settings.scanlines = on,
+            DisplayAction::Reveal(secs) => self.settings.reveal_hold = secs,
+            DisplayAction::Reset => {
+                self.settings = Settings::default();
+                let done = match &self.settings_file {
+                    Some(file) => Settings::reset(file),
+                    None => Ok(()),
+                };
+                match done {
+                    Ok(()) => self.display_broken = None,
+                    Err(e) => self.status = Some(format!("not reset: {e}")),
+                }
+                self.palette = theme::resolve(&self.settings, self.home.as_deref());
+                theme::apply(ctx, &self.palette);
+                return;
+            }
+        }
+        self.palette = theme::resolve(&self.settings, self.home.as_deref());
+        theme::apply(ctx, &self.palette);
+        let written = match &self.settings_file {
+            Some(file) => self.settings.save(file),
+            None => Err("no configuration directory".to_string()),
+        };
+        if let Err(e) = written {
+            self.status = Some(format!(
+                "not saved: {e} (the change holds until the window closes)"
+            ));
         }
     }
 
@@ -628,6 +681,15 @@ impl<S: Store, B: Backend> Manager<S, B> {
             }
             egui::ScrollArea::vertical().show(ui, |ui| {
                 self.vault_settings(ui, p);
+                ui.add_space(16.0);
+                ui.separator();
+                let view = DisplayView {
+                    broken: self.display_broken.clone(),
+                    still: self.still,
+                };
+                if let Some(a) = settings_page::display_section(ui, p, &self.settings, &view) {
+                    self.apply_display(&ui.ctx().clone(), a);
+                }
             });
         });
     }
