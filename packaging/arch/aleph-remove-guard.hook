@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Remove
+Type = Package
+Target = aleph-keyring*
+
+[Action]
+Description = Checking that aleph is no longer wired into the system...
+When = PreTransaction
+Exec = /usr/lib/aleph/remove-guard
+AbortOnFail

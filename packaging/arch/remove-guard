@@ -1,0 +1,43 @@
+#!/bin/sh
+# Refuse to remove aleph while it is still wired into the system. Run by
+# aleph-remove-guard.hook before a transaction that removes the package
+# (spec: docs/superpowers/specs/2026-09-29-aleph-arch-packaging-design.md).
+#
+#  - /var/lib/aleph/manifest.json exists: `alephctl system apply` edited
+#    /etc/pam.d to call pam_aleph.so, and removing the module under those
+#    lines could break logins.
+#  - a user's Secret Service activation file names alephd: applications
+#    would be left with nothing behind the bus name.
+#
+# ALEPH_STATE_DIR and ALEPH_PASSWD_CMD exist for the tests.
+set -u
+
+state_dir=${ALEPH_STATE_DIR:-/var/lib/aleph}
+passwd_cmd=${ALEPH_PASSWD_CMD:-getent passwd}
+refuse=0
+
+if [ -e "$state_dir/manifest.json" ]; then
+    echo "aleph: the PAM changes are still in place ($state_dir/manifest.json):" >&2
+    echo "  run 'alephctl system revert' (as root) first" >&2
+    refuse=1
+fi
+
+# (Command substitution, not a pipeline into `while`: the loop runs in a
+# subshell, and only what it prints comes back.)
+served=$($passwd_cmd 2>/dev/null | while IFS=: read -r user _ _ _ _ home _; do
+    [ -n "$home" ] || continue
+    file="$home/.local/share/dbus-1/services/org.freedesktop.secrets.service"
+    if grep -qs /usr/lib/aleph/alephd "$file" 2>/dev/null; then
+        echo "$user"
+    fi
+done)
+
+if [ -n "$served" ]; then
+    for user in $served; do
+        echo "aleph: $user still has aleph serving the Secret Service:" >&2
+    done
+    echo "  as that user, run 'alephctl setup --revert' first" >&2
+    refuse=1
+fi
+
+exit "$refuse"

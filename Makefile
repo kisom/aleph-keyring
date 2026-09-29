@@ -16,7 +16,7 @@ export TSS2_LOG ?= all+NONE
 
 SUDO := $(if $(filter 0,$(shell id -u)),,sudo)
 
-.PHONY: all build test lint gate gate-hw hw-tpm hw-fido2 install uninstall restart clean
+.PHONY: all build test lint pkg-shell-test gate gate-hw hw-tpm hw-fido2 install uninstall restart clean
 
 all: build
 
@@ -30,8 +30,18 @@ lint:
 	$(CARGO) fmt --all --check
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 	sh -n packaging/install.sh
+	sh -n packaging/arch/aleph-keyring.install
+	sh -n packaging/arch/remove-guard
+	sh -n packaging/arch/tests/guard-test.sh
+	sh -n packaging/arch/tests/hook-test.sh
 
-gate: lint test
+# Shell tests for the package's hook and removal guard: they run on any
+# host, with a stub systemctl and temporary directories.
+pkg-shell-test:
+	sh packaging/arch/tests/guard-test.sh
+	sh packaging/arch/tests/hook-test.sh
+
+gate: lint test pkg-shell-test
 
 # The hardware tests are #[ignore]d in the normal suite; each file holds
 # only its hardware test, so --ignored runs just that. (golden.rs's

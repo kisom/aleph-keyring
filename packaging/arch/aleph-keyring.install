@@ -1,0 +1,39 @@
+# The pacman install hook for aleph-keyring, aleph-keyring-git and
+# aleph-keyring-local (spec: docs/superpowers/specs/2026-09-29-aleph-arch-packaging-design.md).
+# It does what packaging/install.sh does after copying files. A failing
+# systemctl is reported and never fails the transaction (a chroot or a
+# container has none running), and every step is idempotent.
+
+_aleph_systemctl() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo "aleph: systemctl is not available: skipped 'systemctl $*'" >&2
+        return 0
+    fi
+    systemctl "$@" || echo "aleph: 'systemctl $*' failed: run it yourself" >&2
+    return 0
+}
+
+_aleph_enable() {
+    _aleph_systemctl daemon-reload
+    _aleph_systemctl enable --now aleph-tpmd.socket
+    _aleph_systemctl --global enable alephd.socket
+}
+
+post_install() {
+    _aleph_enable
+    echo "aleph: installed. As your user:"
+    echo "  systemctl --user daemon-reload && systemctl --user start alephd.socket"
+    echo "  alephctl setup"
+}
+
+post_upgrade() {
+    _aleph_enable
+    echo "aleph: restart alephd to pick up the new binary: systemctl --user restart alephd.service"
+}
+
+post_remove() {
+    _aleph_systemctl --global disable alephd.socket
+    _aleph_systemctl disable --now aleph-tpmd.socket aleph-tpmd.service
+    _aleph_systemctl daemon-reload
+    echo "aleph: removed. The vault in ~/.local/share/aleph is left in place."
+}
