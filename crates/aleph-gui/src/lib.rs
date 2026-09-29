@@ -2,6 +2,7 @@
 //! manager spec) and the prompter alephd starts (`aleph-gui prompt`, spec
 //! §7).
 
+pub mod admin_page;
 pub mod app;
 pub mod clipboard;
 pub mod conversation;
