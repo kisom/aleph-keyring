@@ -584,6 +584,8 @@ impl<S: Store, B: Backend> Manager<S, B> {
                             Some(format!("'{}' was deleted elsewhere", shown(&label, NAME)));
                     }
                 }
+                // (Task 5 replaces this with the real handling of the status.)
+                StoreEvent::Status(_) => {}
                 StoreEvent::Config(result) => {
                     // (Only the answer being waited for.)
                     if matches!(self.values, Values::Loading) {

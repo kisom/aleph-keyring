@@ -515,3 +515,193 @@ async fn without_alephd_the_store_is_unreachable() {
         .until(|e| matches!(e, StoreEvent::Vault(Vault::Unreachable(_))).then_some(()))
         .await;
 }
+
+/// Run one conversational request against alephd with a scripted prompter
+/// answering `replies`; the request's `Done` and what the prompter was sent.
+async fn converse(
+    store: &mut Probe,
+    name: &str,
+    make: impl FnOnce(std::os::fd::OwnedFd) -> Request,
+    replies: Vec<FromPrompter>,
+) -> (Option<String>, Vec<aleph_daemon::testing::ToPrompter>) {
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    let prompter = Interactive::new(replies);
+    prompter.respond(ours);
+    store.request(make(theirs.into()));
+    let (error, _) = store.done(name).await;
+    let sent = tokio::task::spawn_blocking(move || prompter.sent())
+        .await
+        .unwrap();
+    (error, sent)
+}
+
+async fn status(store: &mut Probe) -> aleph_gui::store::AdminStatus {
+    store.request(Request::Status);
+    store
+        .until(|e| match e {
+            StoreEvent::Status(Ok(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .await
+}
+
+fn finished_ok(sent: &[aleph_daemon::testing::ToPrompter]) -> bool {
+    matches!(
+        sent.last(),
+        Some(aleph_daemon::testing::ToPrompter::Done { ok: true, .. })
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_status_is_read_with_its_keyslots() {
+    let d = daemon(true, vec![]).await;
+    let mut store = Probe::new(&d.bus.address);
+    store.unlocked(|c| !c.is_empty()).await;
+    let s = status(&mut store).await;
+    assert!(s.vault && !s.locked, "{s:?}");
+    assert!(!s.keyslots.is_empty(), "{s:?}");
+    assert!(s.keyslots.iter().any(|k| k.kind == "recovery"), "{s:?}");
+    assert!(
+        s.keyslots.iter().all(|k| !k.id.is_empty() && !k.stale),
+        "{s:?}"
+    );
+    assert_eq!(store.done("read the status").await, (None, false));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_alephd_reading_the_status_fails() {
+    let bus = aleph_daemon::testing::bus();
+    let mut store = Probe::new(&bus.address);
+    store.request(Request::Status);
+    store
+        .until(|e| matches!(e, StoreEvent::Status(Err(_))).then_some(()))
+        .await;
+    assert!(store.done("read the status").await.0.is_some());
+}
+
+/// A slot is added and removed again, each with one confirmation.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tpm_slot_is_added_and_removed() {
+    let d = daemon(true, vec![]).await;
+    let mut store = Probe::new(&d.bus.address);
+    store.unlocked(|c| !c.is_empty()).await;
+    let before = status(&mut store).await.keyslots.len();
+    let (error, sent) = converse(
+        &mut store,
+        "add the TPM slot",
+        Request::AddTpm,
+        vec![password(PW)],
+    )
+    .await;
+    assert_eq!(error, None);
+    assert!(finished_ok(&sent), "{sent:?}");
+    let after = status(&mut store).await;
+    assert_eq!(after.keyslots.len(), before + 1, "{after:?}");
+    let added = after
+        .keyslots
+        .iter()
+        .find(|k| k.kind == "tpm")
+        .expect("the new TPM slot")
+        .id
+        .clone();
+    let (error, sent) = converse(
+        &mut store,
+        "remove the keyslot",
+        |fd| Request::RemoveKeyslot(fd, added.clone()),
+        vec![password(PW)],
+    )
+    .await;
+    assert_eq!(error, None);
+    assert!(finished_ok(&sent), "{sent:?}");
+    assert_eq!(status(&mut store).await.keyslots.len(), before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_master_key_is_rotated_and_the_recovery_key_reissued() {
+    let d = daemon(true, vec![]).await;
+    let mut store = Probe::new(&d.bus.address);
+    store.unlocked(|c| !c.is_empty()).await;
+    let (error, sent) = converse(
+        &mut store,
+        "rotate the master key",
+        Request::RotateMaster,
+        vec![password(PW)],
+    )
+    .await;
+    assert_eq!(error, None);
+    assert!(finished_ok(&sent), "{sent:?}");
+    let (error, sent) = converse(
+        &mut store,
+        "issue a new recovery key",
+        Request::ReissueRecovery,
+        vec![password(PW)],
+    )
+    .await;
+    assert_eq!(error, None);
+    assert!(finished_ok(&sent), "{sent:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retrying_a_slot_needs_no_conversation() {
+    let d = daemon(true, vec![]).await;
+    let mut store = Probe::new(&d.bus.address);
+    store.unlocked(|c| !c.is_empty()).await;
+    let id = status(&mut store).await.keyslots[0].id.clone();
+    store.request(Request::RetryKeyslot(id));
+    assert_eq!(store.done("retry the keyslot").await, (None, false));
+}
+
+/// A backup goes into the file the window opened; one inside aleph's own
+/// directory is refused by alephd, before any question.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backup_is_written_into_the_file_it_is_given() {
+    let d = daemon(true, vec![]).await;
+    let mut store = Probe::new(&d.bus.address);
+    store.unlocked(|c| !c.is_empty()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("backup.aleph");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let (error, sent) = converse(
+        &mut store,
+        "back up",
+        |fd| Request::Backup(fd, file.into()),
+        vec![password(PW)],
+    )
+    .await;
+    assert_eq!(error, None);
+    assert!(finished_ok(&sent), "{sent:?}");
+    assert!(std::fs::metadata(&path).unwrap().len() > 0);
+
+    let inside = d.env.paths.data_dir.join("copy");
+    std::fs::create_dir_all(&d.env.paths.data_dir).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&inside)
+        .unwrap();
+    let (_ours, theirs) = UnixStream::pair().unwrap();
+    store.request(Request::Backup(theirs.into(), file.into()));
+    let (error, _) = store.done("back up").await;
+    assert!(error.unwrap().contains("inside"), "refused");
+}
+
+#[test]
+fn admin_requests_are_not_followed_by_a_listing() {
+    let fd = || std::os::unix::net::UnixStream::pair().unwrap().0.into();
+    for r in [
+        Request::Status,
+        Request::AddTpm(fd()),
+        Request::AddFido2(fd(), true),
+        Request::RemoveKeyslot(fd(), "id".into()),
+        Request::RetryKeyslot("id".into()),
+        Request::RotateMaster(fd()),
+        Request::ReissueRecovery(fd()),
+        Request::Backup(fd(), fd()),
+    ] {
+        assert!(!r.changes(), "{}", r.name());
+    }
+}

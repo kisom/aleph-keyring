@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use aleph_secret_session::{ClientDh, DH, Session};
 use futures_util::StreamExt;
+use serde::Deserialize;
 use zbus::Connection;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 use zeroize::Zeroizing;
@@ -38,6 +39,41 @@ pub const SETTINGS_KEYS: [&str; 4] = [
     "lock.idle_timeout",
     "prompt.timeout",
 ];
+
+/// One keyslot, as alephd's status lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct SlotInfo {
+    pub id: String,
+    pub label: String,
+    /// `tpm`, `fido2`, `recovery`, `login-password`, or an unknown type.
+    pub kind: String,
+    /// Seconds since the epoch.
+    #[serde(default)]
+    pub created: u64,
+    #[serde(default)]
+    pub stale: bool,
+}
+
+/// alephd's status (`alephctl status`), as the admin page shows it. What
+/// this version does not know is ignored; what is missing is the default.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct AdminStatus {
+    pub vault: bool,
+    #[serde(default)]
+    pub locked: bool,
+    #[serde(default)]
+    pub untrusted: Option<String>,
+    #[serde(default)]
+    pub memory_locked: Option<bool>,
+    #[serde(default)]
+    pub tpm: Option<bool>,
+    #[serde(default)]
+    pub keyslots: Vec<SlotInfo>,
+    #[serde(default)]
+    pub rotation_pending: bool,
+    #[serde(default)]
+    pub secret_service: Option<String>,
+}
 
 /// How often the lock state is checked, besides the signals alephd sends
 /// (one missed, or alephd restarting, is caught within this).
@@ -113,6 +149,21 @@ pub enum Request {
     /// a socketpair (one confirmation for all); the window answers on the
     /// other. Only the keys that changed are sent.
     SetConfigs(OwnedFd, BTreeMap<String, String>),
+    /// Read alephd's status (`StoreEvent::Status`).
+    Status,
+    /// The admin page's operations. Those that converse take the
+    /// prompter's end of a socketpair (alephd asks for the confirmation on
+    /// it, and the window answers on the other end).
+    AddTpm(OwnedFd),
+    AddFido2(OwnedFd, bool),
+    RemoveKeyslot(OwnedFd, String),
+    /// Try a stale keyslot again (no conversation).
+    RetryKeyslot(String),
+    RotateMaster(OwnedFd),
+    ReissueRecovery(OwnedFd),
+    /// A backup: the prompter's end, and the new file (opened by the
+    /// caller) it is written into.
+    Backup(OwnedFd, OwnedFd),
 }
 
 impl Request {
@@ -120,7 +171,19 @@ impl Request {
     pub fn changes(&self) -> bool {
         !matches!(
             self,
-            Self::Secret(_) | Self::Reauth(_) | Self::Config | Self::SetConfigs(..) | Self::Lock
+            Self::Secret(_)
+                | Self::Reauth(_)
+                | Self::Config
+                | Self::SetConfigs(..)
+                | Self::Lock
+                | Self::Status
+                | Self::AddTpm(_)
+                | Self::AddFido2(..)
+                | Self::RemoveKeyslot(..)
+                | Self::RetryKeyslot(_)
+                | Self::RotateMaster(_)
+                | Self::ReissueRecovery(_)
+                | Self::Backup(..)
         )
     }
 
@@ -139,6 +202,14 @@ impl Request {
             Self::Reauth(_) => "confirm",
             Self::Config => "read the settings",
             Self::SetConfigs(..) => "save the settings",
+            Self::Status => "read the status",
+            Self::AddTpm(_) => "add the TPM slot",
+            Self::AddFido2(..) => "add the security key",
+            Self::RemoveKeyslot(..) => "remove the keyslot",
+            Self::RetryKeyslot(_) => "retry the keyslot",
+            Self::RotateMaster(_) => "rotate the master key",
+            Self::ReissueRecovery(_) => "issue a new recovery key",
+            Self::Backup(..) => "back up",
         }
     }
 }
@@ -160,6 +231,9 @@ pub enum StoreEvent {
     /// The four VAULT settings (`Request::Config`), or why they could not
     /// be read (a `Done` follows either way).
     Config(Result<BTreeMap<String, String>, String>),
+    /// alephd's status (`Request::Status`), or why it could not be read (a
+    /// `Done` follows either way).
+    Status(Result<AdminStatus, String>),
     /// A request finished; `error` if it failed (a dismissed prompt is
     /// not an error: `dismissed`).
     Done {
@@ -529,6 +603,21 @@ impl Client {
             .map_err(err)
     }
 
+    /// Call an admin method that takes no answer back: `Done` reports the
+    /// call (alephd refused it, or accepted it); a conversation's outcome
+    /// arrives on its socket.
+    async fn converse<B>(&self, method: &str, body: B) -> Result<(bool, Option<StoreEvent>), String>
+    where
+        B: serde::Serialize + zbus::zvariant::DynamicType,
+    {
+        self.admin()
+            .await?
+            .call::<_, _, ()>(method, &body)
+            .await
+            .map_err(err)?;
+        Ok((false, None))
+    }
+
     /// Carry out one request: `(dismissed, secret event)`. A request that
     /// uses the session is tried once more on a new one if it fails
     /// (alephd may have restarted and forgotten ours).
@@ -658,6 +747,45 @@ impl Client {
                     .map_err(err)?;
                 Ok((false, None))
             }
+            Request::Status => {
+                let json: String = self.admin().await?.call("Status", &()).await.map_err(err)?;
+                let status: AdminStatus = serde_json::from_str(&json).map_err(err)?;
+                Ok((false, Some(StoreEvent::Status(Ok(status)))))
+            }
+            Request::AddTpm(fd) => {
+                self.converse("EnrollTpm", (zbus::zvariant::OwnedFd::from(fd),))
+                    .await
+            }
+            Request::AddFido2(fd, touch_only) => {
+                self.converse(
+                    "EnrollFido2",
+                    (zbus::zvariant::OwnedFd::from(fd), touch_only),
+                )
+                .await
+            }
+            Request::RemoveKeyslot(fd, id) => {
+                self.converse("RemoveKeyslot", (zbus::zvariant::OwnedFd::from(fd), id))
+                    .await
+            }
+            Request::RetryKeyslot(id) => self.converse("RetryKeyslot", (id,)).await,
+            Request::RotateMaster(fd) => {
+                self.converse("RotateMaster", (zbus::zvariant::OwnedFd::from(fd),))
+                    .await
+            }
+            Request::ReissueRecovery(fd) => {
+                self.converse("ReissueRecoveryKey", (zbus::zvariant::OwnedFd::from(fd),))
+                    .await
+            }
+            Request::Backup(fd, file) => {
+                self.converse(
+                    "Backup",
+                    (
+                        zbus::zvariant::OwnedFd::from(fd),
+                        zbus::zvariant::OwnedFd::from(file),
+                    ),
+                )
+                .await
+            }
         }
     }
 }
@@ -718,6 +846,7 @@ async fn run(
                     let name = r.name();
                     let changes = r.changes();
                     let reading = matches!(&r, Request::Config);
+                    let reading_status = matches!(&r, Request::Status);
                     let fetching = match &r {
                         Request::Secret(p) => Some(p.clone()),
                         _ => None,
@@ -738,6 +867,9 @@ async fn run(
                             }
                             if reading {
                                 emit.send(StoreEvent::Config(Err(e.clone())));
+                            }
+                            if reading_status {
+                                emit.send(StoreEvent::Status(Err(e.clone())));
                             }
                             emit.send(StoreEvent::Done { request: name, error: Some(e), dismissed: false });
                         }
