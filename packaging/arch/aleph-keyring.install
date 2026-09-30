@@ -28,6 +28,9 @@ post_install() {
 
 post_upgrade() {
     _aleph_enable
+    # aleph-tpmd runs until reboot and keeps the old binary; restart it so
+    # alephd and the helper always speak the same protocol version.
+    _aleph_systemctl try-restart aleph-tpmd.service
     echo "aleph: restart alephd to pick up the new binary: systemctl --user restart alephd.service"
 }
 

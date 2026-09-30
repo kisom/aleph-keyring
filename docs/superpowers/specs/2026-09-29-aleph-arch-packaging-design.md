@@ -39,8 +39,10 @@ owner runs them with `sudo`), and everything NixOS.
   changes, so a rebuild of a changed tree gets a new version (dirty builds
   carry a timestamp). Install with `sudo pacman -U`. The package name is
   `aleph-keyring-local`, provides and conflicts as below.
-- **`aleph-keyring-git`** derives `pkgver()` from `git describe` (the commit
-  count and hash while there is no tag).
+- **`aleph-keyring-git`** derives `pkgver()` from the Cargo version and the
+  total commit count and hash (`0.1.0.r<count>.g<hash>`), not from
+  `git describe`: after the first tag a describe-based count restarts at
+  `r0` and would sort as a downgrade.
 - **`aleph-keyring`** has `pkgver=0.1.0` and a `source` URL for the tag's
   tarball. Its checksum is a placeholder (`sha256sums=('SKIP')`, marked
   `# FILLED AT RELEASE`) in the repository until the owner tags;
@@ -105,7 +107,9 @@ the AUR copies are flattened):
   as the user, `systemctl --user daemon-reload && systemctl --user start
   alephd.socket`, then `alephctl setup`.
 - **`post_upgrade`:** `systemctl daemon-reload`, the same two idempotent
-  `enable`s, and a message: "restart alephd to pick up the new binary:
+  `enable`s, `systemctl try-restart aleph-tpmd.service` (the system helper
+  runs until reboot and has no protocol negotiation, so it must match the new
+  `alephd`), and a message: "restart alephd to pick up the new binary:
   systemctl --user restart alephd.service" (a running `alephd` keeps the old
   binary).
 - **`pre_remove`:** `systemctl --global disable alephd.socket`;

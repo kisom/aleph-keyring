@@ -44,8 +44,8 @@ grep -q "alephctl setup" "$tmp/out" && pass "post_install says what to do next" 
     || fail "post_install prints the next steps"
 
 run post_upgrade || true
-[ "$(calls)" = "daemon-reload;enable --now aleph-tpmd.socket;--global enable alephd.socket;" ] \
-    && pass "post_upgrade re-runs the same idempotent enables" \
+[ "$(calls)" = "daemon-reload;enable --now aleph-tpmd.socket;--global enable alephd.socket;try-restart aleph-tpmd.service;" ] \
+    && pass "post_upgrade re-runs the enables and restarts the system helper" \
     || fail "post_upgrade calls: $(calls)"
 grep -q "restart alephd to pick up the new binary: systemctl --user restart alephd.service" "$tmp/out" \
     && pass "post_upgrade says to restart alephd" \

@@ -1157,6 +1157,7 @@ three plans (DECISIONS.md H7):
   `docs/superpowers/specs/2026-09-29-aleph-arch-packaging-design.md`.
   - Depends on `tpm2-tss`, `libfido2`, `pam`, `dbus`, `hicolor-icon-theme`,
     `openssl`, `wayland`, `libxkbcommon`, and `libglvnd`.
+  - `provides=(org.freedesktop.secrets)`. It does not conflict with
     `gnome-keyring`; setup switches between them.
   - Installs:
     - `alephctl` and `aleph-gui` to `/usr/bin`; `alephd` and `aleph-tpmd`

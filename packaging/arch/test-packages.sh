@@ -233,10 +233,16 @@ for so in libwayland-client.so.0 libwayland-egl.so.1 libxkbcommon.so.0 libEGL.so
     fi
 done
 
+# An upgrade is not a removal: with aleph wired in (the PAM manifest exists,
+# as on a set-up machine) the guard must let it through.
+mkdir -p /var/lib/aleph && : >/var/lib/aleph/manifest.json
 : >/tmp/systemctl.calls
-pacman -U --noconfirm "$pkg" >/tmp/upgrade.out 2>&1 || { cat /tmp/upgrade.out >&2; fail "pacman -U reinstalls"; }
+pacman -U --noconfirm "$pkg" >/tmp/upgrade.out 2>&1 \
+    && pass "pacman -U of the same package is not blocked while the PAM manifest exists" \
+    || { cat /tmp/upgrade.out >&2; fail "pacman -U reinstalls while the PAM manifest exists"; }
+rm -f /var/lib/aleph/manifest.json
 got=$(tr '\n' ';' </tmp/systemctl.calls)
-[ "$got" = "$want" ] && pass "post_upgrade ran the spec's systemctl calls" || fail "post_upgrade calls: $got"
+[ "$got" = "${want}try-restart aleph-tpmd.service;" ] && pass "post_upgrade ran the spec's systemctl calls" || fail "post_upgrade calls: $got"
 grep -q 'restart alephd to pick up the new binary: systemctl --user restart alephd.service' /tmp/upgrade.out \
     && pass "post_upgrade printed the restart message" || fail "post_upgrade printed the restart message"
 
