@@ -4,6 +4,7 @@ description = "aleph: the command-line client for the aleph keyring"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 
 [[bin]]

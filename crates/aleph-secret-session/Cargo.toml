@@ -4,6 +4,7 @@ description = "The Secret Service transfer sessions (plain and dh-ietf1024-sha25
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]

@@ -6,6 +6,9 @@ members = ["crates/aleph-core", "crates/aleph-tpm-proto", "crates/aleph-tpmd", "
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
+# An application: none of the crates is published (cargo deny allows their
+# path dependencies without a version only because of this).
+publish = false
 rust-version = "1.98"
 
 [workspace.dependencies]

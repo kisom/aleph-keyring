@@ -4,6 +4,7 @@ description = "TPM (via aleph-tpmd) and FIDO2 key-encryption-key providers for t
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]

@@ -4,6 +4,7 @@ description = "The prompter protocol between alephd and its prompters (GUI or te
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
