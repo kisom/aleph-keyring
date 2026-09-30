@@ -7,6 +7,52 @@ first. The spec (`docs/superpowers/specs/2026-09-26-aleph-design.md`)
 is updated to match wherever a decision changes it. Decisions the owner
 made directly are marked as such.
 
+## 2026-09-29: Plan 6 (Arch packaging and CI), design
+
+### K1. Plan 6: Arch packaging and CI
+
+The packaging spec
+(`docs/superpowers/specs/2026-09-29-aleph-arch-packaging-design.md`) records
+these:
+
+- **Arch first; NixOS is a later plan.**
+- **Three packages:** a working-tree package (`aleph-keyring-local`, `make
+  pkg`, never published), `aleph-keyring-git`, and the release
+  `aleph-keyring`. The release PKGBUILD's checksum is filled by `make
+  pkgbuild-release TAG=vX.Y.Z` when the owner tags; `make pkgbuild-aur`
+  writes the flattened AUR copies and refuses a `SKIP` checksum.
+- **The install hook enables `aleph-tpmd.socket` and, for every user,
+  `alephd.socket`,** as `install.sh` does. It has four scriptlets:
+  `post_install`, `post_upgrade`, `pre_remove` (the disables, while the unit
+  files still exist) and `post_remove`. Removal is guarded by a
+  `PreTransaction` hook that refuses while the PAM changes or the Secret
+  Service activation still point at aleph.
+- **The package's removal guard is a `PreTransaction` alpm hook with
+  `AbortOnFail`, not a scriptlet.**
+- **The package build does not run the tests; CI does.**
+- **CI runs in the Arch container; actions are pinned by SHA; `cargo deny`
+  with crates.io as the only source.** The gate job runs as an unprivileged
+  user and installs `gnome-keyring` and `lua` (the test suite's, not the
+  package's). Each job has a `timeout-minutes`.
+- **The variant switch under the guard is blocked** (pacman runs the
+  `Remove` hook for a conflict replacement): revert, switch, set up again.
+- **`cargo deny` and workspace path dependencies:** the workspace crates are
+  `publish = false` and `deny.toml` sets `allow-wildcard-paths = true`;
+  `wildcards = "deny"` still refuses a registry `*` dependency (checked in
+  the Arch container on a throwaway copy: `error[wildcard]`).
+- **The package depends on nine names:** `tpm2-tss libfido2 pam dbus
+  hicolor-icon-theme openssl wayland libxkbcommon libglvnd` (found with
+  `readelf` and `namcap` on the built binaries). X11 libraries and an EGL
+  driver are left out on purpose; `opengl-driver` (provided by `mesa` and
+  `nvidia-utils`) is a candidate the owner may add.
+
+**OPEN ITEM for the owner (nothing changed here):** the package declares
+`license=('Apache-2.0')` and ships `LICENSE` and `NOTICE`, but the binary
+embeds OFL-1.1 and Ubuntu-font-1.0 fonts (egui's) and permissive crates (MIT,
+BSD-3-Clause, ISC, Unicode-3.0) whose notices binary distributions normally
+carry. Whether to ship a third-party licenses file (for example generated
+with `cargo-about`) is the owner's call.
+
 ## 2026-09-28: Plan 5d (the manager's admin page), design
 
 ### J1. The manager's admin page: scope and approach

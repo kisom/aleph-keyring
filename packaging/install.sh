@@ -1,6 +1,7 @@
 #!/bin/sh
 # Install (or uninstall) aleph from a release build of this tree, the way
-# the package lays it out (spec §9). Until there is a package:
+# the package lays it out (spec §9). On Arch, `make pkg` is the way (a
+# package of this tree); this script stays for other systems:
 #
 #   make && make install                 # or: make uninstall
 #

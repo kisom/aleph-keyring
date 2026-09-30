@@ -41,6 +41,34 @@ in place (Plan 4b). Design decisions made along the way are in
 | `aleph-gui` | The keyring manager (`aleph-gui`) and the unlock prompt `alephd` opens (`aleph-gui prompt`) |
 | `aleph-secret-session` | The Secret Service transfer sessions, shared by `alephd` and the manager |
 
+## Install
+
+On Arch or Omarchy, build a package of this checkout and install it:
+
+    make pkg
+    sudo pacman -U target/pkg/local/aleph-keyring-local-*.pkg.tar.zst
+
+then, as your user, `systemctl --user daemon-reload && systemctl --user
+start alephd.socket && alephctl setup`. There are three packages:
+`aleph-keyring-local` (`make pkg`, built from your working tree, never
+published), `aleph-keyring-git` and `aleph-keyring` (the release); the last
+two are for the AUR and are not published yet. A `make pkg` of a tree with
+uncommitted changes gets a `.dirty<timestamp>` version that pacman sorts
+older than a clean build of the same commit, so an edit-and-reinstall loop
+prints pacman's "downgrading" warning and still installs.
+`packaging/install.sh` (`make install`) remains for other systems.
+
+Removing the package is refused while `alephctl setup` and `alephctl system
+apply` are still in effect: run `alephctl setup --revert` and `sudo alephctl
+system revert` first (the same holds when switching between the `-git` and
+release packages: revert, switch, set up again). `make pkg-test` builds and
+tests all three packages in an Arch container (needs docker).
+
+CI (`.github/workflows/ci.yml`: `gate`, `deny`, `packages`) has not run on
+GitHub yet: it runs after the first push, and the workflow has been checked
+with `actionlint` only. The same commands have run locally in the container.
+The owner should confirm nothing else is needed for that first push.
+
 ## Development
 
 Tests need `swtpm`, `tpm2-tools`, `tpm2-tss`, `libfido2`, `pam`, `dbus`,
@@ -50,7 +78,7 @@ lua`). Hardware tests are opt-in; see [docs/testing.md](docs/testing.md).
 
 ~~~sh
 make gate                # formatting, clippy, the full suite
-make && make install     # release build, installed (sudo) until there is a package
+make && make install     # release build, installed (sudo): for systems without pacman
 ~~~
 
 ## License

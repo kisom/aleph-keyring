@@ -15,7 +15,8 @@
 #                     (docker; ALEPH_PKG_CACHE=1 keeps cargo's downloads in
 #                     the docker volume aleph-pkg-cargo between runs)
 #   make deny         cargo deny check: advisories, licenses, sources and
-#                     bans, per deny.toml (needs cargo-deny)
+#                     bans, per deny.toml (needs cargo-deny; CI uses
+#                     Arch's cargo-deny package)
 
 CARGO ?= cargo
 # (The TPM library's logging would flood the test output.)

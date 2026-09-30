@@ -1148,10 +1148,15 @@ three plans (DECISIONS.md H7):
 
 - **Repo:** one Cargo workspace (eleven crates), plus `packaging/arch/`,
   `flake.nix`, `assets/`, and `docs/`. It targets current stable Rust.
-- **Arch / Omarchy:** `PKGBUILD` in-repo, published to the AUR as
-  `aleph-keyring` and `aleph-keyring-git`.
-  - Depends on `tpm2-tss`, `libfido2`, `pam`, and `dbus`.
-  - `provides=(org.freedesktop.secrets)`. It does not conflict with
+- **Arch / Omarchy:** `PKGBUILD`s in-repo (`packaging/arch/`), three
+  packages: `aleph-keyring-local` (`make pkg`, built from the working tree,
+  not published), `aleph-keyring-git`, and `aleph-keyring` (the release);
+  the last two go to the AUR (`make pkgbuild-release`, `make pkgbuild-aur`).
+  `make pkg-test` builds and tests all three in an Arch container, and CI
+  (`gate`, `deny`, `packages`) runs it. Details:
+  `docs/superpowers/specs/2026-09-29-aleph-arch-packaging-design.md`.
+  - Depends on `tpm2-tss`, `libfido2`, `pam`, `dbus`, `hicolor-icon-theme`,
+    `openssl`, `wayland`, `libxkbcommon`, and `libglvnd`.
     `gnome-keyring`; setup switches between them.
   - Installs:
     - `alephctl` and `aleph-gui` to `/usr/bin`; `alephd` and `aleph-tpmd`
@@ -1173,9 +1178,15 @@ three plans (DECISIONS.md H7):
       | `assets/icons/aleph-symbolic.svg` | `hicolor/symbolic/apps/aleph-symbolic.svg` |
 
     - `/usr/share/aleph/hyprland/aleph-prompt.lua`
-  - A post-install hook enables `aleph-tpmd.socket`, and `alephd.socket`
+    - `/usr/share/licenses/<pkgname>/LICENSE` and `NOTICE`
+    - the removal guard: `/usr/lib/aleph/remove-guard` and the alpm hook
+      `/usr/share/libalpm/hooks/aleph-remove-guard.hook` (`PreTransaction`,
+      `AbortOnFail`), which refuses to remove the package while `alephctl
+      setup` or `alephctl system apply` is still in effect
+  - The install hook (`post_install`, `post_upgrade`, `pre_remove`,
+    `post_remove`) enables `aleph-tpmd.socket`, and `alephd.socket`
     for every user (`systemctl --global enable`). `packaging/install.sh`
-    does the same from a release build, until there is a package.
+    does the same from a release build, for systems without pacman.
 - **NixOS:** the flake exposes a package (built with `crane`) and a NixOS
   module `services.aleph`. The module:
   - installs the package, the user units, and `aleph-tpmd` as a system
@@ -1188,12 +1199,14 @@ three plans (DECISIONS.md H7):
   On NixOS, `alephctl setup` detects the read-only `/etc/pam.d`, skips the
   system changes, and prints the module configuration instead. Keyslots,
   the recovery key, and import work as on Arch.
-- **CI (GitHub Actions):**
-  - `cargo fmt --check`, `clippy -D warnings`, and the tests (including
-    `swtpm`)
-  - `cargo deny`
-  - `nix flake check`
-  - a `PKGBUILD` build in an Arch container
+- **CI (GitHub Actions):** jobs `gate`, `deny`, and `packages`, all in an
+  Arch container
+  - `gate`: `cargo fmt --check`, `clippy -D warnings`, and the tests
+    (including `swtpm`)
+  - `deny`: `cargo deny`
+  - `packages`: the three packages built and tested (`make pkg-test`)
+- NixOS (the flake and module) is a separate plan; `nix flake check` joins
+  CI with it.
 
 ## 9. Testing
 

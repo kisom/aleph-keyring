@@ -18,6 +18,7 @@ permissions:
 # keeps the token out of .git/config, which the package test copies.)
 jobs:
   gate:
+    timeout-minutes: 60
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
@@ -42,6 +43,7 @@ jobs:
           su builder -c 'make gate'
 
   deny:
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
@@ -61,6 +63,7 @@ jobs:
           make deny
 
   packages:
+    timeout-minutes: 90
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:

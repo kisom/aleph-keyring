@@ -343,6 +343,53 @@ compare.
     start them): while it is down the page says LINK DOWN; it reads again
     when the link returns.
 
+### The Arch packages (Plan 6)
+
+`make pkg-test` (docker) builds and tests all three packages in an
+`archlinux:base-devel` container: metadata, the file list and modes against
+`packaging/arch/files.expected`, the hook's `systemctl` calls (a stub), the
+removal guard through real `pacman -R`, and the refusal to co-install the
+variants. It takes about 20 minutes (a cold cargo build for each of the
+`-git` and release packages, and one for the local one) and printed 111 ok
+checks when last run. The same script runs in CI (`packages`), and `make
+gate` and `make deny` are the other two jobs. **The first CI run on GitHub
+has not happened yet:** it happens after the owner pushes, and the workflow
+has been validated with `actionlint` only, so the owner should confirm that
+nothing else is needed for that first push (the repository settings, the
+runner image, the container pull). Until then the same commands run locally.
+
+The test prints one note that is a recorded limitation, not a check:
+
+    note - variant switch under the guard: blocked
+
+Switching between `aleph-keyring` and `aleph-keyring-git` (pacman removes one
+to install the other) is stopped by the removal guard on a machine that is
+set up: pacman runs the `Remove` hook for a conflict replacement, and the
+guard refuses while the PAM changes or the Secret Service activation are in
+effect. The procedure is: revert (`alephctl setup --revert` as the user,
+`sudo alephctl system revert`), switch, set up again.
+
+`make pkg` versions are `<Cargo version>.r<commit count>.g<hash>`, with
+`.dirty<timestamp>` for an uncommitted tree. A dirty build sorts older than
+a clean build of the same commit (`vercmp`), so an edit-and-reinstall loop
+shows pacman's "downgrading" warning and still installs.
+
+On the owner's machine (these need `sudo`; the owner runs them, none is
+automated):
+
+1. `make pkg-test` passes, and prints the variant-switch note above.
+2. Move from the `install.sh` files: `sudo alephctl system revert`,
+   `alephctl setup --revert`, `make uninstall`; or install over them with
+   `sudo pacman -U --overwrite '/usr/*,/etc/pam.d/aleph-check'
+   target/pkg/local/aleph-keyring-local-*.pkg.tar.zst`. Otherwise:
+   `make pkg`, then `sudo pacman -U target/pkg/local/aleph-keyring-local-*.pkg.tar.zst`.
+3. `systemctl --user daemon-reload; systemctl --user start alephd.socket;
+   alephctl setup`; log out and in; lock and unlock; the manager opens.
+4. `sudo pacman -R aleph-keyring-local`: refused, naming both commands;
+   revert both (`alephctl setup --revert`, `sudo alephctl system revert`);
+   `-R` is accepted; the vault in `~/.local/share/aleph` is still there.
+5. `pacman -Ql aleph-keyring-local` matches `packaging/arch/files.expected`.
+
 ## Emergency manual revert
 
 If login or the lock screen misbehaves after `sudo alephctl system apply`,

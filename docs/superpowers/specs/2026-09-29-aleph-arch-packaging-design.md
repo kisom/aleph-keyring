@@ -1,7 +1,7 @@
 # aleph: Arch packaging and CI (Plan 6) — design
 
 - **Date:** 2026-09-29
-- **Status:** Draft, awaiting the owner's review
+- **Status:** Approved; implemented by docs/superpowers/plans/2026-09-29-aleph-arch-packaging.md
 - **Extends:** `docs/superpowers/specs/2026-09-26-aleph-design.md` §8
   (packaging and distribution). Where this document is more specific, it
   wins; the plan updates §8 to match. NixOS (the flake and the
@@ -141,11 +141,11 @@ does. It is not a scriptlet because a hook's `AbortOnFail` is the documented
 way to abort a transaction.
 
 **A limitation, recorded:** switching between `aleph-keyring` and
-`aleph-keyring-git` removes one package to install the other, and the guard
-may block that on a machine that is set up (whether pacman runs a `Remove`
-hook for a conflict replacement is pinned by the container test, and the
-documentation says what it found). Then the procedure is: revert, switch,
-set up again.
+`aleph-keyring-git` removes one package to install the other. Pacman runs
+the `Remove` hook for a conflict replacement, so on a machine that is set up
+the guard stops the switch (the container test prints `note - variant switch
+under the guard: blocked`). The procedure is: revert (`alephctl setup
+--revert` as the user, `sudo alephctl system revert`), switch, set up again.
 
 ## The package test
 
@@ -178,18 +178,28 @@ dependencies; then:
 
 `.github/workflows/ci.yml`, on push and pull request to `master`. Every job
 runs in `archlinux:base-devel` (the target), and third-party actions are
-pinned by commit SHA (this is a keyring):
+pinned by commit SHA (`actions/checkout` v7.0.1; this is a keyring). Each
+job has a `timeout-minutes` (gate 60, deny 15, packages 90):
 
-- **gate:** installs `rust clang tpm2-tss libfido2 pam swtpm tpm2-tools
-  pkgconf jq`, then `make gate` (fmt, clippy `-D warnings`, the whole suite
-  including `swtpm`; the hardware tests are `#[ignore]`d).
+- **gate:** installs `rust clang pkgconf git jq tpm2-tss libfido2 pam swtpm
+  tpm2-tools gnome-keyring lua` (`gnome-keyring` and `lua`: the test suite
+  needs them, the switchover tests run a real `gnome-keyring-daemon` and
+  `luac` checks the Hyprland files; they are **not** package depends), then
+  runs `make gate` as an unprivileged user (`su builder -c 'make gate'`: as
+  root `gnome-keyring-daemon` aborts and `$USER` is unset): fmt, clippy
+  `-D warnings`, the whole suite including `swtpm`; the hardware tests are
+  `#[ignore]`d.
 - **deny:** `cargo deny check` (Arch package `cargo-deny`) with a new
   `deny.toml`: advisories on; crates.io as the only source (no git
   sources); a license allow-list derived from `Cargo.lock` (the plan lists
-  the result for the owner's review); duplicate versions warn.
+  the result for the owner's review); duplicate versions warn; wildcard
+  dependencies are denied for registry crates (the workspace crates are
+  `publish = false`, and `allow-wildcard-paths` covers their path
+  dependencies on each other).
 - **packages:** `packaging/arch/test-packages.sh`.
 
-The first run on GitHub happens after the owner pushes; until then the same
+The first run on GitHub has not happened: it happens after the owner
+pushes, and the workflow is validated with `actionlint` only. Until then the same
 three commands run locally in a container, and that is the evidence.
 
 ## Documentation
