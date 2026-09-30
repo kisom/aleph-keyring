@@ -14,6 +14,8 @@
 #   make pkg-test     build and test the packages in an Arch container
 #                     (docker; ALEPH_PKG_CACHE=1 keeps cargo's downloads in
 #                     the docker volume aleph-pkg-cargo between runs)
+#   make deny         cargo deny check: advisories, licenses, sources and
+#                     bans, per deny.toml (needs cargo-deny)
 
 CARGO ?= cargo
 # (The TPM library's logging would flood the test output.)
@@ -21,7 +23,7 @@ export TSS2_LOG ?= all+NONE
 
 SUDO := $(if $(filter 0,$(shell id -u)),,sudo)
 
-.PHONY: all build test lint pkg-shell-test pkg pkg-test pkgbuild-release pkgbuild-aur gate gate-hw hw-tpm hw-fido2 install uninstall restart clean
+.PHONY: all build test lint pkg-shell-test pkg pkg-test pkgbuild-release pkgbuild-aur deny gate gate-hw hw-tpm hw-fido2 install uninstall restart clean
 
 all: build
 
@@ -90,6 +92,10 @@ pkgbuild-aur:
 	sh packaging/arch/pkgbuild-aur.sh
 
 gate: lint test pkg-shell-test
+
+# The dependency policy (deny.toml); CI runs it as its own job.
+deny:
+	$(CARGO) deny check
 
 # The hardware tests are #[ignore]d in the normal suite; each file holds
 # only its hardware test, so --ignored runs just that. (golden.rs's

@@ -1,0 +1,83 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+# Every job runs in the Arch container: the target the package installs on.
+# (pacman gets three tries: a mirror that drops the connection fails the
+# whole transaction. The gate also needs gnome-keyring and lua: the
+# switchover tests run a real gnome-keyring-daemon, and luac checks the
+# Hyprland files. git is installed before the checkout, so the checkout
+# is a real repository and not an API download; persist-credentials: false
+# keeps the token out of .git/config, which the package test copies.)
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install the build and test dependencies
+        run: |
+          for try in 1 2 3; do
+            pacman -Syu --noconfirm --needed rust clang pkgconf git jq tpm2-tss libfido2 pam swtpm tpm2-tools gnome-keyring lua && exit 0
+            echo "pacman failed (try $try of 3)" >&2
+          done
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      # (As an unprivileged user, as on a desktop: as root in the container
+      # gnome-keyring-daemon aborts ("error dropping process capabilities")
+      # and the PAM tests find no $USER. The runner is thrown away after the
+      # job, so the checkout is simply handed to that user.)
+      - name: The gate
+        run: |
+          useradd -m builder
+          chown -R builder: "$GITHUB_WORKSPACE"
+          su builder -c 'make gate'
+
+  deny:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install cargo-deny
+        run: |
+          for try in 1 2 3; do
+            pacman -Syu --noconfirm --needed rust cargo-deny git && exit 0
+            echo "pacman failed (try $try of 3)" >&2
+          done
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: cargo deny
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          make deny
+
+  packages:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install git
+        run: |
+          for try in 1 2 3; do
+            pacman -Syu --noconfirm --needed git && exit 0
+            echo "pacman failed (try $try of 3)" >&2
+          done
+          exit 1
+      # (The whole history: the package versions count commits, and the
+      # -git package is built from a clone of this repository.)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Build and test the packages
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          ALEPH_SRC="$GITHUB_WORKSPACE" sh packaging/arch/test-packages.sh
