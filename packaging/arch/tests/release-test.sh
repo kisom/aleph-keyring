@@ -73,6 +73,46 @@ cmp -s "$tmp/PKGBUILD.before" "$tmp/arch/aleph-keyring/PKGBUILD" \
     && pass "a refused or failed pkgbuild-release leaves the PKGBUILD alone" \
     || fail "a refused or failed pkgbuild-release leaves the PKGBUILD alone"
 
+# A sha256sums array over several lines: both scripts must read it all, and
+# pkgbuild-release must replace it with one clean line.
+set_sums_multi() { # each argument: one line of the array
+    grep -v '^sha256sums=' "$tmp/PKGBUILD.before" >"$tmp/arch/aleph-keyring/PKGBUILD"
+    for line do
+        printf '%s\n' "$line" >>"$tmp/arch/aleph-keyring/PKGBUILD"
+    done
+}
+set_sums_multi 'sha256sums=(' "  '$real'" "  'SKIP'" ')'
+rm -rf "$tmp/aur"
+if ALEPH_ARCH_DIR="$tmp/arch" ALEPH_AUR_OUT="$tmp/aur" \
+    sh "$tmp/arch/pkgbuild-aur.sh" >"$tmp/out" 2>"$tmp/err"; then
+    fail "pkgbuild-aur refuses a multi-line array with SKIP"
+else
+    grep -qi checksum "$tmp/err" && pass "pkgbuild-aur refuses a multi-line array with SKIP, and says why" \
+        || fail "the multi-line SKIP refusal explains the checksum"
+fi
+[ ! -e "$tmp/aur" ] && pass "a refused multi-line run writes nothing" \
+    || fail "a refused multi-line run writes nothing"
+
+set_sums_multi 'sha256sums=(' "  'FILLED AT RELEASE by make pkgbuild-release TAG=vX.Y.Z'" "  '$real'" ')'
+if ALEPH_ARCH_DIR="$tmp/arch" ALEPH_RELEASE_TARBALL_URL="file://$tmp/release.tar.gz" \
+    sh "$tmp/arch/pkgbuild-release.sh" v0.1.8 >"$tmp/out" 2>"$tmp/err"; then
+    pass "pkgbuild-release rewrites a multi-line checksum array"
+else
+    cat "$tmp/err" >&2
+    fail "pkgbuild-release rewrites a multi-line checksum array"
+fi
+[ "$(grep -c '^sha256sums=' "$tmp/arch/aleph-keyring/PKGBUILD")" = 1 ] \
+    && pass "the rewritten array is one line" || fail "the rewritten array is not one line"
+grep -q "^sha256sums=('$sum')" "$tmp/arch/aleph-keyring/PKGBUILD" \
+    && pass "the rewritten array carries the real checksum" \
+    || fail "the rewritten array carries the wrong checksum"
+grep -q 'FILLED AT RELEASE' "$tmp/arch/aleph-keyring/PKGBUILD" \
+    && fail "the multi-line placeholder is gone once filled" || pass "the multi-line placeholder is gone once filled"
+[ "$(grep -c "$real" "$tmp/arch/aleph-keyring/PKGBUILD")" = 0 ] \
+    && pass "no orphaned continuation line is left behind" \
+    || fail "an orphaned continuation line is left behind"
+cp "$tmp/PKGBUILD.before" "$tmp/arch/aleph-keyring/PKGBUILD"
+
 # pkgbuild-release writes the version and the real checksum.
 ALEPH_ARCH_DIR="$tmp/arch" ALEPH_RELEASE_TARBALL_URL="file://$tmp/release.tar.gz" \
     sh "$tmp/arch/pkgbuild-release.sh" v0.1.7 >"$tmp/out" 2>"$tmp/err" \
@@ -129,6 +169,51 @@ if ALEPH_MAKEPKG="$tmp/no-such-makepkg" ALEPH_ARCH_DIR="$tmp/arch" ALEPH_AUR_OUT
 else
     grep -q 'makepkg' "$tmp/err" && pass "pkgbuild-aur fails without makepkg and says so" \
         || fail "pkgbuild-aur fails without makepkg and says so"
+fi
+
+# The AUR copies inline this tree's common.sh: pkgbuild-aur runs only at
+# the tagged commit of a clean repository (the scratch copies above sit
+# outside any repository, so the check skips them there).
+GIT_CONFIG_GLOBAL=/dev/null
+GIT_CONFIG_NOSYSTEM=1
+GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid
+GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid
+export GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+repo=$tmp/repo
+mkdir -p "$repo/packaging"
+# (The filled-in scratch copy: the real checksum, so the checksum check
+# passes and the tag and cleanliness checks are what run.)
+set_sums "sha256sums=('$sum')"
+cp -a "$tmp/arch/." "$repo/packaging/arch/"
+git -C "$repo" init -q
+git -C "$repo" add -A
+git -C "$repo" commit -q -m one
+aur_in_repo() {
+    ALEPH_ARCH_DIR="$repo/packaging/arch" ALEPH_AUR_OUT="$tmp/aur3" \
+        sh "$repo/packaging/arch/pkgbuild-aur.sh"
+}
+echo dirt >>"$repo/packaging/arch/common.sh"
+if aur_in_repo >"$tmp/out" 2>"$tmp/err"; then
+    fail "pkgbuild-aur refuses a dirty tree"
+else
+    grep -q 'uncommitted' "$tmp/err" && pass "pkgbuild-aur refuses a dirty tree, and says so" \
+        || fail "the dirty-tree refusal says what is wrong: $(cat "$tmp/err")"
+fi
+git -C "$repo" add -A
+git -C "$repo" commit -q -m two
+if aur_in_repo >"$tmp/out" 2>"$tmp/err"; then
+    fail "pkgbuild-aur refuses an untagged HEAD"
+else
+    grep -q 'not exactly a tag' "$tmp/err" && pass "pkgbuild-aur refuses an untagged HEAD, and says so" \
+        || fail "the untagged refusal says what is wrong: $(cat "$tmp/err")"
+fi
+git -C "$repo" tag v0.1.7
+rm -rf "$tmp/aur3"
+if aur_in_repo >"$tmp/out" 2>"$tmp/err"; then
+    pass "pkgbuild-aur runs at the tagged commit"
+else
+    cat "$tmp/err" >&2
+    fail "pkgbuild-aur runs at the tagged commit"
 fi
 
 if [ "$failures" -ne 0 ]; then

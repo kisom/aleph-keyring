@@ -32,10 +32,24 @@ sum=$(sha256sum "$tmp/release.tar.gz" | cut -d' ' -f1)
 for line in pkgver pkgrel sha256sums; do
     grep -q "^$line=" "$pkgbuild" || { echo "pkgbuild-release: no $line= line in $pkgbuild" >&2; exit 1; }
 done
-sed \
-    -e "s/^pkgver=.*/pkgver=$ver/" \
-    -e "s/^pkgrel=.*/pkgrel=1/" \
-    -e "s/^sha256sums=.*/sha256sums=('$sum')/" \
-    "$pkgbuild" >"$tmp/PKGBUILD"
+# (Written to a copy first, keeping every other line as it is; the file is
+# replaced only once each of the three lines was found. The checksum array
+# is replaced whole: whether it sits on one line or spans several, what is
+# left is one line with the real sum, and no continuation lines behind.)
+awk -v ver="$ver" -v sum="$sum" -v q="'" '
+    /^pkgver=/ { print "pkgver=" ver; next }
+    /^pkgrel=/ { print "pkgrel=1"; next }
+    /^sha256sums=\(/ {
+        print "sha256sums=(" q sum q ")"
+        insums = !/\)/
+        next
+    }
+    insums {
+        if (/\)/)
+            insums = 0
+        next
+    }
+    { print }
+' "$pkgbuild" >"$tmp/PKGBUILD"
 cat "$tmp/PKGBUILD" >"$pkgbuild"
 echo "pkgbuild-release: $pkgbuild is now $ver, sha256 $sum"
