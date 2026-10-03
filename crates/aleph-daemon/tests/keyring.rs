@@ -611,6 +611,12 @@ fn an_unlock_through_the_prompt_is_logged() {
         pid: Some(4242),
     };
     let r = tracing::subscriber::with_default(subscriber, || {
+        // A callsite's interest is cached from its first evaluation, with
+        // whatever dispatcher that thread had: another test that logs this
+        // path with none set may have cached it as never, and this
+        // subscriber would then see nothing (the empty log the CI gate
+        // tripped over). Re-evaluate with this subscriber as the default.
+        tracing_core::callsite::rebuild_interest_cache();
         k.unlock_prompting(|| Ok(p.channel()), Some(caller))
     });
     assert!(matches!(r, Ok(true)), "{r:?}");
@@ -620,6 +626,89 @@ fn an_unlock_through_the_prompt_is_logged() {
         "{text}"
     );
     assert!(!text.contains(PW), "{text}");
+}
+
+/// A log capture survives a callsite whose first evaluation happened with
+/// no dispatcher set while a capture scope was already open — the window
+/// the CI gate's empty log raced through. The global max level starts at
+/// OFF and the macros gate on it before any interest is cached, so the
+/// first scoped dispatch anywhere raises it; from then on, whichever
+/// thread fires a callsite first decides its cached interest for the whole
+/// process. A thread with no dispatcher caches `never`, and a scoped
+/// subscriber is then never consulted: the unlock still works (`Ok(true)`)
+/// and the captured log comes out empty. The interest cache is re-evaluated
+/// each time a dispatch registers, which heals only callsites registered
+/// before it — so a never cached inside the capture's own window stays.
+/// Rebuilding the interest cache under the subscriber, before the
+/// operation, is the cure.
+#[test]
+fn a_log_capture_survives_a_first_evaluation_with_no_subscriber() {
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    #[derive(Clone, Default)]
+    struct Log(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Log {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    fn probe() {
+        tracing::info!("the log capture probe fired");
+    }
+
+    // Raise the global max level (OFF until the first dispatch registers):
+    // without this, the bare thread's firing below would be gated out
+    // entirely and cache nothing, and the test would prove nothing.
+    tracing::subscriber::with_default(
+        tracing_subscriber::fmt()
+            .with_writer({
+                let warm = Log::default();
+                move || warm.clone()
+            })
+            .with_ansi(false)
+            .finish(),
+        || {
+            tracing::info!("the capture warm-up fired");
+        },
+    );
+
+    // The probe has never fired. Fire it from a thread with no dispatcher,
+    // while the capture scope below is open.
+    let (fire, fired) = mpsc::channel();
+    let (done, done_rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        fired.recv().unwrap();
+        probe();
+        done.send(()).unwrap();
+    });
+
+    let log = Log::default();
+    tracing::subscriber::with_default(
+        tracing_subscriber::fmt()
+            .with_writer({
+                let log = log.clone();
+                move || log.clone()
+            })
+            .with_ansi(false)
+            .finish(),
+        || {
+            fire.send(()).unwrap();
+            done_rx.recv().unwrap(); // the bare thread has cached the callsite now
+            tracing_core::callsite::rebuild_interest_cache();
+            probe();
+        },
+    );
+    handle.join().unwrap();
+
+    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        text.contains("the log capture probe fired"),
+        "the capture saw nothing: {text}"
+    );
 }
 
 /// An admin conversation (`alephctl unlock`, answered in the terminal) that

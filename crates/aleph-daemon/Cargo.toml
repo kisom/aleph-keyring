@@ -46,3 +46,4 @@ aleph-daemon = { path = ".", features = ["testing"] }
 pam_aleph = { path = "../pam_aleph" }
 tempfile.workspace = true
 serde.workspace = true
+tracing-core = "0.1"
