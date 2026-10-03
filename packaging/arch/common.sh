@@ -5,21 +5,38 @@
 # $_srcname (the source directory under $srcdir), $pkgdir and $pkgname come
 # from the PKGBUILD.
 
+# The rustc flags for a build: the caller's RUSTFLAGS (split the way cargo
+# splits it, on spaces), then the path remaps. One destination for every
+# variant, so that the flags, and so cargo's fingerprints, are the same.
+# The flags travel in CARGO_ENCODED_RUSTFLAGS, separated by \037: a plain
+# RUSTFLAGS is split on whitespace, which breaks a path that has spaces in
+# it ($srcdir under a startdir with spaces), and cargo does not honor
+# quotes there.
+aleph_rustflags() { # SRCDIR [TARGETDIR]
+    local us out flag
+    us=$(printf '\037')
+    out=
+    for flag in ${RUSTFLAGS:-}; do
+        out="$out$flag$us"
+    done
+    out="${out}--remap-path-prefix=$1=/usr/src/debug/aleph-keyring"
+    # (Generated code's panic locations name OUT_DIR, under the target
+    # directory: with options=('!debug') makepkg no longer remaps it, so
+    # this does, the way makepkg's debug option would.)
+    if [ -n "${2:-}" ]; then
+        out="$out$us--remap-path-prefix=$2=/usr/src/debug/aleph-keyring/target"
+    fi
+    CARGO_ENCODED_RUSTFLAGS=$out
+}
+
 aleph_build() {
   cd "$srcdir/$_srcname"
   # (ALEPH_CARGO_TARGET_DIR, an absolute directory outside $srcdir, is for
   # the package test, which builds two variants in one directory with one
   # target directory; unset, cargo builds in target/ of the source tree.)
   export CARGO_TARGET_DIR=${ALEPH_CARGO_TARGET_DIR:-target}
-  # (Generated code's panic locations name OUT_DIR, under the target
-  # directory: with options=('!debug') makepkg no longer remaps it, so this
-  # does, the way makepkg's debug option would. One destination for every
-  # variant, so that the flags, and so cargo's fingerprints, are the same.)
-  local remap="--remap-path-prefix=$srcdir=/usr/src/debug/aleph-keyring"
-  if [ -n "${ALEPH_CARGO_TARGET_DIR:-}" ]; then
-    remap="$remap --remap-path-prefix=$ALEPH_CARGO_TARGET_DIR=/usr/src/debug/aleph-keyring/target"
-  fi
-  export RUSTFLAGS="${RUSTFLAGS:-} $remap"
+  aleph_rustflags "$srcdir" ${ALEPH_CARGO_TARGET_DIR:+"$ALEPH_CARGO_TARGET_DIR"}
+  export CARGO_ENCODED_RUSTFLAGS
   cargo build --release --workspace --locked
 }
 
