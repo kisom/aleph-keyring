@@ -7,6 +7,24 @@ first. The spec (`docs/superpowers/specs/2026-09-26-aleph-design.md`)
 is updated to match wherever a decision changes it. Decisions the owner
 made directly are marked as such.
 
+## 2026-10-02: Plan 6, the packaged licences (owner decision)
+
+The whole-branch review left the licence metadata open: the binary embeds
+more than aleph's own Apache-2.0 code, while the packages declared only
+`license=('Apache-2.0')` and shipped a `NOTICE` that said the same. The
+owner ruled before any AUR upload:
+
+- **`license=('Apache-2.0')` stays, and the package ships the embedded
+  works' licence texts** in `NOTICE` (`/usr/share/licenses/<pkgname>/`):
+  the egui default fonts — Ubuntu-Light under the Ubuntu Font Licence
+  1.0, NotoEmoji under the OFL-1.1, Hack and emoji-icon-font under the
+  MIT. `license=()` holds the project's own licence; `cargo deny check
+  licenses` gates the embedded set, so `NOTICE` and `deny.toml` move
+  together.
+- The crate licences (MIT, Apache-2.0, BSD-3-Clause, ISC, Zlib, CC0-1.0,
+  Unicode-3.0) are covered by `deny.toml`'s reviewed allow-list rather
+  than by shipping each crate's text.
+
 ## 2026-09-29: Plan 6 (Arch packaging and CI), design
 
 ### K1. Plan 6: Arch packaging and CI

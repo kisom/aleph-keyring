@@ -84,6 +84,8 @@ owner runs them with `sudo`), and everything NixOS.
     (`hicolor/scalable`, `24x24`, `16x16`, `symbolic`)
   - `/usr/share/aleph/hyprland/aleph-prompt.lua`
   - `/usr/share/licenses/<pkgname>/LICENSE`, and `NOTICE` beside it
+    (`NOTICE` also carries the licences of the fonts the GUI embeds:
+    Ubuntu Font Licence 1.0, OFL-1.1, MIT)
   - the removal-guard hook and its checker (below)
 - `packaging/install.sh` stays, for machines that are not Arch; the layout
   is written once in the plan's file list and the test script compares the
