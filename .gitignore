@@ -3,3 +3,8 @@
 *.new.png
 *.diff.png
 *.old.png
+# makepkg output from a manual makepkg in one of the package directories
+# (make pkg builds under target/pkg, which /target already covers).
+packaging/arch/*/src/
+packaging/arch/*/pkg/
+packaging/arch/*/*.pkg.tar.*

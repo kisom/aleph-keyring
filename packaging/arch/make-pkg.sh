@@ -35,7 +35,10 @@ sed "s/^pkgver=.*/pkgver=$pkgver/" "$arch/local/PKGBUILD" >"$out/PKGBUILD"
 cp "$arch/common.sh" "$arch/aleph-keyring.install" "$out/"
 
 cd "$out"
-makepkg -f --noconfirm -C
+# (PKGDEST is pinned to the build directory: a PKGDEST in the user's
+# makepkg.conf would put the package somewhere else, and the path printed
+# below would not exist.)
+PKGDEST="$PWD" makepkg -f --noconfirm -C
 # (Only the package itself: with makepkg.conf's `debug` option makepkg also
 # writes aleph-keyring-local-debug-*, and a pkgver starts with a digit.)
 ls "$PWD"/aleph-keyring-local-[0-9]*.pkg.tar.zst
