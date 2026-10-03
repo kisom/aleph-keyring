@@ -100,7 +100,7 @@ fi
 # the tarball carries the untracked file, not the deleted one, and never
 # target/ or .git; the real index is left alone.
 case ${pkg##*/} in
-"$pkgname"-*.dirty[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-1-x86_64.pkg.tar.zst)
+"$pkgname"-*.dirty[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].g*-1-x86_64.pkg.tar.zst)
     pass "a dirty tree gives a .dirty<timestamp> version" ;;
 *) fail "a dirty tree gives a .dirty<timestamp> version (package: $pkg)" ;;
 esac
@@ -109,6 +109,16 @@ v1=$(as_builder 'ALEPH_PKGVER_NOW=20260929134500 sh packaging/arch/pkgver.sh .')
 v2=$(as_builder 'ALEPH_PKGVER_NOW=20260929134501 sh packaging/arch/pkgver.sh .')
 [ "$(vercmp "$v2" "$v1")" = 1 ] && pass "a later dirty build is newer to vercmp ($v2 > $v1)" \
     || fail "a later dirty build is newer to vercmp: vercmp $v2 $v1 = $(vercmp "$v2" "$v1")"
+# (And the clean build of the same commit sorts newer than any dirty build
+# of it: committing the work and installing the clean package upgrades.)
+case $v1 in
+*.dirty*)
+    clean=${v1%%.dirty*}.g${v1##*.g}
+    [ "$(vercmp "$clean" "$v1")" = 1 ] && pass "the clean same-commit build is newer to vercmp ($clean > $v1)" \
+        || fail "the clean same-commit build is newer to vercmp: vercmp $clean $v1 = $(vercmp "$clean" "$v1")"
+    ;;
+*) fail "the tree was made dirty on purpose, but the version is clean: $v1" ;;
+esac
 tarball=$work/tree/target/pkg/local/aleph-src.tar.gz
 tar -tzf "$tarball" >/tmp/tarball.list
 if grep -q '^aleph-src/untracked-marker.txt$' /tmp/tarball.list; then pass "the tarball carries an untracked file"; else
@@ -117,7 +127,9 @@ fi
 if grep -q '^aleph-src/README.md$' /tmp/tarball.list; then fail "the tarball must not carry a deleted tracked file"; else
     pass "the tarball leaves out a deleted tracked file"
 fi
-if (cd "$work/tree" && git status --porcelain -- README.md untracked-marker.txt) >/tmp/status.out &&
+# (As builder: git status as root would write root-owned index files into
+# builder's tree.)
+if as_builder 'git status --porcelain -- README.md untracked-marker.txt' >/tmp/status.out &&
     grep -qx ' D README.md' /tmp/status.out && grep -qx '?? untracked-marker.txt' /tmp/status.out; then
     pass "the build left the index alone (the deletion is unstaged, the marker untracked)"
 else

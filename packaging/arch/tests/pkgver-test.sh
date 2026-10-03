@@ -50,19 +50,19 @@ got=$(ver "$repo")
 
 echo three >>"$repo/README.md"
 got=$(ver "$repo")
-[ "$got" = "0.1.0.r2.g$hash.dirty20260929134501" ] && pass "a modified tracked file gives .dirty<timestamp>" \
+[ "$got" = "0.1.0.r2.dirty20260929134501.g$hash" ] && pass "a modified tracked file gives .r2.dirty<ts>.g<hash>" \
     || fail "modified file: $got"
 git -C "$repo" checkout -q README.md
 
 echo new >"$repo/untracked.txt"
 got=$(ver "$repo")
-[ "$got" = "0.1.0.r2.g$hash.dirty20260929134501" ] && pass "an untracked file gives .dirty<timestamp>" \
+[ "$got" = "0.1.0.r2.dirty20260929134501.g$hash" ] && pass "an untracked file gives .r2.dirty<ts>.g<hash>" \
     || fail "untracked file: $got"
 rm "$repo/untracked.txt"
 
 rm "$repo/README.md"
 got=$(ver "$repo")
-[ "$got" = "0.1.0.r2.g$hash.dirty20260929134501" ] && pass "a deleted tracked file gives .dirty<timestamp>" \
+[ "$got" = "0.1.0.r2.dirty20260929134501.g$hash" ] && pass "a deleted tracked file gives .r2.dirty<ts>.g<hash>" \
     || fail "deleted file: $got"
 git -C "$repo" checkout -q README.md
 
@@ -77,7 +77,7 @@ got=$(ver "$repo")
 echo five >>"$repo/README.md"
 got=$(sh "$pkgver" "$repo")
 case $got in
-"0.1.0.r3.g$hash3.dirty"[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
+"0.1.0.r3.dirty"[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]".g$hash3")
     pass "a dirty tree carries the current timestamp" ;;
 *) fail "current timestamp: $got" ;;
 esac
@@ -88,8 +88,23 @@ esac
 
 # Run from elsewhere: the repository root is the argument.
 got=$(cd "$tmp" && ALEPH_PKGVER_NOW=1 sh "$pkgver" "$repo")
-[ "$got" = "0.1.0.r3.g$hash3.dirty1" ] && pass "the repository is \$1, whatever the current directory" \
+[ "$got" = "0.1.0.r3.dirty1.g$hash3" ] && pass "the repository is \$1, whatever the current directory" \
     || fail "run from elsewhere: $got"
+
+# The point of the .dirty-before-.g shape: vercmp (where pacman has it)
+# sorts the clean build of the same commit newer than any dirty build of
+# it, and later dirty builds newer than earlier ones.
+if command -v vercmp >/dev/null 2>&1; then
+    d1=$(ALEPH_PKGVER_NOW=20260929134500 sh "$pkgver" "$repo")
+    d2=$(ALEPH_PKGVER_NOW=20260929134501 sh "$pkgver" "$repo")
+    clean=$(git -C "$repo" checkout -q README.md; ver "$repo")
+    [ "$(vercmp "$clean" "$d1")" = 1 ] && pass "vercmp: the clean same-commit build is newer than a dirty one" \
+        || fail "vercmp clean vs dirty: $(vercmp "$clean" "$d1") ($clean, $d1)"
+    [ "$(vercmp "$d2" "$d1")" = 1 ] && pass "vercmp: a later dirty build is newer than an earlier one" \
+        || fail "vercmp dirty builds: $(vercmp "$d2" "$d1")"
+else
+    pass "vercmp not found: the ordering checks run in the container"
+fi
 
 if [ "$failures" -ne 0 ]; then
     printf '%s failure(s)\n' "$failures" >&2

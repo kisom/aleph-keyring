@@ -34,10 +34,13 @@ owner runs them with `sudo`), and everything NixOS.
 
 - **`make pkg`** tars the working tree (tracked and untracked files, minus
   what `.gitignore` ignores, so no `target/`) into a build directory and
-  runs `makepkg -f` there, as the user. `pkgver` is `0.1.0.r<commits>.g<hash>`,
-  with `.dirty<YYYYMMDDHHMMSS>` (UTC) appended when there are uncommitted
-  changes, so a rebuild of a changed tree gets a new version (dirty builds
-  carry a timestamp). Install with `sudo pacman -U`. The package name is
+  runs `makepkg -f` there, as the user, with `PKGDEST` pinned to that
+  directory. `pkgver` is `0.1.0.r<commits>[.dirty<YYYYMMDDHHMMSS>].g<hash>`:
+  the `.dirty` (UTC) marks uncommitted changes, so a rebuild of a changed
+  tree gets a new version (dirty builds carry a timestamp), and it sits
+  before `.g<hash>` so a dirty build sorts older than the clean build of
+  the same commit (`vercmp`): committing and installing the clean package
+  upgrades. Install with `sudo pacman -U`. The package name is
   `aleph-keyring-local`, provides and conflicts as below.
 - **`aleph-keyring-git`** derives `pkgver()` from the Cargo version and the
   total commit count and hash (`0.1.0.r<count>.g<hash>`), not from
