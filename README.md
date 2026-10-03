@@ -53,10 +53,14 @@ start alephd.socket && alephctl setup`. There are three packages:
 `aleph-keyring-local` (`make pkg`, built from your working tree, never
 published), `aleph-keyring-git` and `aleph-keyring` (the release); the last
 two are for the AUR and are not published yet. A `make pkg` of a tree with
-uncommitted changes gets a `.dirty<timestamp>` version that pacman sorts
-older than a clean build of the same commit, so an edit-and-reinstall loop
-prints pacman's "downgrading" warning and still installs.
-`packaging/install.sh` (`make install`) remains for other systems.
+uncommitted changes gets a `.dirty<timestamp>` version that sorts between
+earlier dirty builds and the clean build of the same commit, so committing
+the work and installing the clean package is an upgrade, with no
+"downgrading" warning. `packaging/install.sh` (`make install`) remains for
+other systems: it refuses to run where pacman owns aleph (the package is
+the way on Arch), and its hand-installed files are what a later package
+install would hit as "exists in filesystem" — the migration in
+docs/testing.md moves between the two.
 
 Removing the package is refused while `alephctl setup` and `alephctl system
 apply` are still in effect: run `alephctl setup --revert` and `sudo alephctl
@@ -64,10 +68,9 @@ system revert` first (the same holds when switching between the `-git` and
 release packages: revert, switch, set up again). `make pkg-test` builds and
 tests all three packages in an Arch container (needs docker).
 
-CI (`.github/workflows/ci.yml`: `gate`, `deny`, `packages`) has not run on
-GitHub yet: it runs after the first push, and the workflow has been checked
-with `actionlint` only. The same commands have run locally in the container.
-The owner should confirm nothing else is needed for that first push.
+CI (`.github/workflows/ci.yml`: `gate`, `deny`, `packages`) runs on every
+push to `master`, in the same Arch container the package installs on, with
+the image pinned by digest.
 
 ## Development
 

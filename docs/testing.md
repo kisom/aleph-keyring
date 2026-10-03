@@ -369,26 +369,36 @@ guard refuses while the PAM changes or the Secret Service activation are in
 effect. The procedure is: revert (`alephctl setup --revert` as the user,
 `sudo alephctl system revert`), switch, set up again.
 
-`make pkg` versions are `<Cargo version>.r<commit count>.g<hash>`, with
-`.dirty<timestamp>` for an uncommitted tree. A dirty build sorts older than
-a clean build of the same commit (`vercmp`), so an edit-and-reinstall loop
-shows pacman's "downgrading" warning and still installs.
+`make pkg` versions are
+`<Cargo version>.r<commit count>[.dirty<timestamp>].g<hash>`. Two dirty
+builds of one commit sort by their timestamps; a dirty build sorts older
+than the clean build of the same commit, so committing the work and
+installing the clean package is an upgrade, with no "downgrading"
+warning.
 
 On the owner's machine (these need `sudo`; the owner runs them, none is
 automated):
 
 1. `make pkg-test` passes, and prints the variant-switch note above.
-2. Move from the `install.sh` files: `sudo alephctl system revert`,
-   `alephctl setup --revert`, `make uninstall`; or install over them with
-   `sudo pacman -U --overwrite '/usr/*,/etc/pam.d/aleph-check'
-   target/pkg/local/aleph-keyring-local-*.pkg.tar.zst`. Otherwise:
-   `make pkg`, then `sudo pacman -U target/pkg/local/aleph-keyring-local-*.pkg.tar.zst`.
+2. Move from the `install.sh` files: revert both (`sudo alephctl system
+   revert`, `alephctl setup --revert`), then `sudo make uninstall`, then
+   `make pkg`, then
+   `sudo pacman -U target/pkg/local/aleph-keyring-local-*.pkg.tar.zst`.
+   (Installing the package over the `install.sh` files without
+   uninstalling first needs an `--overwrite` naming exactly those files —
+   one long argument:
+   `sudo pacman -U --overwrite '/usr/bin/alephctl,/usr/bin/aleph-gui,/usr/lib/aleph/*,/usr/lib/security/pam_aleph.so,/etc/pam.d/aleph-check,/usr/share/aleph/*,/usr/share/applications/aleph-gui.desktop,/usr/share/icons/hicolor/*/apps/aleph*.svg,/usr/lib/systemd/system/aleph-tpmd.*,/usr/lib/systemd/user/alephd.*,/usr/share/dbus-1/services/io.aleph.Keyring.service' target/pkg/local/aleph-keyring-local-*.pkg.tar.zst`.)
 3. `systemctl --user daemon-reload; systemctl --user start alephd.socket;
    alephctl setup`; log out and in; lock and unlock; the manager opens.
 4. `sudo pacman -R aleph-keyring-local`: refused, naming both commands;
    revert both (`alephctl setup --revert`, `sudo alephctl system revert`);
    `-R` is accepted; the vault in `~/.local/share/aleph` is still there.
-5. `pacman -Ql aleph-keyring-local` matches `packaging/arch/files.expected`.
+   To go back to aleph afterwards, reinstall the package (`sudo pacman -U
+   target/pkg/local/aleph-keyring-local-*.pkg.tar.zst`) and run
+   `alephctl setup` again.
+5. `pacman -Ql aleph-keyring-local` matches `packaging/arch/files.expected`;
+   what `install.sh` installs is that list minus the removal guard, its
+   hook and the licence files (`tests/install-layout-test.sh` checks it).
 
 ## Emergency manual revert
 

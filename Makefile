@@ -42,8 +42,11 @@ lint:
 	sh -n packaging/arch/remove-guard
 	sh -n packaging/arch/tests/guard-test.sh
 	sh -n packaging/arch/tests/hook-test.sh
+	sh -n packaging/arch/tests/install-layout-test.sh
+	sh -n packaging/arch/tests/makepkg-test.sh
 	sh -n packaging/arch/tests/pkgver-test.sh
 	sh -n packaging/arch/tests/release-test.sh
+	sh -n packaging/arch/tests/rustflags-test.sh
 	sh -n packaging/arch/make-pkg.sh
 	sh -n packaging/arch/pkgver.sh
 	sh -n packaging/arch/pkgbuild-release.sh
@@ -60,8 +63,11 @@ lint:
 pkg-shell-test:
 	sh packaging/arch/tests/guard-test.sh
 	sh packaging/arch/tests/hook-test.sh
+	sh packaging/arch/tests/install-layout-test.sh
+	sh packaging/arch/tests/makepkg-test.sh
 	sh packaging/arch/tests/pkgver-test.sh
 	sh packaging/arch/tests/release-test.sh
+	sh packaging/arch/tests/rustflags-test.sh
 
 # A package of the working tree, built as the user in target/pkg (install it
 # with `sudo pacman -U`; nothing is installed here).

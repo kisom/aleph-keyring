@@ -33,9 +33,12 @@ fn the_launcher_entry_opens_the_manager_with_its_icon() {
             "{icon}"
         );
     }
-    assert!(
-        install.contains("packaging/aleph-gui.desktop /usr/share/applications/aleph-gui.desktop")
-    );
+    // (The desktop entry is installed to its path — in a line that carries
+    // both, whatever target prefix the installer supports.)
+    assert!(install.lines().any(|l| {
+        l.contains("packaging/aleph-gui.desktop")
+            && l.contains("/usr/share/applications/aleph-gui.desktop")
+    }));
     // Both install and uninstall refresh the icon and desktop caches.
     assert_eq!(
         install.matches("gtk-update-icon-cache").count(),
