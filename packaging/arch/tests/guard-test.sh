@@ -14,14 +14,17 @@ fail() { printf 'not ok - %s\n' "$1" >&2; failures=$((failures + 1)); }
 pass() { printf 'ok - %s\n' "$1"; }
 
 # A fresh world: no manifest, one user with a home and no activation file.
+# The proc root is a fixture too: the real /proc carries this machine's
+# live XDG_DATA_HOME values, which would leak into the check.
 world() {
-    rm -rf "$tmp/state" "$tmp/homes" "$tmp/passwd"
-    mkdir -p "$tmp/state" "$tmp/homes/alice/.local/share/dbus-1/services"
+    rm -rf "$tmp/state" "$tmp/homes" "$tmp/passwd" "$tmp/proc"
+    mkdir -p "$tmp/state" "$tmp/homes/alice/.local/share/dbus-1/services" "$tmp/proc"
     printf 'alice:x:1000:1000::%s/homes/alice:/bin/sh\n' "$tmp" >"$tmp/passwd"
 }
 
 run() {
     ALEPH_STATE_DIR="$tmp/state" ALEPH_PASSWD_CMD="cat $tmp/passwd" \
+        ALEPH_PROC_ROOT="$tmp/proc" \
         timeout 5 sh "$guard" >"$tmp/out" 2>"$tmp/err"
 }
 
@@ -69,6 +72,35 @@ grep -q "bob" "$tmp/err" || fail "the refusal names bob"
 world
 printf 'carol:x:1002:1002::/nonexistent/carol:/bin/sh\ndave:x:1003:1003:::/bin/sh\n' >>"$tmp/passwd"
 expect_allow "a home that does not exist, and an empty one, are skipped"
+grep -q "carol's home /nonexistent/carol does not exist" "$tmp/err" \
+    || fail "a missing home is warned about, naming the user"
+grep -q "once the home is back" "$tmp/err" \
+    || fail "the missing-home warning says what to do"
+
+# (Review Focus 6.) A custom XDG_DATA_HOME moves the activation file out of
+# ~/.local/share. The guard reads it from the user's running processes.
+world
+mkdir -p "$tmp/proc/4242" "$tmp/homes/alice/custom-data/dbus-1/services"
+# (alice's uid is the tester's, so the fixture process counts as hers.)
+printf 'alice:x:%s:%s::%s/homes/alice:/bin/sh\n' "$(id -u)" "$(id -g)" "$tmp" >"$tmp/passwd"
+printf 'XDG_DATA_HOME=%s/homes/alice/custom-data\0HOME=%s/homes/alice\n' "$tmp" "$tmp" \
+    >"$tmp/proc/4242/environ"
+printf 'Exec=/usr/lib/aleph/alephd\n' \
+    >"$tmp/homes/alice/custom-data/dbus-1/services/org.freedesktop.secrets.service"
+expect_refuse "an activation file under a process's XDG_DATA_HOME refuses"
+grep -q "alice" "$tmp/err" || fail "the XDG_DATA_HOME refusal names the user"
+
+world
+mkdir -p "$tmp/proc/4242"
+# (The process's owner is whoever runs the test; alice's uid here is not
+# that, so the environ must not be consulted for her. The activation file
+# lives only where that environ's XDG_DATA_HOME points.)
+printf 'alice:x:424242:424242::%s/homes/alice:/bin/sh\n' "$tmp" >"$tmp/passwd"
+printf 'XDG_DATA_HOME=%s/homes/bob/data\0\n' "$tmp" >"$tmp/proc/4242/environ"
+mkdir -p "$tmp/homes/bob/data/dbus-1/services"
+printf 'Exec=/usr/lib/aleph/alephd\n' \
+    >"$tmp/homes/bob/data/dbus-1/services/org.freedesktop.secrets.service"
+expect_allow "another user's XDG_DATA_HOME is not alice's"
 
 world
 f="$tmp/homes/alice/.local/share/dbus-1/services/org.freedesktop.secrets.service"

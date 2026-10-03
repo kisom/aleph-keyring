@@ -7,13 +7,17 @@
 #    /etc/pam.d to call pam_aleph.so, and removing the module under those
 #    lines could break logins.
 #  - a user's Secret Service activation file names alephd: applications
-#    would be left with nothing behind the bus name.
+#    would be left with nothing behind the bus name. The file lives under
+#    the user's data directory: ~/.local/share, or whatever XDG_DATA_HOME
+#    their running processes carry. A home that is not there (not mounted,
+#    say) cannot be checked, which is warned about, not taken for clean.
 #
-# ALEPH_STATE_DIR and ALEPH_PASSWD_CMD exist for the tests.
+# ALEPH_STATE_DIR, ALEPH_PASSWD_CMD and ALEPH_PROC_ROOT exist for the tests.
 set -u
 
 state_dir=${ALEPH_STATE_DIR:-/var/lib/aleph}
 passwd_cmd=${ALEPH_PASSWD_CMD:-getent passwd}
+proc_root=${ALEPH_PROC_ROOT:-/proc}
 refuse=0
 
 if [ -e "$state_dir/manifest.json" ]; then
@@ -30,20 +34,43 @@ if ! users=$($passwd_cmd 2>/dev/null); then
     users=
 fi
 
-served=$(printf '%s\n' "$users" | while IFS=: read -r user _ _ _ _ home _; do
+# The data directories to check for a user: the default, plus any
+# XDG_DATA_HOME in the environment of one of their running processes (the
+# process directory's owner is the process's user).
+data_dirs() { # UID HOME
+    printf '%s\n' "$2/.local/share"
+    for env in "$proc_root"/*/environ; do
+        [ -r "$env" ] || continue
+        [ "$(stat -c %u "${env%/*}")" = "$1" ] || continue
+        xdg=$(tr '\0' '\n' <"$env" | sed -n 's/^XDG_DATA_HOME=//p' | head -n 1)
+        [ -n "$xdg" ] && printf '%s\n' "$xdg"
+    done | sort -u
+}
+
+served=$(printf '%s\n' "$users" | while IFS=: read -r user _ uid _ _ home _; do
     [ -n "$home" ] || continue
-    file="$home/.local/share/dbus-1/services/org.freedesktop.secrets.service"
-    [ -e "$file" ] || continue
-    # (Only a regular file is read: a FIFO or /dev/zero there would block
-    # root forever inside the transaction.)
-    [ -f "$file" ] || continue
-    if [ ! -r "$file" ]; then
-        echo "aleph: cannot read $file: not checking it" >&2
+    # (A home that is not mounted, or is gone, says nothing about whether
+    # aleph still serves that user: warn, and leave the choice to the
+    # admin, instead of quietly calling it clean.)
+    if [ ! -d "$home" ]; then
+        echo "aleph: $user's home $home does not exist: cannot check their Secret Service file" >&2
+        echo "  if $user has aleph serving it, run 'alephctl setup --revert' as $user once the home is back" >&2
         continue
     fi
-    if grep -qs /usr/lib/aleph/alephd "$file" 2>/dev/null; then
-        echo "$user"
-    fi
+    data_dirs "$uid" "$home" | while IFS= read -r dir; do
+        file="$dir/dbus-1/services/org.freedesktop.secrets.service"
+        [ -e "$file" ] || continue
+        # (Only a regular file is read: a FIFO or /dev/zero there would block
+        # root forever inside the transaction.)
+        [ -f "$file" ] || continue
+        if [ ! -r "$file" ]; then
+            echo "aleph: cannot read $file: not checking it" >&2
+            continue
+        fi
+        if grep -qs /usr/lib/aleph/alephd "$file" 2>/dev/null; then
+            echo "$user"
+        fi
+    done
 done)
 
 if [ -n "$served" ]; then
