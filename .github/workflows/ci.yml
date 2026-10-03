@@ -20,7 +20,7 @@ jobs:
   gate:
     timeout-minutes: 60
     runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    container: archlinux@sha256:51dd3d24f7fba779e7c471caeee7804c50e8c134ad948e19685a1c83a42facc3 # archlinux:base-devel
     steps:
       - name: Install the build and test dependencies
         run: |
@@ -45,7 +45,7 @@ jobs:
   deny:
     timeout-minutes: 15
     runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    container: archlinux@sha256:51dd3d24f7fba779e7c471caeee7804c50e8c134ad948e19685a1c83a42facc3 # archlinux:base-devel
     steps:
       - name: Install cargo-deny
         run: |
@@ -65,7 +65,7 @@ jobs:
   packages:
     timeout-minutes: 90
     runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    container: archlinux@sha256:51dd3d24f7fba779e7c471caeee7804c50e8c134ad948e19685a1c83a42facc3 # archlinux:base-devel
     steps:
       - name: Install git
         run: |
